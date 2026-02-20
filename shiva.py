@@ -785,7 +785,7 @@ BASE_HTML = r"""
     }
     *{box-sizing:border-box}
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto; background:var(--bg); color:var(--txt); margin:0}
-    .wrap{max-width:1120px; margin:24px auto; padding:0 16px}
+    .wrap{max-width:1280px; margin:24px auto; padding:0 16px}
     .card{background:var(--panel); border:1px solid var(--b); border-radius:var(--r); padding:16px; margin-bottom:14px; box-shadow:var(--shadow)}
     .soft{background:rgba(255,255,255,.03)}
     .row{display:grid; grid-template-columns:1fr 1fr; gap:12px}
@@ -1113,7 +1113,7 @@ def campaigns_statistics():
 
       <div class="divider"></div>
       <div style="overflow:auto">
-        <table style="width:100%; border-collapse:collapse">
+        <table style="width:100%; min-width:1120px; border-collapse:collapse">
           <thead>
             <tr class="small" style="text-align:left; border-bottom:1px solid var(--b2)">
               <th style="padding:8px">Campaign</th>
@@ -1126,7 +1126,7 @@ def campaigns_statistics():
               <th style="padding:8px">Queued</th>
               <th style="padding:8px">Sending</th>
               <th style="padding:8px">Progress</th>
-              <th style="padding:8px">Page</th>
+              <th style="padding:8px; white-space:nowrap">Page</th>
             </tr>
           </thead>
           <tbody>{body_rows}</tbody>
