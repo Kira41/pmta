@@ -888,6 +888,15 @@ function confirmDelete(){
   return confirm('Delete this campaign? This will remove its recipients states.');
 }
 
+async function deleteCampaign(campaignId){
+  if(!confirmDelete()) return;
+  const form = document.createElement('form');
+  form.method = 'POST';
+  form.action = `/api/campaign/${campaignId}/delete`;
+  document.body.appendChild(form);
+  form.submit();
+}
+
 async function testSMTP(){
   const host = document.getElementById('smtp_host').value;
   const port = parseInt(document.getElementById('smtp_port').value || '0', 10);
@@ -1060,9 +1069,7 @@ def campaigns():
                 <div class="actions">
                   <a class="btn2" href="/campaign/{c.id}">Open</a>
                   <a class="btn2" href="/campaign/{c.id}/edit">Edit</a>
-                  <form method="post" action="/api/campaign/{c.id}/delete" onsubmit="return confirmDelete()" style="display:inline">
-                    <button class="btnDanger" type="submit">Delete</button>
-                  </form>
+                  <button class="btnDanger" type="button" onclick="deleteCampaign({c.id})">Delete</button>
                   <a class="btn2" href="/api/campaign/{c.id}/export" onclick="return confirmExport()">Export</a>
                 </div>
               </div>
@@ -1242,9 +1249,7 @@ def campaign_edit(cid):
         </div>
         <div class="actions">
           <a class="btn2" href="/campaign/{c.id}">Open</a>
-          <form method="post" action="/api/campaign/{c.id}/delete" onsubmit="return confirmDelete()" style="display:inline">
-            <button class="btnDanger" type="submit">Delete</button>
-          </form>
+          <button class="btnDanger" type="button" onclick="deleteCampaign({c.id})">Delete</button>
         </div>
       </div>
 
@@ -1407,9 +1412,7 @@ def campaign_view(cid):
         </div>
         <div class="actions">
           <a class="btn2" href="/campaign/{c.id}/edit">Edit</a>
-          <form method="post" action="/api/campaign/{c.id}/delete" onsubmit="return confirmDelete()" style="display:inline">
-            <button class="btnDanger" type="submit">Delete</button>
-          </form>
+          <button class="btnDanger" type="button" onclick="deleteCampaign({c.id})">Delete</button>
           <a class="btn2" href="/api/campaign/{c.id}/export" onclick="return confirmExport()">Export</a>
         </div>
       </div>
