@@ -111,9 +111,7 @@ class CampaignRecipient(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     campaign_id = db.Column(db.Integer, db.ForeignKey("campaign.id"), nullable=False)
     recipient_id = db.Column(db.Integer, db.ForeignKey("recipient.id"), nullable=False)
-    state = db.Column(
-        db.Column(db.String(16), nullable=False, default="queued")
-    )  # queued/sending/sent/failed/suppressed/skipped
+    state = db.Column(db.String(16), nullable=False, default="queued")  # queued/sending/sent/failed/suppressed/skipped
     created_at = db.Column(db.String(32), default=now_iso)
 
 
