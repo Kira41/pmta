@@ -552,6 +552,18 @@ def _campaign_counts(cid: int) -> dict:
     }
 
 
+def _campaign_failed_rows(cid: int, limit: int = 20) -> List[Tuple[str, str, str]]:
+    return (
+        db.session.query(Recipient.email, Recipient.isp, CampaignRecipient.created_at)
+        .join(CampaignRecipient, CampaignRecipient.recipient_id == Recipient.id)
+        .filter(CampaignRecipient.campaign_id == cid)
+        .filter(CampaignRecipient.state == "failed")
+        .order_by(CampaignRecipient.id.desc())
+        .limit(max(int(limit or 20), 1))
+        .all()
+    )
+
+
 def _update_metrics(c: Campaign, patch: dict):
     m = _safe_json_load(
         c.metrics_json or "{}",
@@ -853,6 +865,7 @@ BASE_HTML = r"""
       </div>
       <div class="actions">
         <a class="btn2" href="/">Campaigns</a>
+        <a class="btn2" href="/statistics">Statistics</a>
         <a class="btn" href="/campaign/new">+ New campaign</a>
       </div>
     </div>
@@ -967,7 +980,15 @@ async function toggleSeedMode(campaignId, enabled){
     await pollSendStatus(campaignId);
     return;
   }
-  showToast(enabled ? 'SEED mode enabled' : 'SEED mode disabled');
+  if(enabled){
+    showToast('SEED mode enabled');
+  }else{
+    const moved = Number(res.requeued_from_skipped || 0);
+    const msg = moved > 0
+      ? `SEED mode disabled • ${moved} recipients moved to queue from Mail list.`
+      : 'SEED mode disabled • sending will continue from Mail list.';
+    showToast(msg);
+  }
   await pollSendStatus(campaignId);
 }
 
@@ -1078,6 +1099,89 @@ def campaigns():
         )
 
     content = "\n".join(rows) if rows else '<div class="card muted">No campaigns yet. Click "New campaign".</div>'
+    return render_template_string(BASE_HTML, content=Markup(content))
+
+
+@app.get("/statistics")
+def campaigns_statistics():
+    campaigns = Campaign.query.order_by(Campaign.id.desc()).all()
+    rows = []
+    grand = {
+        "total": 0,
+        "sent": 0,
+        "failed": 0,
+        "suppressed": 0,
+        "skipped": 0,
+        "queued": 0,
+        "sending": 0,
+    }
+
+    for c in campaigns:
+        counts = _campaign_counts(c.id)
+        for k in grand.keys():
+            grand[k] += int(counts.get(k, 0) or 0)
+
+        rows.append(
+            f"""
+            <tr>
+              <td><a href="/campaign/{c.id}">#{c.id} — {escape(c.name)}</a></td>
+              <td>{escape(c.status)}</td>
+              <td>{counts['total']}</td>
+              <td>{counts['sent']}</td>
+              <td>{counts['failed']}</td>
+              <td>{counts['suppressed']}</td>
+              <td>{counts['skipped']}</td>
+              <td>{counts['queued']}</td>
+              <td>{counts['sending']}</td>
+              <td>{counts['pct']:.1f}%</td>
+              <td><a class="btn2" href="/campaign/{c.id}/statistics">Details</a></td>
+            </tr>
+            """
+        )
+
+    sent_base = max(grand["sent"], 1)
+    rej_rate = (grand["failed"] / sent_base) * 100.0
+    body_rows = "\n".join(rows) if rows else '<tr><td colspan="11" class="muted">No campaigns yet.</td></tr>'
+
+    content = f"""
+    <div class="card">
+      <div class="sectionTitle">
+        <div>
+          <h3>Global statistics</h3>
+          <div class="muted">Overview across all campaigns: delivered/sent, rejected, queued, suppressed, and more.</div>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="card soft"><h4>Total recipients</h4><div><b>{grand['total']}</b></div></div>
+        <div class="card soft"><h4>Sent</h4><div><b>{grand['sent']}</b></div></div>
+        <div class="card soft"><h4>Rejected (failed)</h4><div><b>{grand['failed']}</b></div></div>
+        <div class="card soft"><h4>Reject rate</h4><div><b>{rej_rate:.2f}%</b></div></div>
+      </div>
+
+      <div class="divider"></div>
+      <div style="overflow:auto">
+        <table style="width:100%; border-collapse:collapse">
+          <thead>
+            <tr class="small" style="text-align:left; border-bottom:1px solid var(--b2)">
+              <th style="padding:8px">Campaign</th>
+              <th style="padding:8px">Status</th>
+              <th style="padding:8px">Total</th>
+              <th style="padding:8px">Sent</th>
+              <th style="padding:8px">Rejected</th>
+              <th style="padding:8px">Suppressed</th>
+              <th style="padding:8px">Skipped</th>
+              <th style="padding:8px">Queued</th>
+              <th style="padding:8px">Sending</th>
+              <th style="padding:8px">Progress</th>
+              <th style="padding:8px">Page</th>
+            </tr>
+          </thead>
+          <tbody>{body_rows}</tbody>
+        </table>
+      </div>
+    </div>
+    """
     return render_template_string(BASE_HTML, content=Markup(content))
 
 
@@ -1411,6 +1515,7 @@ def campaign_view(cid):
           </div>
         </div>
         <div class="actions">
+          <a class="btn2" href="/campaign/{c.id}/statistics">Statistics</a>
           <a class="btn2" href="/campaign/{c.id}/edit">Edit</a>
           <button class="btnDanger" type="button" onclick="deleteCampaign({c.id})">Delete</button>
           <a class="btn2" href="/api/campaign/{c.id}/export" onclick="return confirmExport()">Export</a>
@@ -1584,6 +1689,77 @@ def api_campaign_create():
     db.session.add(c)
     db.session.commit()
     return redirect(f"/campaign/{c.id}")
+
+
+@app.get("/campaign/<int:cid>/statistics")
+def campaign_statistics(cid):
+    c = Campaign.query.get_or_404(cid)
+    counts = _campaign_counts(cid)
+    m = _safe_json_load(c.metrics_json or "{}", {})
+    failed_rows = _campaign_failed_rows(cid, limit=25)
+
+    sent_base = max(counts["sent"], 1)
+    rejected_rate = (counts["failed"] / sent_base) * 100.0
+    hard_bounces = int(m.get("hard_bounces", 0) or 0)
+    complaints = int(m.get("complaints", 0) or 0)
+
+    failed_html_rows = "\n".join(
+        f"<tr><td style='padding:8px'>{escape(e)}</td><td style='padding:8px'>{escape(i)}</td><td style='padding:8px'>{escape(ts or '-')}</td></tr>"
+        for (e, i, ts) in failed_rows
+    )
+    if not failed_html_rows:
+        failed_html_rows = "<tr><td colspan='3' class='muted' style='padding:8px'>No rejected recipients yet.</td></tr>"
+
+    content = f"""
+    <div class="card">
+      <div class="sectionTitle">
+        <div>
+          <h3>Campaign statistics — #{c.id} {escape(c.name)}</h3>
+          <div class="muted">Detailed sending stats: sent, rejected, suppression, queue, bounce and complaint counters.</div>
+        </div>
+        <div class="actions">
+          <a class="btn2" href="/campaign/{c.id}">Back to campaign</a>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="card soft"><h4>Total</h4><div><b>{counts['total']}</b></div></div>
+        <div class="card soft"><h4>Sent</h4><div><b>{counts['sent']}</b></div></div>
+        <div class="card soft"><h4>Rejected</h4><div><b>{counts['failed']}</b></div></div>
+        <div class="card soft"><h4>Reject rate</h4><div><b>{rejected_rate:.2f}%</b></div></div>
+      </div>
+
+      <div class="row" style="margin-top:12px">
+        <div class="card soft"><h4>Queued</h4><div><b>{counts['queued']}</b></div></div>
+        <div class="card soft"><h4>Sending</h4><div><b>{counts['sending']}</b></div></div>
+        <div class="card soft"><h4>Suppressed</h4><div><b>{counts['suppressed']}</b></div></div>
+        <div class="card soft"><h4>Skipped</h4><div><b>{counts['skipped']}</b></div></div>
+      </div>
+
+      <div class="row" style="margin-top:12px">
+        <div class="card soft"><h4>Hard bounces</h4><div><b>{hard_bounces}</b></div></div>
+        <div class="card soft"><h4>Complaints</h4><div><b>{complaints}</b></div></div>
+        <div class="card soft"><h4>Status</h4><div><b>{escape(c.status)}</b></div></div>
+        <div class="card soft"><h4>Progress</h4><div><b>{counts['pct']:.1f}%</b></div></div>
+      </div>
+
+      <div class="divider"></div>
+      <h4>Rejected recipients (last 25)</h4>
+      <div style="overflow:auto">
+        <table style="width:100%; border-collapse:collapse">
+          <thead>
+            <tr class="small" style="text-align:left; border-bottom:1px solid var(--b2)">
+              <th style="padding:8px">Email</th>
+              <th style="padding:8px">ISP</th>
+              <th style="padding:8px">Imported at</th>
+            </tr>
+          </thead>
+          <tbody>{failed_html_rows}</tbody>
+        </table>
+      </div>
+    </div>
+    """
+    return render_template_string(BASE_HTML, content=Markup(content))
 
 
 @app.post("/api/campaign/<int:cid>/update")
@@ -1804,8 +1980,16 @@ def api_seed_mode(cid):
     env_params = _campaign_env_parameters(c)
     env_params["seed_mode_enabled"] = enabled
     c.env_parameters_json = json.dumps(env_params)
+
+    requeued_from_skipped = 0
+    if not enabled:
+        skipped_rows = CampaignRecipient.query.filter_by(campaign_id=cid, state="skipped").all()
+        for row in skipped_rows:
+            row.state = "queued"
+        requeued_from_skipped = len(skipped_rows)
+
     db.session.commit()
-    return jsonify({"ok": True, "seed_mode_enabled": enabled})
+    return jsonify({"ok": True, "seed_mode_enabled": enabled, "requeued_from_skipped": requeued_from_skipped})
 
 
 @app.get("/api/campaign/<int:cid>/export")
