@@ -673,7 +673,6 @@ def _sender_loop(cid: int, stop_event: threading.Event):
 
                 # Safety config (campaign/env aware)
                 allowed_seed = _campaign_seed_set(c)
-                allow_bulk_send = bool(ALLOW_BULK_SEND or env_params["allow_bulk_send"])
                 seed_mode_enabled = bool(env_params["seed_mode_enabled"])
 
                 scheduled_any = False
@@ -686,7 +685,7 @@ def _sender_loop(cid: int, stop_event: threading.Event):
                     if isp not in buckets:
                         isp = "other"
 
-                    if seed_mode_enabled or not allow_bulk_send:
+                    if seed_mode_enabled:
                         if not allowed_seed:
                             # No seed configured -> pause and explain
                             c.status = "paused"
@@ -834,6 +833,14 @@ BASE_HTML = r"""
     .toast .t{font-weight:700; margin-bottom:4px}
     .toast.success{border-color:rgba(98,255,177,.35)}
     .toast.error{border-color:rgba(255,107,107,.35)}
+    .switchRow{display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:10px; flex-wrap:wrap}
+    .switchWrap{display:inline-flex; align-items:center; gap:10px}
+    .switch{position:relative; width:54px; height:30px; display:inline-block}
+    .switch input{opacity:0; width:0; height:0}
+    .slider{position:absolute; inset:0; background:var(--btn2); border:1px solid var(--b2); border-radius:999px; cursor:pointer; transition:.18s}
+    .slider:before{content:""; position:absolute; width:24px; height:24px; left:2px; top:2px; border-radius:50%; background:#fff; transition:.18s}
+    .switch input:checked + .slider{background:rgba(98,255,177,.2); border-color:rgba(98,255,177,.6)}
+    .switch input:checked + .slider:before{transform:translateX(24px); background:var(--ok)}
     @keyframes pop{from{transform:translateY(10px); opacity:.4} to{transform:translateY(0); opacity:1}}
   </style>
 </head>
@@ -944,6 +951,17 @@ async function sendAction(campaignId, action){
   await pollSendStatus(campaignId);
 }
 
+async function toggleSeedMode(campaignId, enabled){
+  const res = await postJSON(`/api/campaign/${campaignId}/seed-mode`, {enabled});
+  if(!res.ok){
+    showToast(res.error || 'Could not update seed mode', 'error');
+    await pollSendStatus(campaignId);
+    return;
+  }
+  showToast(enabled ? 'SEED mode enabled' : 'SEED mode disabled');
+  await pollSendStatus(campaignId);
+}
+
 async function pollSendStatus(campaignId){
   try{
     const r = await fetch(`/api/campaign/${campaignId}/send/status`);
@@ -954,6 +972,8 @@ async function pollSendStatus(campaignId){
     const elCounts = document.getElementById('send_counts');
     const elPct = document.getElementById('send_pct');
     const bar = document.getElementById('send_bar');
+    const seedToggle = document.getElementById('seed_mode_toggle');
+    const seedToggleLabel = document.getElementById('seed_mode_label');
 
     const btnStart = document.getElementById('btn_send_start');
     const btnPause = document.getElementById('btn_send_pause');
@@ -964,10 +984,8 @@ async function pollSendStatus(campaignId){
     const hint = !s.sending_enabled
       ? 'Sending is disabled from campaign config.'
       : (s.seed_mode_enabled
-        ? 'Seed mode enabled: only addresses inside Seed list / config SEED_LIST will be sent.'
-        : (s.bulk_enabled
-          ? 'Bulk sending enabled (use ONLY permission-based recipients).'
-          : 'Seed-only mode is active because bulk is disabled.'));
+        ? 'SEED Mode Active: messages are sent only to Seed list / config SEED_LIST.'
+        : 'SEED Mode Disabled: messages are sent to the imported Mail list recipients.');
 
     if(elHint) elHint.textContent = hint;
 
@@ -978,6 +996,13 @@ async function pollSendStatus(campaignId){
     if(btnStart) btnStart.disabled = (s.status === 'running') || (s.total === 0);
     if(btnPause) btnPause.disabled = (s.status !== 'running');
     if(btnStop)  btnStop.disabled  = (s.status === 'stopped' || s.status === 'draft');
+    if(seedToggle){
+      seedToggle.checked = !!s.seed_mode_enabled;
+      seedToggle.disabled = !s.sending_enabled;
+    }
+    if(seedToggleLabel){
+      seedToggleLabel.textContent = s.seed_mode_enabled ? 'SEED Mode: Enable' : 'SEED Mode: Disable';
+    }
 
     return s;
   }catch(e){
@@ -1418,9 +1443,20 @@ def campaign_view(cid):
           <button id="btn_send_stop" class="btnDanger" type="button" onclick="sendAction({c.id}, 'stop')">Stop</button>
         </div>
 
+        <div class="switchRow">
+          <div class="small">Switch SEED mode from frontend.</div>
+          <div class="switchWrap">
+            <span class="pill" id="seed_mode_label">SEED Mode: --</span>
+            <label class="switch">
+              <input id="seed_mode_toggle" type="checkbox" onchange="toggleSeedMode({c.id}, this.checked)">
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+
         <div class="hint" style="margin-top:10px">
-          <b>Safety default:</b> seed-only mode. Add test emails from <a href="/campaign/{c.id}/edit">Edit</a> → <code>Seed list</code>.
-          Bulk requires <code>ALLOW_BULK_SEND=1</code> and should only be used for opt-in / permission-based recipients.
+          <b>SEED Mode Enable:</b> sends only to <code>Seed list</code> / <code>SEED_LIST</code>.
+          <b>SEED Mode Disable:</b> sends to imported <code>Mail list</code> recipients.
         </div>
       </div>
 
@@ -1704,13 +1740,12 @@ def api_send_start(cid):
     c = Campaign.query.get_or_404(cid)
 
     env_params = _campaign_env_parameters(c)
-    allow_bulk_send = bool(ALLOW_BULK_SEND or env_params["allow_bulk_send"])
     seed_mode_enabled = bool(env_params["seed_mode_enabled"])
 
     if not env_params["sending_enabled"]:
         return jsonify({"ok": False, "error": "Sending is disabled in campaign Environment Parameters."})
 
-    if seed_mode_enabled or not allow_bulk_send:
+    if seed_mode_enabled:
         allowed = _campaign_seed_set(c)
         if not allowed:
             return jsonify({"ok": False, "error": "Seed mode: add test emails in Edit → Seed list or Environment Variables.SEED_LIST."})
@@ -1756,6 +1791,18 @@ def api_send_status(cid):
         "seed_count": len(_campaign_seed_set(c)),
     })
     return jsonify(counts)
+
+
+@app.post("/api/campaign/<int:cid>/seed-mode")
+def api_seed_mode(cid):
+    c = Campaign.query.get_or_404(cid)
+    data = request.json or {}
+    enabled = bool(data.get("enabled", False))
+    env_params = _campaign_env_parameters(c)
+    env_params["seed_mode_enabled"] = enabled
+    c.env_parameters_json = json.dumps(env_params)
+    db.session.commit()
+    return jsonify({"ok": True, "seed_mode_enabled": enabled})
 
 
 @app.get("/api/campaign/<int:cid>/export")
