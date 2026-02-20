@@ -1112,8 +1112,8 @@ def campaigns_statistics():
       </div>
 
       <div class="divider"></div>
-      <div style="overflow:auto">
-        <table style="width:100%; min-width:1120px; border-collapse:collapse">
+      <div style="overflow-x:auto; padding-right:12px">
+        <table style="width:100%; min-width:1180px; border-collapse:collapse">
           <thead>
             <tr class="small" style="text-align:left; border-bottom:1px solid var(--b2)">
               <th style="padding:8px">Campaign</th>
@@ -1126,10 +1126,10 @@ def campaigns_statistics():
               <th style="padding:8px">Queued</th>
               <th style="padding:8px">Sending</th>
               <th style="padding:8px">Progress</th>
-              <th style="padding:8px; white-space:nowrap">Page</th>
+              <th style="padding:8px; white-space:nowrap; min-width:120px">Page</th>
             </tr>
           </thead>
-          <tbody>{body_rows}</tbody>
+          <tbody style="height:100px">{body_rows}</tbody>
         </table>
       </div>
     </div>
