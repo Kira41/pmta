@@ -109,6 +109,8 @@ class CampaignRecipient(db.Model):
     campaign_id = db.Column(db.Integer, db.ForeignKey("campaign.id"), nullable=False)
     recipient_id = db.Column(db.Integer, db.ForeignKey("recipient.id"), nullable=False)
     state = db.Column(db.String(16), nullable=False, default="queued")  # queued/sending/sent/failed/suppressed/skipped
+    failure_reason = db.Column(db.Text, nullable=True)
+    failed_at = db.Column(db.String(32), nullable=True)
     created_at = db.Column(db.String(32), default=now_iso)
 
 
@@ -139,12 +141,20 @@ def ensure_schema():
             if not _sqlite_has_column("campaign", "env_variables_json"):
                 db.session.execute(sql_text("ALTER TABLE campaign ADD COLUMN env_variables_json TEXT DEFAULT '{}'"))
                 db.session.commit()
+            if not _sqlite_has_column("campaign_recipient", "failure_reason"):
+                db.session.execute(sql_text("ALTER TABLE campaign_recipient ADD COLUMN failure_reason TEXT"))
+                db.session.commit()
+            if not _sqlite_has_column("campaign_recipient", "failed_at"):
+                db.session.execute(sql_text("ALTER TABLE campaign_recipient ADD COLUMN failed_at TEXT"))
+                db.session.commit()
         else:
             # For other DBs, try a best-effort IF NOT EXISTS.
             try:
                 db.session.execute(sql_text("ALTER TABLE campaign ADD COLUMN IF NOT EXISTS seed_list TEXT"))
                 db.session.execute(sql_text("ALTER TABLE campaign ADD COLUMN IF NOT EXISTS env_parameters_json TEXT"))
                 db.session.execute(sql_text("ALTER TABLE campaign ADD COLUMN IF NOT EXISTS env_variables_json TEXT"))
+                db.session.execute(sql_text("ALTER TABLE campaign_recipient ADD COLUMN IF NOT EXISTS failure_reason TEXT"))
+                db.session.execute(sql_text("ALTER TABLE campaign_recipient ADD COLUMN IF NOT EXISTS failed_at TEXT"))
                 db.session.commit()
             except Exception:
                 db.session.rollback()
@@ -536,9 +546,9 @@ def _campaign_counts(cid: int) -> dict:
     }
 
 
-def _campaign_failed_rows(cid: int, limit: int = 20) -> List[Tuple[str, str, str]]:
+def _campaign_failed_rows(cid: int, limit: int = 20) -> List[Tuple[str, str, str, str]]:
     return (
-        db.session.query(Recipient.email, Recipient.isp, CampaignRecipient.created_at)
+        db.session.query(Recipient.email, Recipient.isp, CampaignRecipient.failed_at, CampaignRecipient.failure_reason)
         .join(CampaignRecipient, CampaignRecipient.recipient_id == Recipient.id)
         .filter(CampaignRecipient.campaign_id == cid)
         .filter(CampaignRecipient.state == "failed")
@@ -610,6 +620,12 @@ def _sender_loop(cid: int, stop_event: threading.Event):
                     cr = CampaignRecipient.query.get(cr_id)
                     if cr:
                         cr.state = "sent" if ok else "failed"
+                        if ok:
+                            cr.failure_reason = None
+                            cr.failed_at = None
+                        else:
+                            cr.failure_reason = (err or "Unknown SMTP error")[:1000]
+                            cr.failed_at = now_iso()
 
                     mm = _safe_json_load(
                         c.metrics_json or "{}",
@@ -700,6 +716,8 @@ def _sender_loop(cid: int, stop_event: threading.Event):
                     if not cr or cr.state != "queued":
                         continue
                     cr.state = "sending"
+                    cr.failure_reason = None
+                    cr.failed_at = None
                     db.session.commit()
 
                     def _task(to_addr: str, campaign_id: int = cid):
@@ -1592,11 +1610,11 @@ def campaign_statistics(cid):
     complaints = int(m.get("complaints", 0) or 0)
 
     failed_html_rows = "\n".join(
-        f"<tr><td style='padding:8px'>{escape(e)}</td><td style='padding:8px'>{escape(i)}</td><td style='padding:8px'>{escape(ts or '-')}</td></tr>"
-        for (e, i, ts) in failed_rows
+        f"<tr><td style='padding:8px'>{escape(e)}</td><td style='padding:8px'>{escape(i)}</td><td style='padding:8px'>{escape(ts or '-')}</td><td style='padding:8px'>{escape(reason or 'Unknown')}</td></tr>"
+        for (e, i, ts, reason) in failed_rows
     )
     if not failed_html_rows:
-        failed_html_rows = "<tr><td colspan='3' class='muted' style='padding:8px'>No rejected recipients yet.</td></tr>"
+        failed_html_rows = "<tr><td colspan='4' class='muted' style='padding:8px'>No rejected recipients yet.</td></tr>"
 
     content = f"""
     <div class="card">
@@ -1639,7 +1657,8 @@ def campaign_statistics(cid):
             <tr class="small" style="text-align:left; border-bottom:1px solid var(--b2)">
               <th style="padding:8px">Email</th>
               <th style="padding:8px">ISP</th>
-              <th style="padding:8px">Imported at</th>
+              <th style="padding:8px">Failed at</th>
+              <th style="padding:8px">Failure reason</th>
             </tr>
           </thead>
           <tbody>{failed_html_rows}</tbody>
