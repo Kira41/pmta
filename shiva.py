@@ -89,6 +89,10 @@ class Campaign(db.Model):
     # This column is added via a small migration helper at startup.
     seed_list = db.Column(db.Text, nullable=False, default="")
 
+    # Campaign-level runtime config that behaves like editable env config
+    env_parameters_json = db.Column(db.Text, nullable=False, default="{}")
+    env_variables_json = db.Column(db.Text, nullable=False, default="{}")
+
     # QA / safety
     qa_score = db.Column(db.Float, nullable=True)
     status = db.Column(db.String(16), nullable=False, default="draft")  # draft/paused/running/stopped
@@ -134,10 +138,18 @@ def ensure_schema():
             if not _sqlite_has_column("campaign", "seed_list"):
                 db.session.execute(sql_text("ALTER TABLE campaign ADD COLUMN seed_list TEXT DEFAULT ''"))
                 db.session.commit()
+            if not _sqlite_has_column("campaign", "env_parameters_json"):
+                db.session.execute(sql_text("ALTER TABLE campaign ADD COLUMN env_parameters_json TEXT DEFAULT '{}'"))
+                db.session.commit()
+            if not _sqlite_has_column("campaign", "env_variables_json"):
+                db.session.execute(sql_text("ALTER TABLE campaign ADD COLUMN env_variables_json TEXT DEFAULT '{}'"))
+                db.session.commit()
         else:
             # For other DBs, try a best-effort IF NOT EXISTS.
             try:
                 db.session.execute(sql_text("ALTER TABLE campaign ADD COLUMN IF NOT EXISTS seed_list TEXT"))
+                db.session.execute(sql_text("ALTER TABLE campaign ADD COLUMN IF NOT EXISTS env_parameters_json TEXT"))
+                db.session.execute(sql_text("ALTER TABLE campaign ADD COLUMN IF NOT EXISTS env_variables_json TEXT"))
                 db.session.commit()
             except Exception:
                 db.session.rollback()
@@ -361,6 +373,14 @@ ALLOW_BULK_SEND = str(os.getenv("ALLOW_BULK_SEND", "0")).strip().lower() in ("1"
 ENV_SEED_LIST = {e.strip().lower() for e in str(os.getenv("SEED_LIST", "")).split(",") if e.strip()}
 MAX_SEND_PER_RUN = int(os.getenv("MAX_SEND_PER_RUN", "0") or 0)  # 0 = unlimited
 
+DEFAULT_ENV_PARAMETERS = {
+    "allow_bulk_send": False,
+    "max_send_per_run": 0,
+    "seed_mode_enabled": True,
+    "sending_enabled": True,
+}
+DEFAULT_ENV_VARIABLES = {"SEED_LIST": ""}
+
 _SENDER_LOCK = threading.Lock()
 _SENDER = {}  # cid -> {thread, stop_event}
 
@@ -368,7 +388,21 @@ _SENDER = {}  # cid -> {thread, stop_event}
 def _campaign_seed_set(c: Campaign) -> set:
     # Campaign UI seed list (newline/comma/space)
     campaign_seeds = set(sanitize_email_list(c.seed_list or ""))
-    return set(ENV_SEED_LIST) | campaign_seeds
+    env_vars = _safe_json_load(c.env_variables_json or "{}", DEFAULT_ENV_VARIABLES)
+    env_seed_raw = str(env_vars.get("SEED_LIST", "") or "")
+    env_seed = {e.strip().lower() for e in env_seed_raw.split(",") if e.strip()}
+    return set(ENV_SEED_LIST) | campaign_seeds | env_seed
+
+
+def _campaign_env_parameters(c: Campaign) -> dict:
+    cfg = _safe_json_load(c.env_parameters_json or "{}", DEFAULT_ENV_PARAMETERS)
+    out = dict(DEFAULT_ENV_PARAMETERS)
+    out.update({k: cfg.get(k, v) for k, v in DEFAULT_ENV_PARAMETERS.items()})
+    out["allow_bulk_send"] = bool(out.get("allow_bulk_send", False))
+    out["seed_mode_enabled"] = bool(out.get("seed_mode_enabled", True))
+    out["sending_enabled"] = bool(out.get("sending_enabled", True))
+    out["max_send_per_run"] = max(int(out.get("max_send_per_run", 0) or 0), 0)
+    return out
 
 
 class TokenBucket:
@@ -597,10 +631,19 @@ def _sender_loop(cid: int, stop_event: threading.Event):
                     c.metrics_json = json.dumps(mm)
                     db.session.commit()
 
-                # Stop after MAX_SEND_PER_RUN (optional)
-                if MAX_SEND_PER_RUN > 0 and sent_this_run >= MAX_SEND_PER_RUN:
+                env_params = _campaign_env_parameters(c)
+
+                if not env_params["sending_enabled"]:
                     c.status = "paused"
-                    _update_metrics(c, {"last_error": f"Paused after MAX_SEND_PER_RUN={MAX_SEND_PER_RUN}."})
+                    _update_metrics(c, {"last_error": "Sending disabled from campaign config."})
+                    db.session.commit()
+                    time.sleep(0.8)
+                    continue
+
+                max_send_per_run = env_params["max_send_per_run"] or MAX_SEND_PER_RUN
+                if max_send_per_run > 0 and sent_this_run >= max_send_per_run:
+                    c.status = "paused"
+                    _update_metrics(c, {"last_error": f"Paused after MAX_SEND_PER_RUN={max_send_per_run}."})
                     db.session.commit()
                     time.sleep(0.8)
                     continue
@@ -630,8 +673,10 @@ def _sender_loop(cid: int, stop_event: threading.Event):
                     time.sleep(0.2)
                     continue
 
-                # Safety: seed-only unless bulk enabled
+                # Safety config (campaign/env aware)
                 allowed_seed = _campaign_seed_set(c)
+                allow_bulk_send = bool(ALLOW_BULK_SEND or env_params["allow_bulk_send"])
+                seed_mode_enabled = bool(env_params["seed_mode_enabled"])
 
                 scheduled_any = False
                 for (cr_id, to_email, isp, r_status) in q:
@@ -643,11 +688,11 @@ def _sender_loop(cid: int, stop_event: threading.Event):
                     if isp not in buckets:
                         isp = "other"
 
-                    if not ALLOW_BULK_SEND:
+                    if seed_mode_enabled or not allow_bulk_send:
                         if not allowed_seed:
                             # No seed configured -> pause and explain
                             c.status = "paused"
-                            _update_metrics(c, {"last_error": "Seed-only mode: add test emails in campaign Seed list (or set env SEED_LIST) to start."})
+                            _update_metrics(c, {"last_error": "Seed mode: add test emails in Seed list / environment variables to start."})
                             db.session.commit()
                             break
                         if to_email not in allowed_seed:
@@ -918,9 +963,13 @@ async function pollSendStatus(campaignId){
 
     if(elStatus) elStatus.textContent = s.status || 'draft';
 
-    const hint = s.bulk_enabled
-      ? 'Bulk sending enabled (use ONLY permission-based recipients).'
-      : 'Seed-only mode: add test emails in Seed list (campaign settings) or set env SEED_LIST. Bulk requires ALLOW_BULK_SEND=1.';
+    const hint = !s.sending_enabled
+      ? 'Sending is disabled from campaign config.'
+      : (s.seed_mode_enabled
+        ? 'Seed mode enabled: only addresses inside Seed list / config SEED_LIST will be sent.'
+        : (s.bulk_enabled
+          ? 'Bulk sending enabled (use ONLY permission-based recipients).'
+          : 'Seed-only mode is active because bulk is disabled.'));
 
     if(elHint) elHint.textContent = hint;
 
@@ -1010,6 +1059,9 @@ def new_campaign():
         "yahoo": {"rate_per_min": 60, "burst": 15, "max_inflight": 30},
         "other": {"rate_per_min": 100, "burst": 25, "max_inflight": 40},
     }
+
+    default_env_parameters = json.dumps(DEFAULT_ENV_PARAMETERS, ensure_ascii=False, indent=2)
+    default_env_variables = json.dumps(DEFAULT_ENV_VARIABLES, ensure_ascii=False, indent=2)
 
     content = f"""
     <form class="card" method="post" action="/api/campaign/create">
@@ -1111,6 +1163,29 @@ def new_campaign():
         <textarea name="seed_list" placeholder="you@gmail.com\nyou@yahoo.com"></textarea>
       </div>
 
+      <div class="card soft" style="margin-top:12px">
+        <div class="sectionTitle">
+          <div>
+            <h4>Campaign config (Environment)</h4>
+            <div class="muted">Edit runtime parameters and variables per campaign without changing server-level env.</div>
+          </div>
+          <span class="pill">Config</span>
+        </div>
+        <div class="row">
+          <div>
+            <label>Environment Parameters (JSON)</label>
+            <textarea name="env_parameters_json">{default_env_parameters}</textarea>
+            <div class="small">Keys: allow_bulk_send, max_send_per_run, seed_mode_enabled, sending_enabled.</div>
+          </div>
+          <div>
+            <label>Environment Variables (JSON)</label>
+            <textarea name="env_variables_json">{default_env_variables}</textarea>
+            <div class="small">Supported now: SEED_LIST (comma separated).</div>
+          </div>
+        </div>
+      </div>
+
+
       <label>ISP limits JSON</label>
       <textarea name="isp_limits_json">{json.dumps(default_limits, ensure_ascii=False, indent=2)}</textarea>
 
@@ -1132,6 +1207,8 @@ def campaign_edit(cid):
     c = Campaign.query.get_or_404(cid)
 
     default_limits = _safe_json_load(c.isp_limits_json or "{}", {})
+    env_params = _campaign_env_parameters(c)
+    env_vars = _safe_json_load(c.env_variables_json or "{}", DEFAULT_ENV_VARIABLES)
 
     content = f"""
     <form class="card" method="post" action="/api/campaign/{c.id}/update">
@@ -1237,6 +1314,26 @@ def campaign_edit(cid):
         </div>
         <label>Seed list</label>
         <textarea name="seed_list">{escape(c.seed_list or '')}</textarea>
+      </div>
+
+      <div class="card soft" style="margin-top:12px">
+        <div class="sectionTitle">
+          <div>
+            <h4>Campaign config (Environment)</h4>
+            <div class="muted">Control seed mode, bulk mode, and sending behavior from campaign config.</div>
+          </div>
+          <span class="pill">Config</span>
+        </div>
+        <div class="row">
+          <div>
+            <label>Environment Parameters (JSON)</label>
+            <textarea name="env_parameters_json">{escape(json.dumps(env_params, ensure_ascii=False, indent=2))}</textarea>
+          </div>
+          <div>
+            <label>Environment Variables (JSON)</label>
+            <textarea name="env_variables_json">{escape(json.dumps(env_vars, ensure_ascii=False, indent=2))}</textarea>
+          </div>
+        </div>
       </div>
 
       <label>ISP limits JSON</label>
@@ -1406,6 +1503,8 @@ def api_campaign_create():
     letter = form.get("letter") or ""
     seed_list = form.get("seed_list") or ""
     isp_limits_json = form.get("isp_limits_json") or "{}"
+    env_parameters_json = form.get("env_parameters_json") or "{}"
+    env_variables_json = form.get("env_variables_json") or "{}"
     pool_size = int(form.get("pool_size") or 10)
     max_inflight = int(form.get("max_inflight") or 100)
 
@@ -1417,6 +1516,14 @@ def api_campaign_create():
         json.loads(isp_limits_json)
     except Exception:
         isp_limits_json = "{}"
+    try:
+        json.loads(env_parameters_json)
+    except Exception:
+        env_parameters_json = json.dumps(DEFAULT_ENV_PARAMETERS)
+    try:
+        json.loads(env_variables_json)
+    except Exception:
+        env_variables_json = json.dumps(DEFAULT_ENV_VARIABLES)
 
     c = Campaign(
         name=name,
@@ -1431,6 +1538,8 @@ def api_campaign_create():
         letter=letter,
         seed_list=seed_list,
         isp_limits_json=isp_limits_json,
+        env_parameters_json=env_parameters_json,
+        env_variables_json=env_variables_json,
         pool_size=pool_size,
         max_inflight=max_inflight,
         status="draft",
@@ -1457,6 +1566,8 @@ def api_campaign_update(cid):
     letter = form.get("letter") or ""
     seed_list = form.get("seed_list") or ""
     isp_limits_json = form.get("isp_limits_json") or "{}"
+    env_parameters_json = form.get("env_parameters_json") or "{}"
+    env_variables_json = form.get("env_variables_json") or "{}"
     pool_size = int(form.get("pool_size") or 10)
     max_inflight = int(form.get("max_inflight") or 100)
 
@@ -1468,6 +1579,14 @@ def api_campaign_update(cid):
         json.loads(isp_limits_json)
     except Exception:
         isp_limits_json = c.isp_limits_json or "{}"
+    try:
+        json.loads(env_parameters_json)
+    except Exception:
+        env_parameters_json = c.env_parameters_json or json.dumps(DEFAULT_ENV_PARAMETERS)
+    try:
+        json.loads(env_variables_json)
+    except Exception:
+        env_variables_json = c.env_variables_json or json.dumps(DEFAULT_ENV_VARIABLES)
 
     c.name = name
     c.base_url = base_url
@@ -1481,6 +1600,8 @@ def api_campaign_update(cid):
     c.letter = letter
     c.seed_list = seed_list
     c.isp_limits_json = isp_limits_json
+    c.env_parameters_json = env_parameters_json
+    c.env_variables_json = env_variables_json
     c.pool_size = pool_size
     c.max_inflight = max_inflight
 
@@ -1584,11 +1705,17 @@ def api_campaign_preview(cid):
 def api_send_start(cid):
     c = Campaign.query.get_or_404(cid)
 
-    if not ALLOW_BULK_SEND:
-        # NEW: allow per-campaign seed list in DB (so user doesn't need env)
+    env_params = _campaign_env_parameters(c)
+    allow_bulk_send = bool(ALLOW_BULK_SEND or env_params["allow_bulk_send"])
+    seed_mode_enabled = bool(env_params["seed_mode_enabled"])
+
+    if not env_params["sending_enabled"]:
+        return jsonify({"ok": False, "error": "Sending is disabled in campaign Environment Parameters."})
+
+    if seed_mode_enabled or not allow_bulk_send:
         allowed = _campaign_seed_set(c)
         if not allowed:
-            return jsonify({"ok": False, "error": "Seed-only mode: add test emails in Edit → Seed list (or set env SEED_LIST)."})
+            return jsonify({"ok": False, "error": "Seed mode: add test emails in Edit → Seed list or Environment Variables.SEED_LIST."})
 
     c.status = "running"
     _update_metrics(c, {"started_at": now_iso()})
@@ -1621,10 +1748,13 @@ def api_send_stop(cid):
 def api_send_status(cid):
     c = Campaign.query.get_or_404(cid)
     counts = _campaign_counts(cid)
+    env_params = _campaign_env_parameters(c)
     counts.update({
         "ok": True,
         "status": c.status,
-        "bulk_enabled": bool(ALLOW_BULK_SEND),
+        "bulk_enabled": bool(ALLOW_BULK_SEND or env_params["allow_bulk_send"]),
+        "seed_mode_enabled": bool(env_params["seed_mode_enabled"]),
+        "sending_enabled": bool(env_params["sending_enabled"]),
         "seed_count": len(_campaign_seed_set(c)),
     })
     return jsonify(counts)
@@ -1657,6 +1787,8 @@ def api_campaign_export(cid):
             "from_profiles": parse_lines(c.from_profiles),
             "subjects": parse_lines(c.subjects),
             "seed_list": sanitize_email_list(c.seed_list or ""),
+            "env_parameters": _campaign_env_parameters(c),
+            "env_variables": _safe_json_load(c.env_variables_json or "{}", DEFAULT_ENV_VARIABLES),
             "placeholders": ["email", "message_id", "tracking_code", "id_num", "id_mix", "unsubscribe_url"],
             "qa_score": c.qa_score,
             "created_at": c.created_at,
