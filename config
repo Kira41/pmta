@@ -1,0 +1,207 @@
+############################################################################
+# PowerMTA config - STRICT 1:1 DOMAIN -> IP (MAIL FROM routing)
+#
+# REQUIRED 1:1 mapping (ONLY send each domain using its linked IP):
+#   mediapaypro.cloud -> 194.116.172.135   (HELO/PTR: mail.mediapaypro.cloud)
+#   mediapaypro.info  -> 194.116.172.136   (HELO/PTR: s2.mediapaypro.info)
+#   mediapaypro.live  -> 194.116.172.137   (HELO/PTR: s3.mediapaypro.live)
+#   mediapaypro.vip   -> 194.116.172.138   (HELO/PTR: s4.mediapaypro.vip)
+#   mediapaypro.work  -> 194.116.172.139   (HELO/PTR: s5.mediapaypro.work)
+#
+# IMPORTANT:
+# - run-as-root no => avoid putting DKIM keys under /root.
+# - Put DKIM keys here:
+#     /root/<domain>/dkim.pem
+############################################################################
+
+postmaster abuse@mediapaypro.work
+
+############################################################################
+# LISTEN (submission)
+############################################################################
+smtp-listener 0.0.0.0:2525
+
+<source 0/0>
+    log-connections yes
+    log-commands    yes      # WARNING: verbose!
+    allow-unencrypted-plain-auth no
+</source>
+
+sync-msg-create false
+sync-msg-update false
+run-as-root no
+
+log-file /var/log/pmta/log
+spool /var/spool/pmta
+
+############################################################################
+# ACCOUNTING / LOGS
+############################################################################
+<acct-file /var/log/pmta/acct.csv>
+    max-size 50M
+</acct-file>
+
+<acct-file /var/log/pmta/diag.csv>
+    move-interval 1d
+    delete-after never
+    records t
+</acct-file>
+
+############################################################################
+# HTTP MANAGEMENT (SECURE DEFAULT: localhost only)
+############################################################################
+http-mgmt-port 8080
+http-access 0.0.0.0/0 admin
+http-access 0.0.0.0/0 monitor
+# If you need remote access, add ONLY your fixed admin IP:
+# http-access X.X.X.X/32 admin
+# http-access X.X.X.X/32 monitor
+
+############################################################################
+# STRICT ROUTING: MAIL FROM domain -> specific virtual-mta
+# NOTE: This routes by ENVELOPE FROM (MAIL FROM). Your sending app must use
+#       envelope-from @mediapaypro.* accordingly.
+############################################################################
+<pattern-list mpp-mailfrom-routing>
+    # mediapaypro.cloud -> pmta-mpp-cloud (194.116.172.135)
+    mail-from /@mediapaypro\.cloud$/        virtual-mta=pmta-mpp-cloud
+    mail-from /@mail\.mediapaypro\.cloud$/  virtual-mta=pmta-mpp-cloud
+
+    # mediapaypro.info -> pmta-mpp-info (194.116.172.136)
+    mail-from /@mediapaypro\.info$/         virtual-mta=pmta-mpp-info
+    mail-from /@s2\.mediapaypro\.info$/     virtual-mta=pmta-mpp-info
+
+    # mediapaypro.live -> pmta-mpp-live (194.116.172.137)
+    mail-from /@mediapaypro\.live$/         virtual-mta=pmta-mpp-live
+    mail-from /@s3\.mediapaypro\.live$/     virtual-mta=pmta-mpp-live
+
+    # mediapaypro.vip -> pmta-mpp-vip (194.116.172.138)
+    mail-from /@mediapaypro\.vip$/          virtual-mta=pmta-mpp-vip
+    mail-from /@s4\.mediapaypro\.vip$/      virtual-mta=pmta-mpp-vip
+
+    # mediapaypro.work -> pmta-mpp-work (194.116.172.139)
+    mail-from /@mediapaypro\.work$/         virtual-mta=pmta-mpp-work
+    mail-from /@s5\.mediapaypro\.work$/     virtual-mta=pmta-mpp-work
+</pattern-list>
+
+############################################################################
+# SMTP USERS / AUTH SOURCE
+############################################################################
+<smtp-user scampia>
+    password CHANGE_ME_STRONG_PASSWORD
+    source {pmta-auth}
+</smtp-user>
+
+<source {pmta-auth}>
+    smtp-service yes
+    require-auth true
+    always-allow-relaying yes
+
+    # CRITICAL: block any override like X-VirtualMTA (forces our 1:1 mapping)
+    process-x-virtual-mta no
+
+    # Apply strict MAIL FROM routing
+    pattern-list mpp-mailfrom-routing
+
+    # Fallback if MAIL FROM doesn't match the 5 domains
+    default-virtual-mta pmta-mpp-work
+
+    remove-received-headers true
+    add-received-header false
+    hide-message-source true
+</source>
+
+############################################################################
+# LOCAL INJECTION/API SOURCE (also enforced)
+############################################################################
+<source 127.0.0.1>
+    always-allow-api-submission yes
+    add-message-id-header yes
+    retain-x-job yes
+    retain-x-virtual-mta yes
+    verp-default yes
+    process-x-envid yes
+    process-x-job yes
+    jobid-header X-Mailer-RecptId
+
+    # CRITICAL: block override
+    process-x-virtual-mta no
+
+    # Enforce strict MAIL FROM routing
+    pattern-list mpp-mailfrom-routing
+    default-virtual-mta pmta-mpp-work
+</source>
+
+############################################################################
+# VIRTUAL MTAS (1:1) + DKIM per domain
+############################################################################
+
+# mediapaypro.cloud -> 194.116.172.135
+<virtual-mta pmta-mpp-cloud>
+    smtp-source-host 194.116.172.135 mail.mediapaypro.cloud
+    domain-key dkim,mediapaypro.cloud,/root/mediapaypro.cloud/dkim.pem
+</virtual-mta>
+
+# mediapaypro.info -> 194.116.172.136
+<virtual-mta pmta-mpp-info>
+    smtp-source-host 194.116.172.136 s2.mediapaypro.info
+    domain-key dkim,mediapaypro.info,/root/mediapaypro.info/dkim.pem
+</virtual-mta>
+
+# mediapaypro.live -> 194.116.172.137
+<virtual-mta pmta-mpp-live>
+    smtp-source-host 194.116.172.137 s3.mediapaypro.live
+    domain-key dkim,mediapaypro.live,/root/mediapaypro.live/dkim.pem
+</virtual-mta>
+
+# mediapaypro.vip -> 194.116.172.138
+<virtual-mta pmta-mpp-vip>
+    smtp-source-host 194.116.172.138 s4.mediapaypro.vip
+    domain-key dkim,mediapaypro.vip,/root/mediapaypro.vip/dkim.pem
+</virtual-mta>
+
+# mediapaypro.work -> 194.116.172.139
+<virtual-mta pmta-mpp-work>
+    smtp-source-host 194.116.172.139 s5.mediapaypro.work
+    domain-key dkim,mediapaypro.work,/root/mediapaypro.work/dkim.pem
+</virtual-mta>
+
+############################################################################
+# DEFAULT DOMAIN DELIVERY / TLS / DKIM
+############################################################################
+<domain *>
+    max-smtp-out 2
+    max-msg-per-connection 50
+    max-errors-per-connection 10
+    max-msg-rate 200/h
+
+    smtp-greeting-timeout 5m
+
+    bounce-upon-no-mx yes
+    assume-delivery-upon-data-termination-timeout yes
+
+    retry-after 10m
+    bounce-after 24h
+
+    dkim-sign yes
+    ignore-8bitmime true
+
+    use-starttls yes
+    require-starttls no
+</domain>
+
+############################################################################
+# BASIC BACKOFF PATTERNS (optional)
+############################################################################
+<smtp-pattern-list blocking-errors>
+    reply /blocked/ mode=backoff
+    reply /spamhaus/ mode=backoff
+    reply /exceeded the rate limit/ mode=backoff
+    reply /try again later/ mode=backoff
+    reply /refused your connection/ mode=backoff
+    reply /Service not available/ mode=backoff
+</smtp-pattern-list>
+
+############################################################################
+# END
+############################################################################
