@@ -6933,6 +6933,7 @@ def _normalize_outcome_type(v: Any) -> str:
     s = ("" if v is None else str(v)).strip().lower()
     if not s:
         return ""
+    s = re.sub(r"\s+", " ", s)
     # PMTA accounting often uses a 1-letter type.
     if s in {"d", "delivered", "delivery", "success", "accepted", "ok", "sent"}:
         return "delivered"
@@ -6941,6 +6942,17 @@ def _normalize_outcome_type(v: Any) -> str:
     if s in {"t", "defer", "deferred", "deferral", "transient"}:
         return "deferred"
     if s in {"c", "complaint", "complained", "fbl"}:
+        return "complained"
+
+    # PMTA accounting CSV often stores status words in longer values,
+    # e.g. dsnStatus="2.0.0 (success)" or dsnAction="relayed".
+    if any(x in s for x in ("success", "2.0.0", "relayed", "delivered", "accepted", "250 ")):
+        return "delivered"
+    if any(x in s for x in ("bounce", "bounced", "failed", "failure", "reject", "5.", " 550", " 551", " 552", " 553", " 554")):
+        return "bounced"
+    if any(x in s for x in ("defer", "deferred", "transient", "4.", " 421", " 450", " 451", " 452")):
+        return "deferred"
+    if any(x in s for x in ("complaint", "fbl", "abuse")):
         return "complained"
     return s
 
@@ -7035,8 +7047,14 @@ def _parse_accounting_line(line: str, *, path: str = "") -> Optional[dict]:
             return None
 
     # CSV
+    delim = ","
+    if "\t" in s and s.count("\t") >= s.count(","):
+        delim = "\t"
+    elif ";" in s and s.count(";") > s.count(","):
+        delim = ";"
+
     try:
-        fields = next(csv.reader([s]))
+        fields = next(csv.reader([s], delimiter=delim))
         fields = [x.strip() for x in fields]
     except Exception:
         return None
@@ -7147,6 +7165,15 @@ def process_pmta_accounting_event(ev: dict) -> dict:
         or ev.get("result")
         or ev.get("state")
     )
+    if typ not in {"delivered", "bounced", "deferred", "complained"}:
+        typ = _normalize_outcome_type(
+            ev.get("dsnAction")
+            or ev.get("dsn_action")
+            or ev.get("dsnStatus")
+            or ev.get("dsn_status")
+            or ev.get("dsnDiag")
+            or ev.get("dsn_diag")
+        )
 
     rcpt = (
         ev.get("rcpt")
