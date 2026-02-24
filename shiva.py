@@ -574,6 +574,17 @@ def db_init() -> None:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_job_outcomes_job ON job_outcomes(job_id)")
 
+            # Recipient -> job mapping (fallback when accounting line lacks job/message ids)
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS rcpt_job_map(
+                       rcpt TEXT PRIMARY KEY,
+                       job_id TEXT NOT NULL,
+                       campaign_id TEXT NOT NULL,
+                       updated_at TEXT NOT NULL
+                   )"""
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_rcpt_job_updated ON rcpt_job_map(updated_at)")
+
             # File offsets for PMTA accounting tailing
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS pmta_offsets(
@@ -683,6 +694,7 @@ def db_clear_all() -> None:
             conn.execute("DELETE FROM campaigns")
             conn.execute("DELETE FROM form_state")
             conn.execute("DELETE FROM jobs")
+            conn.execute("DELETE FROM rcpt_job_map")
             conn.commit()
         finally:
             conn.close()
@@ -824,6 +836,51 @@ def db_set_outcome(job_id: str, rcpt: str, status: str) -> None:
             conn.commit()
         finally:
             conn.close()
+
+
+def db_set_rcpt_job(rcpt: str, job_id: str, campaign_id: str) -> None:
+    r = (rcpt or "").strip().lower()
+    jid = (job_id or "").strip().lower()
+    cid = (campaign_id or "").strip()
+    if not r or not jid:
+        return
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            conn.execute(
+                "INSERT INTO rcpt_job_map(rcpt, job_id, campaign_id, updated_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(rcpt) DO UPDATE SET job_id=excluded.job_id, campaign_id=excluded.campaign_id, updated_at=excluded.updated_at",
+                (r, jid, cid, now_iso()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def db_get_rcpt_job(rcpt: str) -> tuple[str, str]:
+    r = (rcpt or "").strip().lower()
+    if not r:
+        return "", ""
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            row = conn.execute("SELECT job_id, campaign_id FROM rcpt_job_map WHERE rcpt=?", (r,)).fetchone()
+            if not row:
+                return "", ""
+            return str(row[0] or "").strip().lower(), str(row[1] or "").strip()
+        finally:
+            conn.close()
+
+
+def _normalize_accounting_rcpt(v: Any) -> str:
+    s = ("" if v is None else str(v)).strip()
+    if not s:
+        return ""
+    s = s.strip('"').strip().lstrip('<').rstrip('>')
+    m = EMAIL_FIND_RE.search(s)
+    if m:
+        return m.group(0).strip().lower()
+    return s.lower() if EMAIL_RE.match(s.lower()) else ""
 
 
 def db_get_offset(path: str) -> int:
@@ -7009,8 +7066,9 @@ def _parse_accounting_line(line: str, *, path: str = "") -> Optional[dict]:
     if fields:
         ev["type"] = fields[0]
     for f in fields:
-        if EMAIL_RE.match((f or "").strip()):
-            ev["rcpt"] = (f or "").strip()
+        rc = _normalize_accounting_rcpt(f)
+        if rc:
+            ev["rcpt"] = rc
             break
     for f in fields:
         if "@local" in f or "<" in f:
@@ -7090,8 +7148,9 @@ def process_pmta_accounting_event(ev: dict) -> dict:
 
     typ = _normalize_outcome_type(ev.get("type") or ev.get("event") or ev.get("kind") or ev.get("record"))
 
-    rcpt = (ev.get("rcpt") or ev.get("recipient") or ev.get("to") or ev.get("rcpt_to") or "")
-    rcpt = str(rcpt or "").strip()
+    rcpt = _normalize_accounting_rcpt(
+        ev.get("rcpt") or ev.get("recipient") or ev.get("to") or ev.get("rcpt_to") or ""
+    )
 
     job_id = _event_value(ev, "x-job-id", "job-id", "job_id", "jobid").lower()
     campaign_id = _event_value(ev, "x-campaign-id", "campaign-id", "campaign_id", "cid")
@@ -7565,6 +7624,10 @@ def smtp_send_job(
                         msg.set_content(rendered_body)
 
                     dom = _extract_domain_from_email(rcpt)
+                    try:
+                        db_set_rcpt_job(rcpt, job_id, job.campaign_id or "")
+                    except Exception:
+                        pass
 
                     try:
                         server.send_message(msg)
