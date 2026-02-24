@@ -3706,10 +3706,43 @@ This will remove it from Jobs history.`);
     }
   }
 
+  async function bridgeDebugTick(){
+    try{
+      const r = await fetch('/api/accounting/bridge/status');
+      const j = await r.json().catch(()=>({}));
+      if(r.ok && j && j.ok && j.bridge){
+        const b = j.bridge || {};
+        console.log('[Bridge↔Shiva Debug]', {
+          connected: !!b.connected,
+          last_ok: !!b.last_ok,
+          last_error: b.last_error || '',
+          last_attempt_ts: b.last_attempt_ts || '',
+          last_success_ts: b.last_success_ts || '',
+          attempts: Number(b.attempts || 0),
+          success_count: Number(b.success_count || 0),
+          failure_count: Number(b.failure_count || 0),
+          req_url: b.last_req_url || b.pull_url_masked || '',
+          bridge_return_keys: Array.isArray(b.last_response_keys) ? b.last_response_keys : [],
+          bridge_return_count: Number(b.last_bridge_count || 0),
+          processed_by_shiva: Number(b.last_processed || 0),
+          accepted_by_shiva: Number(b.last_accepted || 0),
+          lines_sample: Array.isArray(b.last_lines_sample) ? b.last_lines_sample : [],
+          duration_ms: Number(b.last_duration_ms || 0),
+        });
+      } else {
+        console.warn('[Bridge↔Shiva Debug] bridge status failed', {http_status: r.status, payload: j});
+      }
+    }catch(e){
+      console.error('[Bridge↔Shiva Debug] bridge status exception', e);
+    }
+  }
+
   document.getElementById('btnRefreshAll')?.addEventListener('click', tickAll);
 
   tickAll();
+  bridgeDebugTick();
   setInterval(tickAll, 1200);
+  setInterval(bridgeDebugTick, 5000);
 </script>
 </body>
 </html>
@@ -6789,6 +6822,33 @@ try:
 except Exception:
     PMTA_BRIDGE_PULL_MAX_LINES = 2000
 
+_BRIDGE_DEBUG_LOCK = threading.Lock()
+_BRIDGE_DEBUG_STATE: dict[str, Any] = {
+    "last_attempt_ts": "",
+    "last_success_ts": "",
+    "last_error_ts": "",
+    "last_ok": False,
+    "connected": False,
+    "attempts": 0,
+    "success_count": 0,
+    "failure_count": 0,
+    "last_error": "",
+    "last_req_url": "",
+    "last_http_ok": False,
+    "last_http_status": None,
+    "last_duration_ms": 0,
+    "last_response_keys": [],
+    "last_bridge_count": 0,
+    "last_processed": 0,
+    "last_accepted": 0,
+    "last_lines_sample": [],
+}
+
+
+def _bridge_debug_update(**kwargs: Any) -> None:
+    with _BRIDGE_DEBUG_LOCK:
+        _BRIDGE_DEBUG_STATE.update(kwargs)
+
 _PMTA_ACC_HEADERS: dict[str, list[str]] = {}
 
 # Extract job id from Message-ID we generate:
@@ -7078,8 +7138,19 @@ def process_campaign_accounting_payload(payload: dict) -> dict:
 
 
 def _poll_accounting_bridge_once() -> dict:
+    t0 = time.time()
     url = (PMTA_BRIDGE_PULL_URL or "").strip()
     if not url:
+        _bridge_debug_update(
+            last_attempt_ts=now_iso(),
+            attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
+            last_ok=False,
+            connected=False,
+            failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + 1,
+            last_error_ts=now_iso(),
+            last_error="missing_url",
+            last_duration_ms=int((time.time() - t0) * 1000),
+        )
         return {"ok": False, "error": "missing_url", "processed": 0, "accepted": 0}
 
     # Allow passing a base bridge URL (e.g. http://host:8090) and normalize it
@@ -7089,6 +7160,7 @@ def _poll_accounting_bridge_once() -> dict:
 
     sep = "&" if "?" in url else "?"
     req_url = f"{url}{sep}max_lines={max(1, int(PMTA_BRIDGE_PULL_MAX_LINES or 1))}"
+    _bridge_debug_update(last_req_url=req_url)
 
     headers = {"Accept": "application/json"}
     if PMTA_BRIDGE_PULL_TOKEN:
@@ -7097,17 +7169,51 @@ def _poll_accounting_bridge_once() -> dict:
     try:
         req = Request(req_url, headers=headers, method="GET")
         with urlopen(req, timeout=20) as resp:
+            code = getattr(resp, "status", None)
             raw = (resp.read() or b"{}").decode("utf-8", errors="replace")
+        _bridge_debug_update(last_http_ok=True, last_http_status=code)
     except Exception as e:
+        _bridge_debug_update(
+            last_attempt_ts=now_iso(),
+            attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
+            last_ok=False,
+            connected=False,
+            failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + 1,
+            last_error_ts=now_iso(),
+            last_error=f"bridge_request_failed: {e}",
+            last_http_ok=False,
+            last_duration_ms=int((time.time() - t0) * 1000),
+        )
         return {"ok": False, "error": f"bridge_request_failed: {e}", "processed": 0, "accepted": 0}
 
     try:
         obj = json.loads(raw)
     except Exception:
+        _bridge_debug_update(
+            last_attempt_ts=now_iso(),
+            attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
+            last_ok=False,
+            connected=False,
+            failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + 1,
+            last_error_ts=now_iso(),
+            last_error="invalid_bridge_json",
+            last_duration_ms=int((time.time() - t0) * 1000),
+        )
         return {"ok": False, "error": "invalid_bridge_json", "processed": 0, "accepted": 0}
 
     lines = obj.get("lines") if isinstance(obj, dict) else None
     if not isinstance(lines, list):
+        _bridge_debug_update(
+            last_attempt_ts=now_iso(),
+            attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
+            last_ok=False,
+            connected=False,
+            failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + 1,
+            last_error_ts=now_iso(),
+            last_error="invalid_bridge_payload",
+            last_response_keys=list(obj.keys()) if isinstance(obj, dict) else [],
+            last_duration_ms=int((time.time() - t0) * 1000),
+        )
         return {"ok": False, "error": "invalid_bridge_payload", "processed": 0, "accepted": 0}
 
     processed = 0
@@ -7123,6 +7229,21 @@ def _poll_accounting_bridge_once() -> dict:
         processed += 1
         accepted += 1 if res.get("ok") else 0
 
+    _bridge_debug_update(
+        last_attempt_ts=now_iso(),
+        last_success_ts=now_iso(),
+        attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
+        success_count=int(_BRIDGE_DEBUG_STATE.get("success_count", 0)) + 1,
+        last_ok=True,
+        connected=True,
+        last_error="",
+        last_bridge_count=len(lines),
+        last_processed=processed,
+        last_accepted=accepted,
+        last_response_keys=list(obj.keys()) if isinstance(obj, dict) else [],
+        last_lines_sample=[str(x)[:220] for x in lines[:3]],
+        last_duration_ms=int((time.time() - t0) * 1000),
+    )
     return {"ok": True, "processed": processed, "accepted": accepted, "count": len(lines)}
 
 
@@ -9089,6 +9210,23 @@ def api_preflight():
             "dbl_zones": DBL_ZONES_LIST,
         }
     )
+
+
+@app.get("/api/accounting/bridge/status")
+def api_accounting_bridge_status():
+    """Expose latest bridge polling diagnostics for browser console debugging."""
+    with _BRIDGE_DEBUG_LOCK:
+        state = dict(_BRIDGE_DEBUG_STATE)
+    state["pull_enabled"] = bool(PMTA_BRIDGE_PULL_ENABLED)
+    state["pull_interval_s"] = float(PMTA_BRIDGE_PULL_S or 0)
+    state["pull_max_lines"] = int(PMTA_BRIDGE_PULL_MAX_LINES or 0)
+    state["pull_url"] = (PMTA_BRIDGE_PULL_URL or "").strip()
+    state["pull_url_configured"] = bool(state["pull_url"])
+    if state["pull_url"]:
+        state["pull_url_masked"] = state["pull_url"].split("?", 1)[0]
+    else:
+        state["pull_url_masked"] = ""
+    return jsonify({"ok": True, "bridge": state})
 
 
 @app.post("/api/accounting/bridge/pull")
