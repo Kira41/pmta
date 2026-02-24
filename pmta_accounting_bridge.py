@@ -2,6 +2,7 @@
 import os
 import fnmatch
 import json
+import threading
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import List, Tuple, Dict, Any
@@ -50,6 +51,9 @@ ALLOWED_KINDS = {
     "pmtahttp": ["pmtahttp.log", "pmtahttp.log.*"],
     "all": ["acct-*.csv", "diag-*.csv", "log", "log.*", "pmtahttp.log", "pmtahttp.log.*"],
 }
+
+_TAIL_STATE_LOCK = threading.Lock()
+_TAIL_STATE: Dict[str, int] = {}
 
 
 def require_token(request: Request):
@@ -147,6 +151,50 @@ def _read_tail_lines(path: Path, max_lines: int) -> List[str]:
     return lines
 
 
+def _read_new_lines(path: Path, max_lines: int) -> Dict[str, Any]:
+    """Read newly appended lines from latest file with per-file byte offset state."""
+    safe_max = max(1, int(max_lines or 1))
+
+    key = str(path.resolve())
+    with _TAIL_STATE_LOCK:
+        start_off = int(_TAIL_STATE.get(key, 0) or 0)
+
+    size = path.stat().st_size
+    if start_off > size:
+        start_off = 0
+
+    lines: List[str] = []
+    next_off = start_off
+    has_more = False
+
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        f.seek(start_off)
+        while len(lines) < safe_max:
+            line = f.readline()
+            if not line:
+                break
+            next_off = f.tell()
+            s = line.strip()
+            if not s:
+                continue
+            lines.append(s)
+
+        if f.readline():
+            has_more = True
+
+    with _TAIL_STATE_LOCK:
+        _TAIL_STATE[key] = next_off
+
+    return {
+        "file": path.name,
+        "from_offset": start_off,
+        "to_offset": next_off,
+        "count": len(lines),
+        "has_more": has_more,
+        "lines": lines,
+    }
+
+
 def _push_ndjson(lines: List[str]) -> Dict[str, Any]:
     if not SHIVA_ACCOUNTING_URL:
         raise HTTPException(status_code=500, detail="Server misconfig: SHIVA_ACCOUNTING_URL is not set")
@@ -203,6 +251,7 @@ def root():
         "endpoints": {
             "health": "/health",
             "files": "/api/v1/files?kind=acct",
+            "pull_latest": "/api/v1/pull/latest?kind=acct",
             "push_latest": "/api/v1/push/latest?kind=acct",
             "job_push_latest": "/api/v1/jobs/push-latest?kind=acct",
         },
@@ -279,6 +328,31 @@ def job_push_latest_accounting(
         "job": "push-latest",
         "executed_at_utc": datetime.now(timezone.utc).isoformat(),
         "result": result,
+    }
+
+
+@app.get("/api/v1/pull/latest")
+def pull_latest_accounting(
+    kind: str = "acct",
+    max_lines: int = DEFAULT_PUSH_MAX_LINES,
+    _: None = Depends(require_token),
+):
+    """Return newly appended accounting lines so Shiva can pull them periodically."""
+    patterns = ALLOWED_KINDS.get(kind)
+    if not patterns:
+        raise HTTPException(status_code=400, detail=f"Invalid kind. Use one of: {list(ALLOWED_KINDS.keys())}")
+
+    latest = _find_latest_file(patterns)
+    chunk = _read_new_lines(latest, max_lines)
+    return {
+        "ok": True,
+        "kind": kind,
+        "file": chunk["file"],
+        "from_offset": chunk["from_offset"],
+        "to_offset": chunk["to_offset"],
+        "has_more": chunk["has_more"],
+        "count": chunk["count"],
+        "lines": chunk["lines"],
     }
 
 

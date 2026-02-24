@@ -6842,6 +6842,18 @@ try:
 except Exception:
     PMTA_ACCOUNTING_POLL_S = 2.0
 
+PMTA_BRIDGE_PULL_ENABLED = (os.getenv("PMTA_BRIDGE_PULL_ENABLED", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+PMTA_BRIDGE_PULL_URL = (os.getenv("PMTA_BRIDGE_PULL_URL", "") or "").strip()
+PMTA_BRIDGE_PULL_TOKEN = (os.getenv("PMTA_BRIDGE_PULL_TOKEN", "") or "").strip()
+try:
+    PMTA_BRIDGE_PULL_S = float((os.getenv("PMTA_BRIDGE_PULL_S", "5") or "5").strip())
+except Exception:
+    PMTA_BRIDGE_PULL_S = 5.0
+try:
+    PMTA_BRIDGE_PULL_MAX_LINES = int((os.getenv("PMTA_BRIDGE_PULL_MAX_LINES", "2000") or "2000").strip())
+except Exception:
+    PMTA_BRIDGE_PULL_MAX_LINES = 2000
+
 _ACCOUNTING_POLLER_STARTED = False
 _PMTA_ACC_HEADERS: dict[str, list[str]] = {}
 
@@ -7163,6 +7175,59 @@ def process_campaign_accounting_payload(payload: dict) -> dict:
     return {"ok": True, "campaign_id": campaign_id, "processed": processed, "accepted": accepted}
 
 
+def _poll_accounting_bridge_once() -> dict:
+    url = (PMTA_BRIDGE_PULL_URL or "").strip()
+    if not url:
+        return {"ok": False, "error": "missing_url", "processed": 0, "accepted": 0}
+
+    sep = "&" if "?" in url else "?"
+    req_url = f"{url}{sep}max_lines={max(1, int(PMTA_BRIDGE_PULL_MAX_LINES or 1))}"
+
+    headers = {"Accept": "application/json"}
+    if PMTA_BRIDGE_PULL_TOKEN:
+        headers["Authorization"] = f"Bearer {PMTA_BRIDGE_PULL_TOKEN}"
+
+    try:
+        req = Request(req_url, headers=headers, method="GET")
+        with urlopen(req, timeout=20) as resp:
+            raw = (resp.read() or b"{}").decode("utf-8", errors="replace")
+    except Exception as e:
+        return {"ok": False, "error": f"bridge_request_failed: {e}", "processed": 0, "accepted": 0}
+
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return {"ok": False, "error": "invalid_bridge_json", "processed": 0, "accepted": 0}
+
+    lines = obj.get("lines") if isinstance(obj, dict) else None
+    if not isinstance(lines, list):
+        return {"ok": False, "error": "invalid_bridge_payload", "processed": 0, "accepted": 0}
+
+    processed = 0
+    accepted = 0
+    for line in lines:
+        s = str(line or "").strip()
+        if not s:
+            continue
+        ev = _parse_accounting_line(s, path="bridge")
+        if not ev:
+            continue
+        res = process_pmta_accounting_event(ev)
+        processed += 1
+        accepted += 1 if res.get("ok") else 0
+
+    return {"ok": True, "processed": processed, "accepted": accepted, "count": len(lines)}
+
+
+def _accounting_bridge_poller_thread():
+    while True:
+        try:
+            _poll_accounting_bridge_once()
+        except Exception:
+            pass
+        time.sleep(max(1.0, float(PMTA_BRIDGE_PULL_S or 5.0)))
+
+
 def _accounting_poller_thread():
     files = _iter_accounting_files()
     if not files:
@@ -7214,8 +7279,19 @@ def start_accounting_poller_if_needed():
     t = threading.Thread(target=_accounting_poller_thread, daemon=True)
     t.start()
 
-# Start PMTA accounting poller (file tail) if configured.
+
+def start_accounting_bridge_poller_if_needed():
+    if not PMTA_BRIDGE_PULL_ENABLED:
+        return
+    if not PMTA_BRIDGE_PULL_URL:
+        return
+    t = threading.Thread(target=_accounting_bridge_poller_thread, daemon=True)
+    t.start()
+
+
+# Start PMTA accounting pollers if configured.
 start_accounting_poller_if_needed()
+start_accounting_bridge_poller_if_needed()
 
 
 # =========================
@@ -8046,6 +8122,18 @@ APP_CONFIG_SCHEMA: list[dict] = [
     # Accounting webhook security
     {"key": "PMTA_ACCOUNTING_WEBHOOK_TOKEN", "type": "str", "default": "", "group": "Accounting", "restart_required": False, "secret": True,
      "desc": "Shared secret for /pmta/accounting webhook. Send as X-Webhook-Token header or ?token=."},
+    {"key": "PMTA_BRIDGE_PULL_TOKEN", "type": "str", "default": "", "group": "Accounting", "restart_required": False, "secret": True,
+     "desc": "Bearer token sent by Shiva while pulling /api/v1/pull/latest from bridge."},
+
+    # Accounting bridge pull mode (restart to start/stop background poller)
+    {"key": "PMTA_BRIDGE_PULL_ENABLED", "type": "bool", "default": "0", "group": "Accounting", "restart_required": True,
+     "desc": "If enabled, Shiva periodically pulls accounting lines from bridge API instead of waiting for push."},
+    {"key": "PMTA_BRIDGE_PULL_URL", "type": "str", "default": "", "group": "Accounting", "restart_required": True,
+     "desc": "Full bridge endpoint for pull mode, e.g. http://194.116.172.135:8090/api/v1/pull/latest?kind=acct."},
+    {"key": "PMTA_BRIDGE_PULL_S", "type": "float", "default": "5", "group": "Accounting", "restart_required": False,
+     "desc": "Polling interval (seconds) for Shiva bridge pull thread."},
+    {"key": "PMTA_BRIDGE_PULL_MAX_LINES", "type": "int", "default": "2000", "group": "Accounting", "restart_required": False,
+     "desc": "max_lines query used when Shiva pulls from bridge endpoint."},
 
     # App (restart-only)
     {"key": "DB_CLEAR_ON_START", "type": "bool", "default": "0", "group": "App", "restart_required": True,
@@ -8167,6 +8255,7 @@ def reload_runtime_config() -> dict:
         global PMTA_DOMAIN_STATS, PMTA_DOMAINS_POLL_S, PMTA_DOMAINS_TOP_N
         global OPENROUTER_ENDPOINT, OPENROUTER_MODEL, OPENROUTER_TIMEOUT_S
         global PMTA_ACCOUNTING_WEBHOOK_TOKEN, PMTA_ACCOUNTING_WEBHOOK
+        global PMTA_BRIDGE_PULL_ENABLED, PMTA_BRIDGE_PULL_URL, PMTA_BRIDGE_PULL_TOKEN, PMTA_BRIDGE_PULL_S, PMTA_BRIDGE_PULL_MAX_LINES
 
         # Spam
         SPAMCHECK_BACKEND = (cfg_get_str("SPAMCHECK_BACKEND", "spamd") or "spamd").strip().lower()
@@ -8221,6 +8310,13 @@ def reload_runtime_config() -> dict:
         # Accounting webhook token / enable
         PMTA_ACCOUNTING_WEBHOOK_TOKEN = (cfg_get_str("PMTA_ACCOUNTING_WEBHOOK_TOKEN", PMTA_ACCOUNTING_WEBHOOK_TOKEN) or "").strip()
         PMTA_ACCOUNTING_WEBHOOK = bool(cfg_get_bool("PMTA_ACCOUNTING_WEBHOOK", bool(PMTA_ACCOUNTING_WEBHOOK)))
+
+        # Bridge pull mode (Shiva -> Bridge)
+        PMTA_BRIDGE_PULL_ENABLED = bool(cfg_get_bool("PMTA_BRIDGE_PULL_ENABLED", bool(PMTA_BRIDGE_PULL_ENABLED)))
+        PMTA_BRIDGE_PULL_URL = (cfg_get_str("PMTA_BRIDGE_PULL_URL", PMTA_BRIDGE_PULL_URL) or "").strip()
+        PMTA_BRIDGE_PULL_TOKEN = (cfg_get_str("PMTA_BRIDGE_PULL_TOKEN", PMTA_BRIDGE_PULL_TOKEN) or "").strip()
+        PMTA_BRIDGE_PULL_S = float(cfg_get_float("PMTA_BRIDGE_PULL_S", float(PMTA_BRIDGE_PULL_S or 5.0)))
+        PMTA_BRIDGE_PULL_MAX_LINES = int(cfg_get_int("PMTA_BRIDGE_PULL_MAX_LINES", int(PMTA_BRIDGE_PULL_MAX_LINES or 2000)))
 
         return {"ok": True, "ts": now_iso()}
     except Exception as e:
@@ -9217,6 +9313,14 @@ def pmta_accounting_webhook():
             accepted += 1 if res.get("ok") else 0
 
     return jsonify({"ok": True, "processed": processed, "accepted": accepted})
+
+
+@app.post("/api/accounting/bridge/pull")
+def api_accounting_bridge_pull_once():
+    """Manual pull from bridge endpoint (same processing path as periodic poller)."""
+    if not PMTA_BRIDGE_PULL_URL:
+        return jsonify({"ok": False, "error": "bridge pull URL is not configured"}), 400
+    return jsonify(_poll_accounting_bridge_once())
 
 
 @app.post("/start")
