@@ -7114,6 +7114,55 @@ def process_pmta_accounting_event(ev: dict) -> dict:
     return {"ok": True, "job_id": job.id, "campaign_id": job.campaign_id, "type": typ, "rcpt": rcpt}
 
 
+def process_campaign_accounting_payload(payload: dict) -> dict:
+    """Process middleware payload grouped by campaign_id.
+
+    Expected shape:
+      {
+        "campaign_id": "...",
+        "outcomes": [
+          {"recipient": "a@b.com", "status": "bounced", "job_id": "..."},
+          ...
+        ]
+      }
+    """
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "invalid_payload", "processed": 0, "accepted": 0}
+
+    campaign_id = str(payload.get("campaign_id") or "").strip()
+    outcomes = payload.get("outcomes")
+    if not campaign_id:
+        return {"ok": False, "error": "missing_campaign_id", "processed": 0, "accepted": 0}
+    if not isinstance(outcomes, list):
+        return {"ok": False, "error": "missing_outcomes", "processed": 0, "accepted": 0}
+
+    processed = 0
+    accepted = 0
+    with JOBS_LOCK:
+        fallback_job = _find_job_by_campaign(campaign_id)
+        for item in outcomes:
+            if not isinstance(item, dict):
+                continue
+            processed += 1
+            rcpt = str(item.get("recipient") or item.get("rcpt") or item.get("email") or "").strip()
+            typ = _normalize_outcome_type(item.get("status") or item.get("type") or item.get("event"))
+            if not rcpt or typ not in {"delivered", "bounced", "deferred", "complained"}:
+                continue
+
+            jid = str(item.get("job_id") or item.get("jobId") or "").strip().lower()
+            job = JOBS.get(jid) if jid else None
+            if not job or (job.campaign_id or "") != campaign_id:
+                job = fallback_job
+            if not job:
+                continue
+
+            _apply_outcome_to_job(job, rcpt, typ)
+            job.maybe_persist()
+            accepted += 1
+
+    return {"ok": True, "campaign_id": campaign_id, "processed": processed, "accepted": accepted}
+
+
 def _accounting_poller_thread():
     files = _iter_accounting_files()
     if not files:
@@ -9127,7 +9176,7 @@ def pmta_accounting_webhook():
 
     raw = request.get_data(as_text=True) or ""
     if not raw.strip():
-        return jsonify({"ok": True, "processed": 0})
+        return jsonify({"ok": True, "processed": 0, "accepted": 0})
 
     processed = 0
     accepted = 0
@@ -9135,6 +9184,9 @@ def pmta_accounting_webhook():
     ct = (request.headers.get("Content-Type") or "").lower()
     if "application/json" in ct:
         obj = request.get_json(silent=True)
+        # New middleware shape: grouped outcomes by campaign_id
+        if isinstance(obj, dict) and isinstance(obj.get("outcomes"), list) and obj.get("campaign_id"):
+            return jsonify(process_campaign_accounting_payload(obj))
         if isinstance(obj, dict):
             res = process_pmta_accounting_event(obj)
             processed += 1
