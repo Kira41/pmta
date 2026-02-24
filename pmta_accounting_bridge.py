@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 import os
 import fnmatch
+import json
 from pathlib import Path
 from datetime import datetime, timezone
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,6 +16,9 @@ from fastapi.middleware.cors import CORSMiddleware
 PMTA_LOG_DIR = Path(os.getenv("PMTA_LOG_DIR", "/var/log/pmta")).resolve()
 API_TOKEN = os.getenv("API_TOKEN", "")  # required unless ALLOW_NO_AUTH=1
 ALLOW_NO_AUTH = os.getenv("ALLOW_NO_AUTH", "0") == "1"
+SHIVA_ACCOUNTING_URL = os.getenv("SHIVA_ACCOUNTING_URL", "").strip()
+SHIVA_WEBHOOK_TOKEN = os.getenv("SHIVA_WEBHOOK_TOKEN", "").strip()
+DEFAULT_PUSH_MAX_LINES = int(os.getenv("DEFAULT_PUSH_MAX_LINES", "5000"))
 
 # CORS (for browser access)
 # Examples:
@@ -107,6 +113,77 @@ def list_dir_files(patterns: list[str]) -> list[dict]:
     return items
 
 
+def _find_latest_file(patterns: list[str]) -> Path:
+    candidates: list[tuple[float, Path]] = []
+    for p in PMTA_LOG_DIR.iterdir():
+        if not p.is_file() or p.is_symlink():
+            continue
+        if not _file_matches(p.name, patterns):
+            continue
+        try:
+            candidates.append((p.stat().st_mtime, p))
+        except FileNotFoundError:
+            continue
+
+    if not candidates:
+        raise HTTPException(status_code=404, detail="No accounting/log files matched")
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
+def _read_tail_lines(path: Path, max_lines: int) -> list[str]:
+    lines: list[str] = []
+    safe_max = max(1, max_lines)
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            lines.append(s)
+            if len(lines) > safe_max:
+                lines.pop(0)
+    return lines
+
+
+def _push_ndjson(lines: list[str]) -> dict:
+    if not SHIVA_ACCOUNTING_URL:
+        raise HTTPException(status_code=500, detail="Server misconfig: SHIVA_ACCOUNTING_URL is not set")
+    if not SHIVA_WEBHOOK_TOKEN:
+        raise HTTPException(status_code=500, detail="Server misconfig: SHIVA_WEBHOOK_TOKEN is not set")
+
+    payload = "\n".join(lines).encode("utf-8")
+    req = Request(
+        SHIVA_ACCOUNTING_URL,
+        data=payload,
+        method="POST",
+        headers={
+            "Content-Type": "application/x-ndjson",
+            "X-Webhook-Token": SHIVA_WEBHOOK_TOKEN,
+        },
+    )
+
+    try:
+        with urlopen(req, timeout=20) as resp:
+            body = (resp.read() or b"{}").decode("utf-8", errors="replace")
+            try:
+                out = json.loads(body)
+            except json.JSONDecodeError:
+                out = {"raw": body}
+            return {
+                "status": int(getattr(resp, "status", 200)),
+                "response": out,
+            }
+    except HTTPError as e:
+        text = (e.read() or b"").decode("utf-8", errors="replace")
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "upstream_http_error", "status": e.code, "body": text[:1000]},
+        )
+    except URLError as e:
+        raise HTTPException(status_code=502, detail={"error": "upstream_connection_error", "reason": str(e)})
+
+
 @app.get("/health")
 def health():
     return {
@@ -149,10 +226,35 @@ def get_files(
     }
 
 
+@app.post("/api/v1/push/latest")
+def push_latest_accounting(
+    kind: str = "acct",
+    max_lines: int = DEFAULT_PUSH_MAX_LINES,
+    _: None = Depends(require_token),
+):
+    patterns = ALLOWED_KINDS.get(kind)
+    if not patterns:
+        raise HTTPException(status_code=400, detail=f"Invalid kind. Use one of: {list(ALLOWED_KINDS.keys())}")
+
+    latest = _find_latest_file(patterns)
+    lines = _read_tail_lines(latest, max_lines)
+    if not lines:
+        return {"ok": True, "pushed": 0, "file": latest.name, "note": "file had no non-empty lines"}
+
+    upstream = _push_ndjson(lines)
+    return {
+        "ok": True,
+        "kind": kind,
+        "file": latest.name,
+        "pushed": len(lines),
+        "upstream": upstream,
+    }
+
+
 if __name__ == "__main__":
-    # Run: python3 pmta_accounting_api.py
+    # Run: python3 pmta_accounting_bridge.py
     import uvicorn
 
     host = os.getenv("BIND_ADDR", "0.0.0.0")
     port = int(os.getenv("PORT", "8080"))
-    uvicorn.run("pmta_accounting_api:app", host=host, port=port, reload=False)
+    uvicorn.run("pmta_accounting_bridge:app", host=host, port=port, reload=False)
