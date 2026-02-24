@@ -7180,6 +7180,11 @@ def _poll_accounting_bridge_once() -> dict:
     if not url:
         return {"ok": False, "error": "missing_url", "processed": 0, "accepted": 0}
 
+    # Allow passing a base bridge URL (e.g. http://host:8090) and normalize it
+    # to the pull endpoint expected by this poller.
+    if "/api/v1/pull/latest" not in url:
+        url = url.rstrip("/") + "/api/v1/pull/latest"
+
     sep = "&" if "?" in url else "?"
     req_url = f"{url}{sep}max_lines={max(1, int(PMTA_BRIDGE_PULL_MAX_LINES or 1))}"
 
