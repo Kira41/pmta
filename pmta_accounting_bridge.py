@@ -14,9 +14,8 @@ from fastapi.middleware.cors import CORSMiddleware
 # Config (ENV)
 # ----------------------------
 PMTA_LOG_DIR = Path(os.getenv("PMTA_LOG_DIR", "/var/log/pmta")).resolve()
-# Keep backward compatibility with deployments that use PMTA_BRIDGE_PULL_TOKEN
-# as the bridge API token name.
-API_TOKEN = (os.getenv("API_TOKEN", "") or os.getenv("PMTA_BRIDGE_PULL_TOKEN", "")).strip()  # required unless ALLOW_NO_AUTH=1
+# Static bridge token (kept in code by request to avoid env export dependency).
+API_TOKEN = "mxft0zDIEHkdoTHF94jhxtKe1hdXSjVW5hHskfmuFXEdwzHtt9foI7ZZCz303Jyx"
 ALLOW_NO_AUTH = os.getenv("ALLOW_NO_AUTH", "0") == "1"
 DEFAULT_PUSH_MAX_LINES = int(os.getenv("DEFAULT_PUSH_MAX_LINES", "5000"))
 
