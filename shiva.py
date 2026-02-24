@@ -574,6 +574,17 @@ def db_init() -> None:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_job_outcomes_job ON job_outcomes(job_id)")
 
+            # Recipient -> job mapping (fallback when accounting line lacks job/message ids)
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS rcpt_job_map(
+                       rcpt TEXT PRIMARY KEY,
+                       job_id TEXT NOT NULL,
+                       campaign_id TEXT NOT NULL,
+                       updated_at TEXT NOT NULL
+                   )"""
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_rcpt_job_updated ON rcpt_job_map(updated_at)")
+
             # File offsets for PMTA accounting tailing
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS pmta_offsets(
@@ -683,6 +694,7 @@ def db_clear_all() -> None:
             conn.execute("DELETE FROM campaigns")
             conn.execute("DELETE FROM form_state")
             conn.execute("DELETE FROM jobs")
+            conn.execute("DELETE FROM rcpt_job_map")
             conn.commit()
         finally:
             conn.close()
@@ -824,6 +836,51 @@ def db_set_outcome(job_id: str, rcpt: str, status: str) -> None:
             conn.commit()
         finally:
             conn.close()
+
+
+def db_set_rcpt_job(rcpt: str, job_id: str, campaign_id: str) -> None:
+    r = (rcpt or "").strip().lower()
+    jid = (job_id or "").strip().lower()
+    cid = (campaign_id or "").strip()
+    if not r or not jid:
+        return
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            conn.execute(
+                "INSERT INTO rcpt_job_map(rcpt, job_id, campaign_id, updated_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(rcpt) DO UPDATE SET job_id=excluded.job_id, campaign_id=excluded.campaign_id, updated_at=excluded.updated_at",
+                (r, jid, cid, now_iso()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def db_get_rcpt_job(rcpt: str) -> tuple[str, str]:
+    r = (rcpt or "").strip().lower()
+    if not r:
+        return "", ""
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            row = conn.execute("SELECT job_id, campaign_id FROM rcpt_job_map WHERE rcpt=?", (r,)).fetchone()
+            if not row:
+                return "", ""
+            return str(row[0] or "").strip().lower(), str(row[1] or "").strip()
+        finally:
+            conn.close()
+
+
+def _normalize_accounting_rcpt(v: Any) -> str:
+    s = ("" if v is None else str(v)).strip()
+    if not s:
+        return ""
+    s = s.strip('"').strip().lstrip('<').rstrip('>')
+    m = EMAIL_FIND_RE.search(s)
+    if m:
+        return m.group(0).strip().lower()
+    return s.lower() if EMAIL_RE.match(s.lower()) else ""
 
 
 def db_get_offset(path: str) -> int:
@@ -6829,10 +6886,14 @@ def pmta_chunk_policy(*, smtp_host: str, chunk_domain_counts: dict[str, int]) ->
 #   PMTA_ACCOUNTING_WEBHOOK=1
 # Enable file tail:
 #   PMTA_ACCOUNTING_FILES=/var/log/pmta/accounting.csv,/var/log/pmta/accounting.ndjson
+#   PMTA_ACCOUNTING_DIRS=/mnt/pmta/accounting
+#   PMTA_ACCOUNTING_GLOB=*.csv,*.ndjson
 #   PMTA_ACCOUNTING_POLL_S=2
 PMTA_ACCOUNTING_WEBHOOK = (os.getenv("PMTA_ACCOUNTING_WEBHOOK", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
 PMTA_ACCOUNTING_WEBHOOK_TOKEN = (os.getenv("PMTA_ACCOUNTING_WEBHOOK_TOKEN", "") or "").strip()
 PMTA_ACCOUNTING_FILES = [p.strip() for p in (os.getenv("PMTA_ACCOUNTING_FILES", "") or "").split(",") if p.strip()]
+PMTA_ACCOUNTING_DIRS = [p.strip() for p in (os.getenv("PMTA_ACCOUNTING_DIRS", "") or "").split(",") if p.strip()]
+PMTA_ACCOUNTING_GLOB = [p.strip() for p in (os.getenv("PMTA_ACCOUNTING_GLOB", "*.csv,*.ndjson") or "").split(",") if p.strip()]
 try:
     PMTA_ACCOUNTING_POLL_S = float((os.getenv("PMTA_ACCOUNTING_POLL_S", "2") or "2").strip())
 except Exception:
@@ -6874,6 +6935,76 @@ def _normalize_outcome_type(v: Any) -> str:
     if s in {"c", "complaint", "complained", "fbl"}:
         return "complained"
     return s
+
+
+def _event_value(ev: dict, *names: str) -> str:
+    if not isinstance(ev, dict):
+        return ""
+    aliases = {n.strip().lower().replace("_", "-") for n in names if n and n.strip()}
+    if not aliases:
+        return ""
+
+    for k, v in ev.items():
+        kk = str(k or "").strip().lower().replace("_", "-")
+        if kk in aliases and str(v or "").strip():
+            return str(v).strip()
+
+    for k, v in ev.items():
+        kk = str(k or "").strip().lower().replace("_", "-")
+        if any(a in kk for a in aliases) and str(v or "").strip():
+            return str(v).strip()
+    return ""
+
+
+def _find_job_by_campaign(campaign_id: str) -> Optional[SendJob]:
+    cid = (campaign_id or "").strip()
+    if not cid:
+        return None
+
+    candidates = [j for j in JOBS.values() if (j.campaign_id or "").strip() == cid and not bool(j.deleted)]
+    if not candidates:
+        return None
+
+    running = [j for j in candidates if (j.status or "") in {"running", "backoff", "paused"}]
+    pool = running or candidates
+
+    def _sort_key(j: SendJob) -> tuple[str, str]:
+        return (str(j.updated_at or ""), str(j.created_at or ""))
+
+    pool.sort(key=_sort_key, reverse=True)
+    return pool[0]
+
+
+def _iter_accounting_files() -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+
+    for p in PMTA_ACCOUNTING_FILES:
+        rp = os.path.realpath(p)
+        if rp not in seen:
+            seen.add(rp)
+            out.append(p)
+
+    for d in PMTA_ACCOUNTING_DIRS:
+        try:
+            root = Path(d)
+            if not root.exists() or not root.is_dir():
+                continue
+
+            patterns = PMTA_ACCOUNTING_GLOB or ["*.csv", "*.ndjson"]
+            for pat in patterns:
+                for f in root.rglob(pat):
+                    if not f.is_file():
+                        continue
+                    rp = os.path.realpath(str(f))
+                    if rp in seen:
+                        continue
+                    seen.add(rp)
+                    out.append(str(f))
+        except Exception:
+            continue
+
+    return out
 
 
 def _parse_accounting_line(line: str, *, path: str = "") -> Optional[dict]:
@@ -6923,8 +7054,9 @@ def _parse_accounting_line(line: str, *, path: str = "") -> Optional[dict]:
     if fields:
         ev["type"] = fields[0]
     for f in fields:
-        if EMAIL_RE.match((f or "").strip()):
-            ev["rcpt"] = (f or "").strip()
+        rc = _normalize_accounting_rcpt(f)
+        if rc:
+            ev["rcpt"] = rc
             break
     for f in fields:
         if "@local" in f or "<" in f:
@@ -7004,23 +7136,15 @@ def process_pmta_accounting_event(ev: dict) -> dict:
 
     typ = _normalize_outcome_type(ev.get("type") or ev.get("event") or ev.get("kind") or ev.get("record"))
 
-    rcpt = (ev.get("rcpt") or ev.get("recipient") or ev.get("to") or ev.get("rcpt_to") or "")
-    rcpt = str(rcpt or "").strip()
+    rcpt = _normalize_accounting_rcpt(
+        ev.get("rcpt") or ev.get("recipient") or ev.get("to") or ev.get("rcpt_to") or ""
+    )
 
-    job_id = ""
-    for k in ("x-job-id", "X-Job-ID", "job_id", "jobid"):
-        v = ev.get(k)
-        if v and str(v).strip():
-            job_id = str(v).strip().lower()
-            break
+    job_id = _event_value(ev, "x-job-id", "job-id", "job_id", "jobid").lower()
+    campaign_id = _event_value(ev, "x-campaign-id", "campaign-id", "campaign_id", "cid")
 
     if not job_id:
-        msgid = (
-            ev.get("msgid")
-            or ev.get("message-id") or ev.get("message_id") or ev.get("messageid")
-            or ev.get("header_message-id") or ev.get("header_message_id") or ev.get("header-message-id")
-            or ""
-        )
+        msgid = _event_value(ev, "msgid", "message-id", "message_id", "messageid", "header_message-id", "header_message_id")
         if not msgid:
             # Pick any field that looks like a Message-ID header (different acct-file schemas)
             for k, v in (ev or {}).items():
@@ -7033,26 +7157,39 @@ def process_pmta_accounting_event(ev: dict) -> dict:
     if not job_id:
         job_id = _extract_job_id_from_text(str(ev.get("raw") or ""))
 
-    if not job_id or not rcpt or typ not in {"delivered", "bounced", "deferred", "complained"}:
-        return {"ok": False, "reason": "missing_fields", "job_id": job_id, "rcpt": rcpt, "type": typ}
+    if not rcpt or typ not in {"delivered", "bounced", "deferred", "complained"}:
+        return {"ok": False, "reason": "missing_fields", "job_id": job_id, "campaign_id": campaign_id, "rcpt": rcpt, "type": typ}
 
     with JOBS_LOCK:
-        job = JOBS.get(job_id)
+        job = JOBS.get(job_id) if job_id else None
+        if not job and campaign_id:
+            job = _find_job_by_campaign(campaign_id)
+
+        if not job and rcpt:
+            mapped_job_id, mapped_campaign_id = db_get_rcpt_job(rcpt)
+            if not campaign_id and mapped_campaign_id:
+                campaign_id = mapped_campaign_id
+            if mapped_job_id:
+                job = JOBS.get(mapped_job_id)
+            if not job and campaign_id:
+                job = _find_job_by_campaign(campaign_id)
+
         if not job:
-            return {"ok": False, "reason": "job_not_found", "job_id": job_id}
+            return {"ok": False, "reason": "job_not_found", "job_id": job_id, "campaign_id": campaign_id, "rcpt": rcpt}
 
         _apply_outcome_to_job(job, rcpt, typ)
         job.maybe_persist()
 
-    return {"ok": True, "job_id": job_id, "type": typ, "rcpt": rcpt}
+    return {"ok": True, "job_id": job.id, "campaign_id": job.campaign_id, "type": typ, "rcpt": rcpt}
 
 
 def _accounting_poller_thread():
-    files = list(PMTA_ACCOUNTING_FILES or [])
+    files = _iter_accounting_files()
     if not files:
         return
 
     while True:
+        files = _iter_accounting_files()
         for p in files:
             try:
                 if not os.path.exists(p):
@@ -7091,7 +7228,7 @@ def start_accounting_poller_if_needed():
     global _ACCOUNTING_POLLER_STARTED
     if _ACCOUNTING_POLLER_STARTED:
         return
-    if not PMTA_ACCOUNTING_FILES:
+    if not PMTA_ACCOUNTING_FILES and not PMTA_ACCOUNTING_DIRS:
         return
     _ACCOUNTING_POLLER_STARTED = True
     t = threading.Thread(target=_accounting_poller_thread, daemon=True)
@@ -7372,6 +7509,10 @@ def smtp_send_job(
                         msg.set_content(rendered_body)
 
                     dom = _extract_domain_from_email(rcpt)
+                    try:
+                        db_set_rcpt_job(rcpt, job_id, job.campaign_id or "")
+                    except Exception:
+                        pass
 
                     try:
                         server.send_message(msg)
@@ -7937,6 +8078,10 @@ APP_CONFIG_SCHEMA: list[dict] = [
      "desc": "Enable /pmta/accounting webhook receiver. Requires restart for full effect."},
     {"key": "PMTA_ACCOUNTING_FILES", "type": "str", "default": "", "group": "Accounting", "restart_required": True,
      "desc": "Comma-separated accounting file paths for file tailing. Requires restart to (re)start poller."},
+    {"key": "PMTA_ACCOUNTING_DIRS", "type": "str", "default": "", "group": "Accounting", "restart_required": True,
+     "desc": "Comma-separated directories to scan for accounting files (supports shared mount with permissive chmod)."},
+    {"key": "PMTA_ACCOUNTING_GLOB", "type": "str", "default": "*.csv,*.ndjson", "group": "Accounting", "restart_required": True,
+     "desc": "Comma-separated glob patterns used when scanning PMTA_ACCOUNTING_DIRS recursively."},
     {"key": "PMTA_ACCOUNTING_POLL_S", "type": "float", "default": "2", "group": "Accounting", "restart_required": True,
      "desc": "Polling interval for accounting file tailing. Requires restart if poller not running."},
 ]
