@@ -574,6 +574,19 @@ def db_init() -> None:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_job_outcomes_job ON job_outcomes(job_id)")
 
+            # Per-job recipient registry (helps map accounting rows with missing job/campaign ids)
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS job_recipients(
+                       job_id TEXT NOT NULL,
+                       campaign_id TEXT NOT NULL,
+                       rcpt TEXT NOT NULL,
+                       first_seen_at TEXT NOT NULL,
+                       last_seen_at TEXT NOT NULL,
+                       PRIMARY KEY(job_id, rcpt)
+                   )"""
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_job_recipients_rcpt ON job_recipients(rcpt, last_seen_at)")
+
             # File offsets for PMTA accounting tailing
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS pmta_offsets(
@@ -600,6 +613,8 @@ def db_init() -> None:
                 conn.execute("DELETE FROM campaigns")
                 conn.execute("DELETE FROM form_state")
                 conn.execute("DELETE FROM jobs")
+                conn.execute("DELETE FROM job_outcomes")
+                conn.execute("DELETE FROM job_recipients")
                 conn.commit()
         finally:
             conn.close()
@@ -683,6 +698,8 @@ def db_clear_all() -> None:
             conn.execute("DELETE FROM campaigns")
             conn.execute("DELETE FROM form_state")
             conn.execute("DELETE FROM jobs")
+            conn.execute("DELETE FROM job_outcomes")
+            conn.execute("DELETE FROM job_recipients")
             conn.commit()
         finally:
             conn.close()
@@ -5385,6 +5402,45 @@ def resolve_sender_domain_ips(domain: str) -> list[str]:
     return out
 
 
+def db_mark_job_recipient(job_id: str, campaign_id: str, rcpt: str) -> None:
+    jid = (job_id or "").strip().lower()
+    cid = (campaign_id or "").strip()
+    em = (rcpt or "").strip().lower()
+    if not jid or not em:
+        return
+    ts = now_iso()
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            conn.execute(
+                "INSERT INTO job_recipients(job_id, campaign_id, rcpt, first_seen_at, last_seen_at) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(job_id, rcpt) DO UPDATE SET campaign_id=excluded.campaign_id, last_seen_at=excluded.last_seen_at",
+                (jid, cid, em, ts, ts),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def db_find_job_ids_by_recipient(rcpt: str, limit: int = 8) -> list[str]:
+    em = (rcpt or "").strip().lower()
+    if not em:
+        return []
+    lim = max(1, min(int(limit or 1), 50))
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            rows = conn.execute(
+                "SELECT job_id FROM job_recipients WHERE rcpt=? ORDER BY last_seen_at DESC LIMIT ?",
+                (em, lim),
+            ).fetchall()
+            return [str(r[0]).strip().lower() for r in (rows or []) if r and str(r[0]).strip()]
+        except Exception:
+            return []
+        finally:
+            conn.close()
+
+
 # =========================
 # PowerMTA Monitoring (optional)
 # =========================
@@ -6927,6 +6983,35 @@ def _find_job_by_campaign(campaign_id: str) -> Optional[SendJob]:
     return pool[0]
 
 
+def _find_job_by_recipient(rcpt: str) -> Optional[SendJob]:
+    em = (rcpt or "").strip().lower()
+    if not em:
+        return None
+
+    # 1) Prefer persisted recipient->job mapping (most reliable when ids are absent in PMTA CSV).
+    for jid in db_find_job_ids_by_recipient(em, limit=12):
+        job = JOBS.get(jid)
+        if job and not bool(job.deleted):
+            return job
+
+    # 2) Fallback to in-memory recent send results if DB has no hit.
+    candidates: list[SendJob] = []
+    for job in JOBS.values():
+        if bool(job.deleted):
+            continue
+        rr = job.recent_results or []
+        if any(str(it.get("email") or "").strip().lower() == em for it in rr[-250:]):
+            candidates.append(job)
+
+    if not candidates:
+        return None
+
+    running = [j for j in candidates if (j.status or "") in {"running", "backoff", "paused"}]
+    pool = running or candidates
+    pool.sort(key=lambda j: (str(j.updated_at or ""), str(j.created_at or "")), reverse=True)
+    return pool[0]
+
+
 def _parse_accounting_line(line: str, *, path: str = "") -> Optional[dict]:
     """Parse one accounting line.
 
@@ -7082,8 +7167,10 @@ def process_pmta_accounting_event(ev: dict) -> dict:
         job = JOBS.get(job_id) if job_id else None
         if not job and campaign_id:
             job = _find_job_by_campaign(campaign_id)
+        if not job and rcpt:
+            job = _find_job_by_recipient(rcpt)
         if not job:
-            return {"ok": False, "reason": "job_not_found", "job_id": job_id, "campaign_id": campaign_id}
+            return {"ok": False, "reason": "job_not_found", "job_id": job_id, "campaign_id": campaign_id, "rcpt": rcpt}
 
         _apply_outcome_to_job(job, rcpt, typ)
         job.maybe_persist()
@@ -7523,6 +7610,8 @@ def smtp_send_job(
                 for rcpt in rcpts:
                     if not _wait_ready():
                         return
+
+                    db_mark_job_recipient(job_id, job.campaign_id or "", rcpt)
 
                     msg = EmailMessage()
                     msg["From"] = formataddr((from_name, from_email))
