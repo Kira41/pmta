@@ -6,8 +6,6 @@ import threading
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import List, Tuple, Dict, Any
-from urllib.request import Request as UrlRequest, urlopen
-from urllib.error import URLError, HTTPError
 
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,9 +18,6 @@ PMTA_LOG_DIR = Path(os.getenv("PMTA_LOG_DIR", "/var/log/pmta")).resolve()
 # as the bridge API token name.
 API_TOKEN = (os.getenv("API_TOKEN", "") or os.getenv("PMTA_BRIDGE_PULL_TOKEN", "")).strip()  # required unless ALLOW_NO_AUTH=1
 ALLOW_NO_AUTH = os.getenv("ALLOW_NO_AUTH", "0") == "1"
-# Keep backward compatibility with deployments that use SHIVA_WEBHOOK_URL.
-SHIVA_ACCOUNTING_URL = (os.getenv("SHIVA_ACCOUNTING_URL", "") or os.getenv("SHIVA_WEBHOOK_URL", "")).strip()
-SHIVA_WEBHOOK_TOKEN = os.getenv("SHIVA_WEBHOOK_TOKEN", "").strip()
 DEFAULT_PUSH_MAX_LINES = int(os.getenv("DEFAULT_PUSH_MAX_LINES", "5000"))
 
 # CORS (for browser access)
@@ -144,20 +139,6 @@ def _find_latest_file(patterns: List[str]) -> Path:
     return candidates[0][1]
 
 
-def _read_tail_lines(path: Path, max_lines: int) -> List[str]:
-    lines: List[str] = []
-    safe_max = max(1, max_lines)
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            s = line.strip()
-            if not s:
-                continue
-            lines.append(s)
-            if len(lines) > safe_max:
-                lines.pop(0)
-    return lines
-
-
 def _read_new_lines(path: Path, max_lines: int) -> Dict[str, Any]:
     """Read newly appended lines from latest file with per-file byte offset state."""
     safe_max = max(1, int(max_lines or 1))
@@ -202,44 +183,6 @@ def _read_new_lines(path: Path, max_lines: int) -> Dict[str, Any]:
     }
 
 
-def _push_ndjson(lines: List[str]) -> Dict[str, Any]:
-    if not SHIVA_ACCOUNTING_URL:
-        raise HTTPException(status_code=500, detail="Server misconfig: SHIVA_ACCOUNTING_URL is not set")
-    if not SHIVA_WEBHOOK_TOKEN:
-        raise HTTPException(status_code=500, detail="Server misconfig: SHIVA_WEBHOOK_TOKEN is not set")
-
-    payload = "\n".join(lines).encode("utf-8")
-    req = UrlRequest(
-        SHIVA_ACCOUNTING_URL,
-        data=payload,
-        method="POST",
-        headers={
-            "Content-Type": "application/x-ndjson",
-            "X-Webhook-Token": SHIVA_WEBHOOK_TOKEN,
-        },
-    )
-
-    try:
-        with urlopen(req, timeout=20) as resp:
-            body = (resp.read() or b"{}").decode("utf-8", errors="replace")
-            try:
-                out = json.loads(body)
-            except json.JSONDecodeError:
-                out = {"raw": body}
-            return {
-                "status": int(getattr(resp, "status", 200)),
-                "response": out,
-            }
-    except HTTPError as e:
-        text = (e.read() or b"").decode("utf-8", errors="replace")
-        raise HTTPException(
-            status_code=502,
-            detail={"error": "upstream_http_error", "status": e.code, "body": text[:1000]},
-        )
-    except URLError as e:
-        raise HTTPException(status_code=502, detail={"error": "upstream_connection_error", "reason": str(e)})
-
-
 @app.get("/health")
 def health():
     return {
@@ -259,8 +202,6 @@ def root():
             "health": "/health",
             "files": "/api/v1/files?kind=acct",
             "pull_latest": "/api/v1/pull/latest?kind=acct",
-            "push_latest": "/api/v1/push/latest?kind=acct",
-            "job_push_latest": "/api/v1/jobs/push-latest?kind=acct",
         },
     }
 
@@ -295,46 +236,6 @@ def get_files(
         "total": total,
         "count": len(items),
         "items": items,
-    }
-
-
-@app.post("/api/v1/push/latest")
-def push_latest_accounting(
-    kind: str = "acct",
-    max_lines: int = DEFAULT_PUSH_MAX_LINES,
-    _: None = Depends(require_token),
-):
-    patterns = ALLOWED_KINDS.get(kind)
-    if not patterns:
-        raise HTTPException(status_code=400, detail=f"Invalid kind. Use one of: {list(ALLOWED_KINDS.keys())}")
-
-    latest = _find_latest_file(patterns)
-    lines = _read_tail_lines(latest, max_lines)
-    if not lines:
-        return {"ok": True, "pushed": 0, "file": latest.name, "note": "file had no non-empty lines"}
-
-    upstream = _push_ndjson(lines)
-    return {
-        "ok": True,
-        "kind": kind,
-        "file": latest.name,
-        "pushed": len(lines),
-        "upstream": upstream,
-    }
-
-
-@app.post("/api/v1/jobs/push-latest")
-def job_push_latest_accounting(
-    kind: str = "acct",
-    max_lines: int = DEFAULT_PUSH_MAX_LINES,
-    _: None = Depends(require_token),
-):
-    result = push_latest_accounting(kind=kind, max_lines=max_lines, _=None)
-    return {
-        "ok": True,
-        "job": "push-latest",
-        "executed_at_utc": datetime.now(timezone.utc).isoformat(),
-        "result": result,
     }
 
 
