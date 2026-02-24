@@ -826,50 +826,6 @@ def db_set_outcome(job_id: str, rcpt: str, status: str) -> None:
             conn.close()
 
 
-def db_get_offset(path: str) -> int:
-    p = (path or "").strip()
-    if not p:
-        return 0
-    with DB_LOCK:
-        conn = _db_conn()
-        try:
-            row = conn.execute("SELECT offset FROM pmta_offsets WHERE path=?", (p,)).fetchone()
-            try:
-                return int(row[0]) if row else 0
-            except Exception:
-                return 0
-        finally:
-            conn.close()
-
-
-def db_set_offset(path: str, offset: int) -> None:
-    p = (path or "").strip()
-    if not p:
-        return
-    try:
-        off = int(offset)
-        if off < 0:
-            off = 0
-    except Exception:
-        off = 0
-
-    with DB_LOCK:
-        conn = _db_conn()
-        try:
-            conn.execute(
-                "INSERT INTO pmta_offsets(path, offset, updated_at) VALUES(?,?,?) "
-                "ON CONFLICT(path) DO UPDATE SET offset=excluded.offset, updated_at=excluded.updated_at",
-                (p, off, now_iso()),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-
-# =========================
-# App Config (UI-managed overrides for env/defaults)
-# =========================
-
 def db_get_app_config(key: str) -> Optional[str]:
     k = (key or "").strip()
     if not k:
@@ -6819,30 +6775,9 @@ def pmta_chunk_policy(*, smtp_host: str, chunk_domain_counts: dict[str, int]) ->
 # =========================
 # PowerMTA Accounting ingestion (official bounces/deferrals/complaints)
 # =========================
-# Two supported modes:
-# 1) Webhook (recommended): PMTA pushes events to this app.
-# 2) File tailing: this app tails accounting files on disk.
-#
-# Security:
-#   PMTA_ACCOUNTING_WEBHOOK_TOKEN=...  (required for webhook)
-# Enable webhook:
-#   PMTA_ACCOUNTING_WEBHOOK=1
-# Enable file tail:
-#   PMTA_ACCOUNTING_FILES=/var/log/pmta/accounting.csv,/var/log/pmta/accounting.ndjson
-#   PMTA_ACCOUNTING_DIRS=/mnt/pmta/accounting
-#   PMTA_ACCOUNTING_GLOB=*.csv,*.ndjson
-#   PMTA_ACCOUNTING_POLL_S=2
-PMTA_ACCOUNTING_WEBHOOK = (os.getenv("PMTA_ACCOUNTING_WEBHOOK", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
-PMTA_ACCOUNTING_WEBHOOK_TOKEN = (os.getenv("PMTA_ACCOUNTING_WEBHOOK_TOKEN", "") or "").strip()
-PMTA_ACCOUNTING_FILES = [p.strip() for p in (os.getenv("PMTA_ACCOUNTING_FILES", "") or "").split(",") if p.strip()]
-PMTA_ACCOUNTING_DIRS = [p.strip() for p in (os.getenv("PMTA_ACCOUNTING_DIRS", "") or "").split(",") if p.strip()]
-PMTA_ACCOUNTING_GLOB = [p.strip() for p in (os.getenv("PMTA_ACCOUNTING_GLOB", "*.csv,*.ndjson") or "").split(",") if p.strip()]
-try:
-    PMTA_ACCOUNTING_POLL_S = float((os.getenv("PMTA_ACCOUNTING_POLL_S", "2") or "2").strip())
-except Exception:
-    PMTA_ACCOUNTING_POLL_S = 2.0
-
-PMTA_BRIDGE_PULL_ENABLED = (os.getenv("PMTA_BRIDGE_PULL_ENABLED", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+# Single supported mode:
+# Shiva requests accounting from bridge API, and bridge only serves API responses.
+PMTA_BRIDGE_PULL_ENABLED = (os.getenv("PMTA_BRIDGE_PULL_ENABLED", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
 PMTA_BRIDGE_PULL_URL = (os.getenv("PMTA_BRIDGE_PULL_URL", "") or "").strip()
 PMTA_BRIDGE_PULL_TOKEN = (os.getenv("PMTA_BRIDGE_PULL_TOKEN", "") or "").strip()
 try:
@@ -6854,7 +6789,6 @@ try:
 except Exception:
     PMTA_BRIDGE_PULL_MAX_LINES = 2000
 
-_ACCOUNTING_POLLER_STARTED = False
 _PMTA_ACC_HEADERS: dict[str, list[str]] = {}
 
 # Extract job id from Message-ID we generate:
@@ -6928,38 +6862,6 @@ def _find_job_by_campaign(campaign_id: str) -> Optional[SendJob]:
 
     pool.sort(key=_sort_key, reverse=True)
     return pool[0]
-
-
-def _iter_accounting_files() -> list[str]:
-    out: list[str] = []
-    seen: set[str] = set()
-
-    for p in PMTA_ACCOUNTING_FILES:
-        rp = os.path.realpath(p)
-        if rp not in seen:
-            seen.add(rp)
-            out.append(p)
-
-    for d in PMTA_ACCOUNTING_DIRS:
-        try:
-            root = Path(d)
-            if not root.exists() or not root.is_dir():
-                continue
-
-            patterns = PMTA_ACCOUNTING_GLOB or ["*.csv", "*.ndjson"]
-            for pat in patterns:
-                for f in root.rglob(pat):
-                    if not f.is_file():
-                        continue
-                    rp = os.path.realpath(str(f))
-                    if rp in seen:
-                        continue
-                    seen.add(rp)
-                    out.append(str(f))
-        except Exception:
-            continue
-
-    return out
 
 
 def _parse_accounting_line(line: str, *, path: str = "") -> Optional[dict]:
@@ -7233,58 +7135,6 @@ def _accounting_bridge_poller_thread():
         time.sleep(max(1.0, float(PMTA_BRIDGE_PULL_S or 5.0)))
 
 
-def _accounting_poller_thread():
-    files = _iter_accounting_files()
-    if not files:
-        return
-
-    while True:
-        files = _iter_accounting_files()
-        for p in files:
-            try:
-                if not os.path.exists(p):
-                    continue
-                off = db_get_offset(p)
-                size = os.path.getsize(p)
-                if off > size:
-                    off = 0
-
-                with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                    f.seek(off)
-                    data = f.read()
-                    new_off = f.tell()
-
-                if new_off != off:
-                    db_set_offset(p, new_off)
-
-                if not data:
-                    continue
-
-                for line in data.splitlines():
-                    ev = _parse_accounting_line(line, path=p)
-                    if not ev:
-                        continue
-                    try:
-                        process_pmta_accounting_event(ev)
-                    except Exception:
-                        continue
-            except Exception:
-                continue
-
-        time.sleep(max(0.5, float(PMTA_ACCOUNTING_POLL_S or 2.0)))
-
-
-def start_accounting_poller_if_needed():
-    global _ACCOUNTING_POLLER_STARTED
-    if _ACCOUNTING_POLLER_STARTED:
-        return
-    if not PMTA_ACCOUNTING_FILES and not PMTA_ACCOUNTING_DIRS:
-        return
-    _ACCOUNTING_POLLER_STARTED = True
-    t = threading.Thread(target=_accounting_poller_thread, daemon=True)
-    t.start()
-
-
 def start_accounting_bridge_poller_if_needed():
     if not PMTA_BRIDGE_PULL_ENABLED:
         return
@@ -7294,8 +7144,7 @@ def start_accounting_bridge_poller_if_needed():
     t.start()
 
 
-# Start PMTA accounting pollers if configured.
-start_accounting_poller_if_needed()
+# Start PMTA accounting bridge poller if configured.
 start_accounting_bridge_poller_if_needed()
 
 
@@ -8124,15 +7973,13 @@ APP_CONFIG_SCHEMA: list[dict] = [
     {"key": "OPENROUTER_TIMEOUT_S", "type": "float", "default": "40", "group": "AI", "restart_required": False,
      "desc": "Timeout for OpenRouter HTTP calls (seconds)."},
 
-    # Accounting webhook security
-    {"key": "PMTA_ACCOUNTING_WEBHOOK_TOKEN", "type": "str", "default": "", "group": "Accounting", "restart_required": False, "secret": True,
-     "desc": "Shared secret for /pmta/accounting webhook. Send as X-Webhook-Token header or ?token=."},
+
     {"key": "PMTA_BRIDGE_PULL_TOKEN", "type": "str", "default": "", "group": "Accounting", "restart_required": False, "secret": True,
      "desc": "Bearer token sent by Shiva while pulling /api/v1/pull/latest from bridge."},
 
-    # Accounting bridge pull mode (restart to start/stop background poller)
-    {"key": "PMTA_BRIDGE_PULL_ENABLED", "type": "bool", "default": "0", "group": "Accounting", "restart_required": True,
-     "desc": "If enabled, Shiva periodically pulls accounting lines from bridge API instead of waiting for push."},
+    # Accounting bridge pull mode (Shiva pull request -> bridge API response)
+    {"key": "PMTA_BRIDGE_PULL_ENABLED", "type": "bool", "default": "1", "group": "Accounting", "restart_required": True,
+     "desc": "Enable the only accounting flow: Shiva pulls accounting from bridge API."},
     {"key": "PMTA_BRIDGE_PULL_URL", "type": "str", "default": "", "group": "Accounting", "restart_required": True,
      "desc": "Full bridge endpoint for pull mode, e.g. http://194.116.172.135:8090/api/v1/pull/latest?kind=acct."},
     {"key": "PMTA_BRIDGE_PULL_S", "type": "float", "default": "5", "group": "Accounting", "restart_required": False,
@@ -8143,16 +7990,6 @@ APP_CONFIG_SCHEMA: list[dict] = [
     # App (restart-only)
     {"key": "DB_CLEAR_ON_START", "type": "bool", "default": "0", "group": "App", "restart_required": True,
      "desc": "If enabled: wipes SQLite tables on app start (danger). Requires restart."},
-    {"key": "PMTA_ACCOUNTING_WEBHOOK", "type": "bool", "default": "1", "group": "Accounting", "restart_required": True,
-     "desc": "Enable /pmta/accounting webhook receiver. Requires restart for full effect."},
-    {"key": "PMTA_ACCOUNTING_FILES", "type": "str", "default": "", "group": "Accounting", "restart_required": True,
-     "desc": "Comma-separated accounting file paths for file tailing. Requires restart to (re)start poller."},
-    {"key": "PMTA_ACCOUNTING_DIRS", "type": "str", "default": "", "group": "Accounting", "restart_required": True,
-     "desc": "Comma-separated directories to scan for accounting files (supports shared mount with permissive chmod)."},
-    {"key": "PMTA_ACCOUNTING_GLOB", "type": "str", "default": "*.csv,*.ndjson", "group": "Accounting", "restart_required": True,
-     "desc": "Comma-separated glob patterns used when scanning PMTA_ACCOUNTING_DIRS recursively."},
-    {"key": "PMTA_ACCOUNTING_POLL_S", "type": "float", "default": "2", "group": "Accounting", "restart_required": True,
-     "desc": "Polling interval for accounting file tailing. Requires restart if poller not running."},
 ]
 
 APP_CONFIG_INDEX: dict[str, dict] = {it["key"]: it for it in APP_CONFIG_SCHEMA if isinstance(it, dict) and it.get("key")}
@@ -8259,7 +8096,6 @@ def reload_runtime_config() -> dict:
         global PMTA_PRESSURE_CONTROL, PMTA_PRESSURE_POLL_S
         global PMTA_DOMAIN_STATS, PMTA_DOMAINS_POLL_S, PMTA_DOMAINS_TOP_N
         global OPENROUTER_ENDPOINT, OPENROUTER_MODEL, OPENROUTER_TIMEOUT_S
-        global PMTA_ACCOUNTING_WEBHOOK_TOKEN, PMTA_ACCOUNTING_WEBHOOK
         global PMTA_BRIDGE_PULL_ENABLED, PMTA_BRIDGE_PULL_URL, PMTA_BRIDGE_PULL_TOKEN, PMTA_BRIDGE_PULL_S, PMTA_BRIDGE_PULL_MAX_LINES
 
         # Spam
@@ -8311,10 +8147,6 @@ def reload_runtime_config() -> dict:
         OPENROUTER_ENDPOINT = (cfg_get_str("OPENROUTER_ENDPOINT", OPENROUTER_ENDPOINT) or OPENROUTER_ENDPOINT).strip()
         OPENROUTER_MODEL = (cfg_get_str("OPENROUTER_MODEL", OPENROUTER_MODEL) or OPENROUTER_MODEL).strip()
         OPENROUTER_TIMEOUT_S = float(cfg_get_float("OPENROUTER_TIMEOUT_S", OPENROUTER_TIMEOUT_S))
-
-        # Accounting webhook token / enable
-        PMTA_ACCOUNTING_WEBHOOK_TOKEN = (cfg_get_str("PMTA_ACCOUNTING_WEBHOOK_TOKEN", PMTA_ACCOUNTING_WEBHOOK_TOKEN) or "").strip()
-        PMTA_ACCOUNTING_WEBHOOK = bool(cfg_get_bool("PMTA_ACCOUNTING_WEBHOOK", bool(PMTA_ACCOUNTING_WEBHOOK)))
 
         # Bridge pull mode (Shiva -> Bridge)
         PMTA_BRIDGE_PULL_ENABLED = bool(cfg_get_bool("PMTA_BRIDGE_PULL_ENABLED", bool(PMTA_BRIDGE_PULL_ENABLED)))
@@ -9257,67 +9089,6 @@ def api_preflight():
             "dbl_zones": DBL_ZONES_LIST,
         }
     )
-
-
-@app.post("/pmta/accounting")
-def pmta_accounting_webhook():
-    """Receive PMTA accounting events (NDJSON/JSON) and attach them to Jobs.
-
-    Security:
-      - Set PMTA_ACCOUNTING_WEBHOOK_TOKEN, and send it as:
-          X-Webhook-Token: <token>
-        or ?token=<token>
-    """
-    if not PMTA_ACCOUNTING_WEBHOOK:
-        return jsonify({"ok": False, "error": "webhook disabled"}), 404
-
-    token = (request.headers.get("X-Webhook-Token") or request.args.get("token") or "").strip()
-    if (not PMTA_ACCOUNTING_WEBHOOK_TOKEN) or (token != PMTA_ACCOUNTING_WEBHOOK_TOKEN):
-        return jsonify({"ok": False, "error": "unauthorized"}), 403
-
-    raw = request.get_data(as_text=True) or ""
-    if not raw.strip():
-        return jsonify({"ok": True, "processed": 0, "accepted": 0})
-
-    processed = 0
-    accepted = 0
-
-    ct = (request.headers.get("Content-Type") or "").lower()
-    if "application/json" in ct:
-        obj = request.get_json(silent=True)
-        # New middleware shape: grouped outcomes by campaign_id
-        if isinstance(obj, dict) and isinstance(obj.get("outcomes"), list) and obj.get("campaign_id"):
-            return jsonify(process_campaign_accounting_payload(obj))
-        if isinstance(obj, dict):
-            res = process_pmta_accounting_event(obj)
-            processed += 1
-            accepted += 1 if res.get("ok") else 0
-        elif isinstance(obj, list):
-            for it in obj:
-                if not isinstance(it, dict):
-                    continue
-                res = process_pmta_accounting_event(it)
-                processed += 1
-                accepted += 1 if res.get("ok") else 0
-        else:
-            # Fallback: treat as NDJSON
-            for line in raw.splitlines():
-                ev = _parse_accounting_line(line, path="webhook")
-                if not ev:
-                    continue
-                res = process_pmta_accounting_event(ev)
-                processed += 1
-                accepted += 1 if res.get("ok") else 0
-    else:
-        for line in raw.splitlines():
-            ev = _parse_accounting_line(line, path="webhook")
-            if not ev:
-                continue
-            res = process_pmta_accounting_event(ev)
-            processed += 1
-            accepted += 1 if res.get("ok") else 0
-
-    return jsonify({"ok": True, "processed": processed, "accepted": accepted})
 
 
 @app.post("/api/accounting/bridge/pull")
