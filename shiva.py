@@ -7164,18 +7164,8 @@ def process_pmta_accounting_event(ev: dict) -> dict:
         job = JOBS.get(job_id) if job_id else None
         if not job and campaign_id:
             job = _find_job_by_campaign(campaign_id)
-
-        if not job and rcpt:
-            mapped_job_id, mapped_campaign_id = db_get_rcpt_job(rcpt)
-            if not campaign_id and mapped_campaign_id:
-                campaign_id = mapped_campaign_id
-            if mapped_job_id:
-                job = JOBS.get(mapped_job_id)
-            if not job and campaign_id:
-                job = _find_job_by_campaign(campaign_id)
-
         if not job:
-            return {"ok": False, "reason": "job_not_found", "job_id": job_id, "campaign_id": campaign_id, "rcpt": rcpt}
+            return {"ok": False, "reason": "job_not_found", "job_id": job_id, "campaign_id": campaign_id}
 
         _apply_outcome_to_job(job, rcpt, typ)
         job.maybe_persist()
