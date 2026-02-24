@@ -7153,6 +7153,11 @@ def _poll_accounting_bridge_once() -> dict:
         )
         return {"ok": False, "error": "missing_url", "processed": 0, "accepted": 0}
 
+    # Accept a bare host:port and default to HTTP to avoid urlopen failures
+    # like "unknown url type: 194.116.172.135".
+    if url and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+        url = f"http://{url}"
+
     # Allow passing a base bridge URL (e.g. http://host:8090) and normalize it
     # to the pull endpoint expected by this poller.
     if "/api/v1/pull/latest" not in url:
