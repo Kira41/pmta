@@ -6844,6 +6844,9 @@ _BRIDGE_DEBUG_STATE: dict[str, Any] = {
     "last_lines_sample": [],
 }
 
+_BRIDGE_POLLER_LOCK = threading.Lock()
+_BRIDGE_POLLER_STARTED = False
+
 
 def _bridge_debug_update(**kwargs: Any) -> None:
     with _BRIDGE_DEBUG_LOCK:
@@ -7146,12 +7149,10 @@ def _poll_accounting_bridge_once() -> dict:
             attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
             last_ok=False,
             connected=False,
-            failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + 1,
-            last_error_ts=now_iso(),
-            last_error="missing_url",
+            last_error="bridge_pull_url_not_configured",
             last_duration_ms=int((time.time() - t0) * 1000),
         )
-        return {"ok": False, "error": "missing_url", "processed": 0, "accepted": 0}
+        return {"ok": False, "error": "bridge_pull_url_not_configured", "processed": 0, "accepted": 0}
 
     # Accept a bare host:port and default to HTTP to avoid urlopen failures
     # like "unknown url type: 194.116.172.135".
@@ -7262,12 +7263,15 @@ def _accounting_bridge_poller_thread():
 
 
 def start_accounting_bridge_poller_if_needed():
+    global _BRIDGE_POLLER_STARTED
     if not PMTA_BRIDGE_PULL_ENABLED:
         return
-    if not PMTA_BRIDGE_PULL_URL:
-        return
-    t = threading.Thread(target=_accounting_bridge_poller_thread, daemon=True)
-    t.start()
+    with _BRIDGE_POLLER_LOCK:
+        if _BRIDGE_POLLER_STARTED:
+            return
+        t = threading.Thread(target=_accounting_bridge_poller_thread, daemon=True)
+        t.start()
+        _BRIDGE_POLLER_STARTED = True
 
 
 # Start PMTA accounting bridge poller if configured.
@@ -8280,6 +8284,9 @@ def reload_runtime_config() -> dict:
         PMTA_BRIDGE_PULL_TOKEN = (cfg_get_str("PMTA_BRIDGE_PULL_TOKEN", PMTA_BRIDGE_PULL_TOKEN) or "").strip()
         PMTA_BRIDGE_PULL_S = float(cfg_get_float("PMTA_BRIDGE_PULL_S", float(PMTA_BRIDGE_PULL_S or 5.0)))
         PMTA_BRIDGE_PULL_MAX_LINES = int(cfg_get_int("PMTA_BRIDGE_PULL_MAX_LINES", int(PMTA_BRIDGE_PULL_MAX_LINES or 2000)))
+
+        # If bridge pull gets enabled/configured from UI after startup, ensure poller thread is running.
+        start_accounting_bridge_poller_if_needed()
 
         return {"ok": True, "ts": now_iso()}
     except Exception as e:
