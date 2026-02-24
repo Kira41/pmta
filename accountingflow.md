@@ -76,3 +76,105 @@ curl -X POST "http://194.116.172.135:8090/api/v1/push/latest?kind=acct&token=<AP
 ```
 
 هذا الطلب يذهب إلى bridge؛ والـ bridge بعدها يرسل النتائج إلى Shiva عبر `SHIVA_ACCOUNTING_URL`.
+
+
+## محاكاة عملية كاملة (Shiva على localhost + Bridge/PMTA على سيرفر خارجي)
+
+نفترض السيناريو التالي:
+
+- Shiva يعمل محليًا على جهازك: `http://127.0.0.1:5000`
+- Bridge + PowerMTA + accounting files على السيرفر: `194.116.172.135`
+- bridge يعمل على: `http://194.116.172.135:8090`
+
+### 1) تفعيل endpoint في Shiva (المستقبِل)
+
+على جهاز Shiva المحلي:
+
+```bash
+export PMTA_ACCOUNTING_WEBHOOK=1
+export PMTA_ACCOUNTING_WEBHOOK_TOKEN="MY_SHARED_SECRET"
+# ثم شغّل shiva.py على بورتك المحلي (مثلاً 5000)
+```
+
+الآن Shiva جاهز ليستقبل `POST /pmta/accounting`.
+
+### 2) جعل bridge يعرف عنوان Shiva
+
+على السيرفر الذي فيه bridge:
+
+```bash
+export PORT=8090
+export SHIVA_ACCOUNTING_URL="http://PUBLIC_OR_VPN_IP_OF_SHIVA:5000/pmta/accounting"
+export SHIVA_WEBHOOK_TOKEN="MY_SHARED_SECRET"
+python3 pmta_accounting_bridge.py
+```
+
+> إن كان Shiva فقط على `127.0.0.1` فلن يستطيع السيرفر الخارجي الوصول له مباشرة.
+> تحتاج أحد الحلول: (a) تشغيل Shiva على عنوان شبكي يمكن الوصول له، أو (b) VPN، أو (c) reverse tunnel (مثل ngrok/cloudflared/ssh tunnel).
+
+### 3) طلب دفع النتائج من bridge (يدويًا أو Cron)
+
+```bash
+curl -X POST "http://194.116.172.135:8090/api/v1/push/latest?kind=acct&token=<API_TOKEN>"
+```
+
+ماذا يفعل bridge داخليًا؟
+
+1. يختار أحدث ملف accounting مناسب.
+2. يقرأ آخر السطور (NDJSON/CSV parsing line by line).
+3. يرسل NDJSON إلى `SHIVA_ACCOUNTING_URL` مع `X-Webhook-Token`.
+
+### 4) مثال Response من Shiva إلى bridge
+
+عند نجاح webhook، Shiva يرجع JSON مشابه:
+
+```json
+{
+  "ok": true,
+  "processed": 120,
+  "accepted": 118,
+  "errors": 2
+}
+```
+
+الـ bridge يعيد لك (كعميل ناديت `/push/latest`) Response فيه:
+
+```json
+{
+  "ok": true,
+  "file": "acct-2026-02-24.ndjson",
+  "pushed": 120,
+  "upstream": {
+    "status": 200,
+    "response": {
+      "ok": true,
+      "processed": 120,
+      "accepted": 118,
+      "errors": 2
+    }
+  }
+}
+```
+
+### 5) ماذا يفعل Shiva بهذه الأحداث؟
+
+Shiva يعالج كل event بهذا المنطق:
+
+1. يحاول ربط الحدث بـ `job_id` مباشرةً (`x-job-id` أو `job-id`...).
+2. إن لم يجد، يحاول استخراج `job_id` من Message-ID.
+3. إن لم يجد، fallback على `campaign_id`.
+4. عند نجاح الربط: يحدّث حالة المستلم (`delivered` / `bounced` / `deferred` / `complained`) ويزيد العدادات.
+
+### 6) كيف تظهر على الداشبورد؟
+
+بعد تحديث العدادات داخل job/campaign state:
+
+1. APIs الداخلية في Shiva ترجع الحقول المحدثة.
+2. واجهة الداشبورد تقرأ `outcomes` و `accounting_last_ts` وغيرها.
+3. ترى مباشرة الأرقام مثل delivered/bounced/deferred/complained محدثة.
+
+### 7) أهم نقطة تمنع الالتباس
+
+- Shiva **لا يسحب** من bridge.
+- bridge هو الذي **يدفع Push** إلى Shiva webhook.
+- لذلك الرابط الذي تضعه في bridge يجب أن يكون رابط Shiva (`/pmta/accounting`) وليس العكس.
