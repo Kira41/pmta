@@ -4,7 +4,8 @@ import fnmatch
 import json
 from pathlib import Path
 from datetime import datetime, timezone
-from urllib.request import Request, urlopen
+from typing import List, Tuple, Dict, Any
+from urllib.request import Request as UrlRequest, urlopen
 from urllib.error import URLError, HTTPError
 
 from fastapi import FastAPI, Depends, HTTPException, Request
@@ -38,7 +39,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
     allow_credentials=False,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -74,11 +75,11 @@ def require_token(request: Request):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def _file_matches(name: str, patterns: list[str]) -> bool:
+def _file_matches(name: str, patterns: List[str]) -> bool:
     return any(fnmatch.fnmatch(name, pat) for pat in patterns)
 
 
-def list_dir_files(patterns: list[str]) -> list[dict]:
+def list_dir_files(patterns: List[str]) -> List[Dict[str, Any]]:
     if not PMTA_LOG_DIR.is_dir():
         raise HTTPException(status_code=500, detail=f"Directory not found: {PMTA_LOG_DIR}")
 
@@ -113,8 +114,8 @@ def list_dir_files(patterns: list[str]) -> list[dict]:
     return items
 
 
-def _find_latest_file(patterns: list[str]) -> Path:
-    candidates: list[tuple[float, Path]] = []
+def _find_latest_file(patterns: List[str]) -> Path:
+    candidates: List[Tuple[float, Path]] = []
     for p in PMTA_LOG_DIR.iterdir():
         if not p.is_file() or p.is_symlink():
             continue
@@ -132,8 +133,8 @@ def _find_latest_file(patterns: list[str]) -> Path:
     return candidates[0][1]
 
 
-def _read_tail_lines(path: Path, max_lines: int) -> list[str]:
-    lines: list[str] = []
+def _read_tail_lines(path: Path, max_lines: int) -> List[str]:
+    lines: List[str] = []
     safe_max = max(1, max_lines)
     with path.open("r", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -146,14 +147,14 @@ def _read_tail_lines(path: Path, max_lines: int) -> list[str]:
     return lines
 
 
-def _push_ndjson(lines: list[str]) -> dict:
+def _push_ndjson(lines: List[str]) -> Dict[str, Any]:
     if not SHIVA_ACCOUNTING_URL:
         raise HTTPException(status_code=500, detail="Server misconfig: SHIVA_ACCOUNTING_URL is not set")
     if not SHIVA_WEBHOOK_TOKEN:
         raise HTTPException(status_code=500, detail="Server misconfig: SHIVA_WEBHOOK_TOKEN is not set")
 
     payload = "\n".join(lines).encode("utf-8")
-    req = Request(
+    req = UrlRequest(
         SHIVA_ACCOUNTING_URL,
         data=payload,
         method="POST",
@@ -190,6 +191,21 @@ def health():
         "ok": True,
         "dir": str(PMTA_LOG_DIR),
         "server_time_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "service": "PMTA Accounting/Logs API",
+        "version": "1.1.0",
+        "endpoints": {
+            "health": "/health",
+            "files": "/api/v1/files?kind=acct",
+            "push_latest": "/api/v1/push/latest?kind=acct",
+            "job_push_latest": "/api/v1/jobs/push-latest?kind=acct",
+        },
     }
 
 
@@ -248,6 +264,21 @@ def push_latest_accounting(
         "file": latest.name,
         "pushed": len(lines),
         "upstream": upstream,
+    }
+
+
+@app.post("/api/v1/jobs/push-latest")
+def job_push_latest_accounting(
+    kind: str = "acct",
+    max_lines: int = DEFAULT_PUSH_MAX_LINES,
+    _: None = Depends(require_token),
+):
+    result = push_latest_accounting(kind=kind, max_lines=max_lines, _=None)
+    return {
+        "ok": True,
+        "job": "push-latest",
+        "executed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "result": result,
     }
 
 
