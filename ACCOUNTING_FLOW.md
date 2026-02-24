@@ -1,46 +1,53 @@
-# Shiva ↔ PowerMTA Accounting Bridge flow
+# Accounting Flow (Shiva Pull Model)
 
-This repository supports two ways for Shiva (`shiva.py`) to ingest PowerMTA accounting outcomes:
+This repository now supports pull-based accounting ingestion where **Shiva requests data from bridge**.
 
-1. **Direct webhook to Shiva** (`POST /pmta/accounting` on Shiva).
-2. **Via bridge** (`pmta_accounting_bridge.py`) where the bridge reads PMTA logs and forwards NDJSON to Shiva webhook.
+## Direction
 
-## How Shiva knows where to receive results
+1. Bridge (`pmta_accounting_bridge.py`) reads PMTA accounting files.
+2. Shiva (`shiva.py`) periodically calls bridge API over server IP.
+3. Bridge returns lines only.
+4. Shiva parses and applies outcomes to matching jobs/campaigns.
 
-Shiva does **not** call the bridge directly. Shiva only exposes and secures this endpoint:
+This avoids requiring a public IP for Shiva.
 
-- `POST /pmta/accounting`
-- token is checked from `X-Webhook-Token` header (or `?token=`)
-- token value comes from `PMTA_ACCOUNTING_WEBHOOK_TOKEN`
+## Bridge API for Shiva
 
-So Shiva "knows" incoming accounting data by accepting webhook payloads and mapping each event to a job/campaign.
+New endpoint:
 
-## How the bridge knows where to send
+- `GET /api/v1/pull/latest?kind=acct&max_lines=<N>`
+- Auth: `Authorization: Bearer <API_TOKEN>` (or `?token=` fallback)
 
-Bridge uses environment variables:
+Response shape:
 
-- `SHIVA_ACCOUNTING_URL` → full webhook URL (typically `http://<shiva-host>:<port>/pmta/accounting`)
-- `SHIVA_WEBHOOK_TOKEN` → shared secret sent as `X-Webhook-Token`
+```json
+{
+  "ok": true,
+  "kind": "acct",
+  "file": "acct-2026-02-24.csv",
+  "from_offset": 12345,
+  "to_offset": 14789,
+  "has_more": false,
+  "count": 120,
+  "lines": ["{...}", "{...}"]
+}
+```
 
-Bridge reads latest matching file (acct/diag/log), builds NDJSON payload, then sends `POST` with:
+## Shiva env (pull mode)
 
-- `Content-Type: application/x-ndjson`
-- `X-Webhook-Token: <token>`
+```bash
+export PMTA_BRIDGE_PULL_ENABLED=1
+export PMTA_BRIDGE_PULL_URL="http://194.116.172.135:8090/api/v1/pull/latest?kind=acct"
+export PMTA_BRIDGE_PULL_TOKEN="<API_TOKEN>"
+export PMTA_BRIDGE_PULL_S=5
+export PMTA_BRIDGE_PULL_MAX_LINES=2000
+```
 
-## How result is returned
+Optional manual pull on Shiva:
 
-- Bridge endpoint `POST /api/v1/push/latest` returns:
-  - selected file name,
-  - pushed line count,
-  - upstream status/body returned by Shiva.
-- Shiva webhook returns JSON such as processed/accepted counts.
+- `POST /api/accounting/bridge/pull`
 
-## Event-to-job mapping in Shiva
+## Notes
 
-For each accounting event Shiva tries in this order:
-
-1. explicit `job_id` fields (`x-job-id`, `job-id`, etc.)
-2. extract job id from Message-ID format
-3. fallback by `campaign_id` lookup
-
-If matched, Shiva updates per-recipient outcome (`delivered`, `bounced`, `deferred`, `complained`), updates counters, and persists state.
+- Existing `/pmta/accounting` webhook remains available if needed.
+- Pull mode is one-way request/response: Shiva requests, bridge responds.
