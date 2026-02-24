@@ -16,9 +16,12 @@ from fastapi.middleware.cors import CORSMiddleware
 # Config (ENV)
 # ----------------------------
 PMTA_LOG_DIR = Path(os.getenv("PMTA_LOG_DIR", "/var/log/pmta")).resolve()
-API_TOKEN = os.getenv("API_TOKEN", "")  # required unless ALLOW_NO_AUTH=1
+# Keep backward compatibility with deployments that use PMTA_BRIDGE_PULL_TOKEN
+# as the bridge API token name.
+API_TOKEN = (os.getenv("API_TOKEN", "") or os.getenv("PMTA_BRIDGE_PULL_TOKEN", "")).strip()  # required unless ALLOW_NO_AUTH=1
 ALLOW_NO_AUTH = os.getenv("ALLOW_NO_AUTH", "0") == "1"
-SHIVA_ACCOUNTING_URL = os.getenv("SHIVA_ACCOUNTING_URL", "").strip()
+# Keep backward compatibility with deployments that use SHIVA_WEBHOOK_URL.
+SHIVA_ACCOUNTING_URL = (os.getenv("SHIVA_ACCOUNTING_URL", "") or os.getenv("SHIVA_WEBHOOK_URL", "")).strip()
 SHIVA_WEBHOOK_TOKEN = os.getenv("SHIVA_WEBHOOK_TOKEN", "").strip()
 DEFAULT_PUSH_MAX_LINES = int(os.getenv("DEFAULT_PUSH_MAX_LINES", "5000"))
 
@@ -73,7 +76,11 @@ def require_token(request: Request):
     if auth.lower().startswith("bearer "):
         token = auth.split(" ", 1)[1].strip()
     else:
-        token = request.query_params.get("token", "").strip()
+        token = (
+            request.headers.get("x-api-token", "").strip()
+            or request.query_params.get("token", "").strip()
+            or request.query_params.get("api_token", "").strip()
+        )
 
     if token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
