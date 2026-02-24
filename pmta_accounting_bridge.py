@@ -11,7 +11,7 @@ import os
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.request import Request, urlopen
 
 
@@ -29,7 +29,7 @@ POLL_S = float((os.getenv("PMTA_ACCOUNTING_POLL_S", "2") or "2").strip())
 BATCH_SIZE = int((os.getenv("PMTA_ACCOUNTING_BRIDGE_BATCH_SIZE", "1000") or "1000").strip())
 DRY_RUN = env_bool("PMTA_ACCOUNTING_BRIDGE_DRY_RUN", "0")
 
-HEADERS_BY_PATH: dict[str, list[str]] = {}
+HEADERS_BY_PATH: Dict[str, List[str]] = {}
 
 
 def norm_status(v: Any) -> str:
@@ -58,7 +58,7 @@ def event_value(ev: dict, *names: str) -> str:
     return ""
 
 
-def parse_line(line: str, path: str) -> dict | None:
+def parse_line(line: str, path: str) -> Optional[dict]:
     s = (line or "").strip()
     if not s:
         return None
@@ -79,7 +79,7 @@ def parse_line(line: str, path: str) -> dict | None:
         return None
 
     hdr = HEADERS_BY_PATH.get(path) or []
-    ev: dict[str, Any] = {"raw": s}
+    ev: Dict[str, Any] = {"raw": s}
     if hdr and len(hdr) == len(fields):
         for k, v in zip(hdr, fields):
             if k:
@@ -90,7 +90,7 @@ def parse_line(line: str, path: str) -> dict | None:
     return ev
 
 
-def to_outcome(ev: dict) -> dict | None:
+def to_outcome(ev: dict) -> Optional[dict]:
     campaign_id = event_value(ev, "x-campaign-id", "campaign-id", "campaign_id", "cid")
     if not campaign_id:
         return None
@@ -107,9 +107,9 @@ def to_outcome(ev: dict) -> dict | None:
     }
 
 
-def iter_files() -> list[str]:
-    out: list[str] = []
-    seen: set[str] = set()
+def iter_files() -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
     for p in FILES:
         rp = os.path.realpath(p)
         if rp not in seen:
@@ -131,7 +131,7 @@ def iter_files() -> list[str]:
     return out
 
 
-def load_offsets() -> dict[str, int]:
+def load_offsets() -> Dict[str, int]:
     try:
         with open(OFFSET_FILE, "r", encoding="utf-8") as f:
             obj = json.load(f)
@@ -142,14 +142,14 @@ def load_offsets() -> dict[str, int]:
     return {}
 
 
-def save_offsets(offsets: dict[str, int]) -> None:
+def save_offsets(offsets: Dict[str, int]) -> None:
     tmp = OFFSET_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(offsets, f)
     os.replace(tmp, OFFSET_FILE)
 
 
-def send_grouped(groups: dict[str, list[dict]]) -> None:
+def send_grouped(groups: Dict[str, List[dict]]) -> None:
     for campaign_id, outcomes in groups.items():
         if not outcomes:
             continue
@@ -171,8 +171,8 @@ def send_grouped(groups: dict[str, list[dict]]) -> None:
             _ = resp.read()
 
 
-def collect_batch(offsets: dict[str, int]) -> tuple[dict[str, list[dict]], dict[str, int]]:
-    groups: dict[str, list[dict]] = defaultdict(list)
+def collect_batch(offsets: Dict[str, int]) -> Tuple[Dict[str, List[dict]], Dict[str, int]]:
+    groups: Dict[str, List[dict]] = defaultdict(list)
     count = 0
     for p in iter_files():
         try:
