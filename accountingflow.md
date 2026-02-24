@@ -37,3 +37,42 @@ Shiva يستقبل فقط؛ bridge هو الذي "يعرف أين يرسل".
    - `Content-Type: application/x-ndjson`
    - `X-Webhook-Token: SHIVA_WEBHOOK_TOKEN`
 4. Shiva يتحقق من التوكن ويحوّل الأحداث إلى job/campaign outcomes.
+
+## سؤالك المباشر: أين أضع الرابط `http://194.116.172.135:8090/`؟
+
+- هذا العنوان (مع المنفذ `8090`) هو غالبًا عنوان **خدمة bridge نفسها**.
+- لا تضعه داخل `shiva.py` أو كمتغير `PMTA_ACCOUNTING_WEBHOOK_TOKEN`.
+
+### إذا كان 8090 هو Port الخاص بالـ bridge
+
+- bridge يعرف المنفذ من متغير البيئة `PORT`.
+- إذا لم تضبطه يدويًا، القيمة الافتراضية في `pmta_accounting_bridge.py` هي `8090`.
+
+مثال:
+
+```bash
+# تشغيل bridge على 8090 (افتراضيًا)
+export PORT=8090
+python3 pmta_accounting_bridge.py
+```
+
+### أين يوضع رابط Shiva الحقيقي؟
+
+يوضع في bridge داخل:
+
+```bash
+export SHIVA_ACCOUNTING_URL="http://<shiva-host>:<shiva-port>/pmta/accounting"
+export SHIVA_WEBHOOK_TOKEN="<same-value-as-PMTA_ACCOUNTING_WEBHOOK_TOKEN-in-shiva>"
+```
+
+> مهم: `SHIVA_ACCOUNTING_URL` يجب أن يشير إلى **Shiva endpoint** وليس إلى bridge endpoint.
+
+### كيف ترسل للـ bridge من الخارج؟
+
+إذا bridge شغّال على `194.116.172.135:8090` فاستدعِ endpoint الخاص به مثل:
+
+```bash
+curl -X POST "http://194.116.172.135:8090/api/v1/push/latest?kind=acct&token=<API_TOKEN>"
+```
+
+هذا الطلب يذهب إلى bridge؛ والـ bridge بعدها يرسل النتائج إلى Shiva عبر `SHIVA_ACCOUNTING_URL`.
