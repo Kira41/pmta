@@ -6934,9 +6934,9 @@ def _normalize_outcome_type(v: Any) -> str:
     if not s:
         return ""
     # PMTA accounting often uses a 1-letter type.
-    if s in {"d", "delivered", "delivery", "success"}:
+    if s in {"d", "delivered", "delivery", "success", "accepted", "ok", "sent"}:
         return "delivered"
-    if s in {"b", "bounce", "bounced", "hardbounce", "softbounce"}:
+    if s in {"b", "bounce", "bounced", "hardbounce", "softbounce", "failed", "failure", "reject", "rejected", "error"}:
         return "bounced"
     if s in {"t", "defer", "deferred", "deferral", "transient"}:
         return "deferred"
@@ -7138,9 +7138,24 @@ def process_pmta_accounting_event(ev: dict) -> dict:
     if not isinstance(ev, dict):
         return {"ok": False, "reason": "not_dict"}
 
-    typ = _normalize_outcome_type(ev.get("type") or ev.get("event") or ev.get("kind") or ev.get("record"))
+    typ = _normalize_outcome_type(
+        ev.get("type")
+        or ev.get("event")
+        or ev.get("kind")
+        or ev.get("record")
+        or ev.get("status")
+        or ev.get("result")
+        or ev.get("state")
+    )
 
-    rcpt = (ev.get("rcpt") or ev.get("recipient") or ev.get("to") or ev.get("rcpt_to") or "")
+    rcpt = (
+        ev.get("rcpt")
+        or ev.get("recipient")
+        or ev.get("email")
+        or ev.get("to")
+        or ev.get("rcpt_to")
+        or ""
+    )
     rcpt = str(rcpt or "").strip()
 
     job_id = _event_value(ev, "x-job-id", "job-id", "job_id", "jobid").lower()
@@ -7295,7 +7310,21 @@ def _poll_accounting_bridge_once() -> dict:
         return {"ok": False, "error": "invalid_bridge_json", "processed": 0, "accepted": 0}
 
     lines = obj.get("lines") if isinstance(obj, dict) else None
-    if not isinstance(lines, list):
+
+    # Some bridges return structured rows instead of raw accounting lines,
+    # for example: {"results":[{"email":"a@b.com","status":"failed"}, ...]}
+    # We support both forms.
+    bridge_rows: list[Any] = []
+    if isinstance(lines, list):
+        bridge_rows = list(lines)
+    elif isinstance(obj, dict):
+        for key in ("outcomes", "results", "messages", "items", "rows", "data"):
+            v = obj.get(key)
+            if isinstance(v, list):
+                bridge_rows = v
+                break
+
+    if not isinstance(bridge_rows, list):
         _bridge_debug_update(
             last_attempt_ts=now_iso(),
             attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
@@ -7311,11 +7340,15 @@ def _poll_accounting_bridge_once() -> dict:
 
     processed = 0
     accepted = 0
-    for line in lines:
-        s = str(line or "").strip()
-        if not s:
-            continue
-        ev = _parse_accounting_line(s, path="bridge")
+    for row in bridge_rows:
+        ev: Optional[dict] = None
+        if isinstance(row, dict):
+            ev = row
+        else:
+            s = str(row or "").strip()
+            if not s:
+                continue
+            ev = _parse_accounting_line(s, path="bridge")
         if not ev:
             continue
         res = process_pmta_accounting_event(ev)
@@ -7330,14 +7363,14 @@ def _poll_accounting_bridge_once() -> dict:
         last_ok=True,
         connected=True,
         last_error="",
-        last_bridge_count=len(lines),
+        last_bridge_count=len(bridge_rows),
         last_processed=processed,
         last_accepted=accepted,
         last_response_keys=list(obj.keys()) if isinstance(obj, dict) else [],
-        last_lines_sample=[str(x)[:220] for x in lines[:3]],
+        last_lines_sample=[str(x)[:220] for x in bridge_rows[:3]],
         last_duration_ms=int((time.time() - t0) * 1000),
     )
-    return {"ok": True, "processed": processed, "accepted": accepted, "count": len(lines)}
+    return {"ok": True, "processed": processed, "accepted": accepted, "count": len(bridge_rows)}
 
 
 def _accounting_bridge_poller_thread():
