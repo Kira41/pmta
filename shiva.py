@@ -3315,27 +3315,70 @@ This will remove it from Jobs history.`);
     const entries = Object.entries(ec).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0));
     const el = qk(card,'errorTypes');
     if(!el){ return; }
-    if(!entries.length){ el.textContent = '—'; return; }
+
     const labels = {
       accepted: '2XX accepted',
       temporary_error: '4XX temporary',
       blocked: '5XX blocked'
     };
-    el.innerHTML = entries.map(([k,v]) => `${esc(labels[k] || k)}: <b>${Number(v||0)}</b>`).join(' · ');
 
-    // last accounting errors (last 10)
-    const re = (j.accounting_last_errors || []).slice().reverse().slice(0,10);
+    const rawErrors = Array.isArray(j.accounting_last_errors) ? j.accounting_last_errors : [];
+    const onlyErrors = rawErrors.filter(x => (x && x.kind !== 'accepted'));
+
+    function errorSignature(detail){
+      const txt = (detail || '').toString();
+      const m = txt.match(/\b([245]\.\d\.\d{1,3})\b(?:\s*\(([^)]+)\))?/i);
+      if(m){
+        const code = (m[1] || '').trim();
+        const reason = (m[2] || '').trim();
+        return reason ? `${code} (${reason})` : code;
+      }
+      const smtp = txt.match(/\b([245]\d\d)\b/);
+      if(smtp) return smtp[1];
+      return txt ? txt.slice(0, 120) : 'unknown';
+    }
+
+    const sigMap = new Map();
+    for(const x of onlyErrors){
+      const sig = errorSignature(x.detail);
+      if(!sigMap.has(sig)) sigMap.set(sig, {count: 0, sample: x});
+      const row = sigMap.get(sig);
+      row.count += 1;
+    }
+    const topSig = Array.from(sigMap.entries()).sort((a,b)=>b[1].count-a[1].count)[0] || null;
+
+    if(!entries.length && !topSig){
+      el.textContent = '—';
+    }else{
+      const parts = [];
+      if(topSig){
+        const [sig, info] = topSig;
+        parts.push(`Most common error: <b>${esc(sig)}</b> · <b>${Number(info.count||0)}</b>`);
+        const sample = (info.sample && info.sample.detail) ? info.sample.detail : '';
+        if(sample){
+          parts.push(`Example: ${esc(sample)}`);
+        }
+      }
+      if(entries.length){
+        parts.push(entries.map(([k,v]) => `${esc(labels[k] || k)}: <b>${Number(v||0)}</b>`).join(' · '));
+      }
+      el.innerHTML = parts.join('<br>');
+    }
+
+    // last accounting errors (last 10) - errors only
+    const re = onlyErrors.slice().reverse().slice(0,10);
     const el2 = qk(card,'lastErrors');
     if(el2){
       if(!re.length){ el2.textContent = '—'; }
       else{
         el2.innerHTML = re.map(x => {
-          const kk = (x.kind === 'accepted') ? '2XX' : ((x.kind === 'temporary_error') ? '4XX' : '5XX');
+          const kk = (x.kind === 'temporary_error') ? '4XX' : '5XX';
           return `• [${esc(kk)}] ${esc(x.email || '—')} — ${esc(x.detail || '')}`;
         }).join('<br>');
       }
     }
   }
+
 
   function renderChunkHist(card, j){
     const tb = qk(card,'chunkHist');
