@@ -3263,6 +3263,7 @@ PAGE_JOBS = r"""
     lastFailed: {},
     lastAdaptive: {},
     lastRoute: {},
+    lastPmtaMonitor: {},
   };
 
   async function controlJob(jobId, action){
@@ -3845,6 +3846,20 @@ This will remove it from Jobs history.`);
     alertsEl.textContent = alerts.length ? ('Alerts: ' + alerts.join(' · ')) : 'Alerts: —';
 
     // Notifications
+    const pm = j.pmta_live || null;
+    const pmStateNow = (pm && pm.enabled)
+      ? (pm.ok ? 'ok' : 'bad')
+      : 'disabled';
+    const pmStatePrev = state.lastPmtaMonitor[jobId];
+    if(pmStatePrev !== pmStateNow){
+      if(pmStateNow === 'ok'){
+        toast('✅ PowerMTA Monitor connected', `Job ${jobId}: Live monitor connection is active.`, 'good');
+      }else if(pmStateNow === 'bad'){
+        toast('❌ PowerMTA Monitor disconnected', `Job ${jobId}: ${pm?.reason || 'Monitor unreachable.'}`, 'bad');
+      }
+      state.lastPmtaMonitor[jobId] = pmStateNow;
+    }
+
     const prevStatus = state.lastStatus[jobId];
     if(prevStatus && prevStatus !== st){
       if((st||'').toLowerCase() === 'backoff') toast('Backoff', `Job ${jobId} entered backoff.`, 'warn');
