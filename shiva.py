@@ -2911,6 +2911,48 @@ PAGE_JOBS = r"""
     .smallBar{height:8px; border-radius:999px; background:rgba(255,255,255,.10); border:1px solid rgba(255,255,255,.12); overflow:hidden}
     .smallBar > div{height:100%; width:0%; background: rgba(53,228,154,.55);} 
 
+    .outcomesWrap{
+      margin-top:8px;
+      padding:10px;
+      border:1px solid rgba(255,255,255,.10);
+      border-radius:12px;
+      background: rgba(255,255,255,.03);
+    }
+    .outcomesGrid{
+      display:grid;
+      grid-template-columns: repeat(2, minmax(0,1fr));
+      gap:8px;
+    }
+    .outChip{
+      border:1px solid rgba(255,255,255,.10);
+      border-radius:10px;
+      padding:8px 10px;
+      background: rgba(0,0,0,.16);
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:8px;
+    }
+    .outChip .k{font-size:11px; letter-spacing:.5px; text-transform:uppercase; color:rgba(255,255,255,.62);}
+    .outChip .v{font-weight:900; font-size:15px;}
+    .outChip.del .v{color: var(--good);}
+    .outChip.bnc .v{color: var(--bad);}
+    .outChip.def .v{color: var(--warn);}
+    .outChip.cmp .v{color: #ff8bd6;}
+    .outTrend{
+      margin-top:10px;
+      padding-top:10px;
+      border-top:1px dashed rgba(255,255,255,.12);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size:12px;
+      line-height:1.5;
+      color: rgba(255,255,255,.84);
+      overflow-wrap:anywhere;
+      word-break:break-word;
+    }
+    .outMeta{ margin-top:8px; font-size:11px; color:rgba(255,255,255,.62); }
+    @media (max-width: 560px){ .outcomesGrid{ grid-template-columns: 1fr; } }
+
     table{width:100%; border-collapse:collapse; font-size: 12px;}
     th,td{padding:8px; border-bottom:1px solid rgba(255,255,255,.10); text-align:left; vertical-align:top}
 
@@ -3054,8 +3096,8 @@ PAGE_JOBS = r"""
 
               <div style="height:10px"></div>
               <div class="mini"><b>Outcomes (PMTA accounting)</b></div>
-              <div class="mini" data-k="outcomes">—</div>
-              <div class="mini" data-k="outcomeTrend">—</div>
+              <div class="outcomesWrap" data-k="outcomes">—</div>
+              <div class="outTrend" data-k="outcomeTrend">—</div>
 
               <div style="height:10px"></div>
 
@@ -3601,7 +3643,15 @@ This will remove it from Jobs history.`);
     const trEl = qk(card,'outcomeTrend');
     if(outEl){
       const ts = (j.accounting_last_ts || '').toString();
-      outEl.innerHTML = `del=<b>${Number(j.delivered||0)}</b> · bnc=<b>${Number(j.bounced||0)}</b> · def=<b>${Number(j.deferred||0)}</b> · cmp=<b>${Number(j.complained||0)}</b>` + (ts ? (` · last=${esc(ts)}`) : '');
+      outEl.innerHTML = `
+        <div class="outcomesGrid">
+          <div class="outChip del"><span class="k">Delivered</span><span class="v">${Number(j.delivered||0)}</span></div>
+          <div class="outChip bnc"><span class="k">Bounced</span><span class="v">${Number(j.bounced||0)}</span></div>
+          <div class="outChip def"><span class="k">Deferred</span><span class="v">${Number(j.deferred||0)}</span></div>
+          <div class="outChip cmp"><span class="k">Complained</span><span class="v">${Number(j.complained||0)}</span></div>
+        </div>
+        <div class="outMeta">${ts ? (`Last accounting update: ${esc(ts)}`) : 'Last accounting update: —'}</div>
+      `;
     }
     function spark(vals){
       const chars = '▁▂▃▄▅▆▇█';
@@ -3619,7 +3669,7 @@ This will remove it from Jobs history.`);
       const bncV = tail.map(x=>Number(x.bounced||0));
       const defV = tail.map(x=>Number(x.deferred||0));
       const cmpV = tail.map(x=>Number(x.complained||0));
-      trEl.textContent = tail.length ? (`trend: del ${spark(delV)} · bnc ${spark(bncV)} · def ${spark(defV)} · cmp ${spark(cmpV)}`) : 'trend: —';
+      trEl.textContent = tail.length ? (`Trend · DEL ${spark(delV)} · BNC ${spark(bncV)} · DEF ${spark(defV)} · CMP ${spark(cmpV)}`) : 'Trend · —';
     }
 
     // 5) Top domains
