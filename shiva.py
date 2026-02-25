@@ -2536,7 +2536,7 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
         }
 
         // Start recipient pre-send filter before submitting.
-        toast('فلتر البريد', 'بدأ فلتر التحقق من العناوين قبل الإرسال...', 'warn');
+        toast('Maillist filter', 'The filter started verifying addresses before sending....', 'warn');
 
         // Only NOW show submitting toast (and lock start button) — job creation in progress.
         toast('Sending', 'Submitting... please wait', 'warn');
