@@ -3683,9 +3683,14 @@ This will remove it from Jobs history.`);
         if(tqs.length){
           const top = tqs.slice(0, 4).map(x => {
             const qn = (x.queue ?? '').toString();
+            const dm = (x.domain ?? '').toString();
             const rr = (x.recipients ?? 0);
             const dd = (x.deferred ?? 0);
-            return `${qn}=${rr}` + (dd ? (`(def:${dd})`) : '');
+            const le = (x.last_error ?? '').toString();
+            const base = `${qn}=${rr}` + (dd ? (`(def:${dd})`) : '');
+            const domPart = dm ? (` [${dm}]`) : '';
+            const errPart = le ? (` · err: ${le.slice(0,70)}`) : '';
+            return base + domPart + errPart;
           });
           topTxt = top.join(' · ');
         }
@@ -3748,13 +3753,21 @@ This will remove it from Jobs history.`);
     const trEl = qk(card,'outcomeTrend');
     if(outEl){
       const ts = (j.accounting_last_ts || '').toString();
+      const deliveredN = Number(j.delivered||0);
+      const bouncedN = Number(j.bounced||0);
+      const deferredN = Number(j.deferred||0);
+      const complainedN = Number(j.complained||0);
+      const sentN = Number(j.sent||0);
+      const pendingByOutcome = Math.max(0, sentN - deliveredN - bouncedN - complainedN);
+      const queuedNow = Number((((j.pmta_live || {}).queued_recipients) ?? 0) || 0);
       outEl.innerHTML = `
         <div class="outcomesGrid">
-          <div class="outChip del"><span class="k">Delivered</span><span class="v">${Number(j.delivered||0)}</span></div>
-          <div class="outChip bnc"><span class="k">Bounced</span><span class="v">${Number(j.bounced||0)}</span></div>
-          <div class="outChip def"><span class="k">Deferred</span><span class="v">${Number(j.deferred||0)}</span></div>
-          <div class="outChip cmp"><span class="k">Complained</span><span class="v">${Number(j.complained||0)}</span></div>
+          <div class="outChip del"><span class="k">Delivered</span><span class="v">${deliveredN}</span></div>
+          <div class="outChip bnc"><span class="k">Bounced</span><span class="v">${bouncedN}</span></div>
+          <div class="outChip def"><span class="k">Deferred</span><span class="v">${deferredN}</span></div>
+          <div class="outChip cmp"><span class="k">Complained</span><span class="v">${complainedN}</span></div>
         </div>
+        <div class="outMeta">Pending (sent - final outcomes): <b>${pendingByOutcome}</b> · PMTA queue now: <b>${queuedNow}</b></div>
         <div class="outMeta">${ts ? (`Last accounting update: ${esc(ts)}`) : 'Last accounting update: —'}</div>
       `;
     }
@@ -6085,6 +6098,30 @@ def _sum_queue_counts(obj: Any) -> tuple[Optional[int], Optional[int]]:
     return (sum_rcpt if got_rcpt else None), (sum_msg if got_msg else None)
 
 
+def _normalize_pmta_queue_to_domain(name: Any) -> str:
+    """Normalize PMTA queue/domain labels to a recipient domain key.
+
+    PMTA queue names are often shaped like:
+      gmail.com/pmta-mpp-info
+      gmail.com/*
+      *.example.net/vmta-1
+    We only need the domain part for Shiva domain-level counters.
+    """
+    s = str(name or "").strip().lower()
+    if not s:
+        return ""
+    # Keep left-most queue segment before '/' (domain-like in PMTA queues page).
+    if "/" in s:
+        s = s.split("/", 1)[0].strip()
+    s = s.strip(".")
+    # Avoid wildcard placeholders.
+    if s.startswith("*."):
+        s = s[2:]
+    if s in {"*", "*.*", "*/*"}:
+        return ""
+    return s if "." in s else ""
+
+
 def _queues_extract_top(obj: Any, *, top_n: int = 6) -> list[dict]:
     """Best-effort: extract top queues (by recipients) from /queues JSON.
 
@@ -6151,9 +6188,18 @@ def _queues_extract_top(obj: Any, *, top_n: int = 6) -> list[dict]:
         if not qn:
             continue
 
+        dom = _normalize_pmta_queue_to_domain(qn)
+
         rcpt = pick_int(it, ("recipients", "rcp", "rcpts", "queued_recipients", "recipientcount"))
         msgs = pick_int(it, ("messages", "msg", "msgs", "queued_messages", "messagecount"))
         defer = pick_int(it, ("deferred", "deferrals", "deferred_recipients", "deferredrecipients"))
+
+        last_err = ""
+        for k in ("lasterror", "last_error", "error", "reason", "diag", "lastdiag", "last_diag"):
+            v = it.get(k)
+            if isinstance(v, str) and v.strip():
+                last_err = v.strip()
+                break
 
         if rcpt is None:
             rcpt = _deep_find_first_int(it, {"recipients", "rcpt", "queued"})
@@ -6164,9 +6210,11 @@ def _queues_extract_top(obj: Any, *, top_n: int = 6) -> list[dict]:
 
         out.append({
             "queue": qn,
+            "domain": dom,
             "recipients": int(rcpt or 0),
             "messages": int(msgs or (rcpt or 0)),
             "deferred": int(defer or 0),
+            "last_error": last_err,
         })
 
     out.sort(key=lambda x: int(x.get("recipients") or 0), reverse=True)
@@ -6568,8 +6616,9 @@ def pmta_domains_overview(*, smtp_host: str) -> dict:
 
     out: dict[str, dict] = {}
     for it in items:
-        dom = pick_name(it)
-        if not dom or ("." not in dom):
+        raw_name = pick_name(it)
+        dom = _normalize_pmta_queue_to_domain(raw_name)
+        if not dom:
             continue
 
         queued = _deep_find_first_int(it, {"queued", "queued_recipients", "queuedrecipients", "recipientqueued", "queue_recipients", "queue", "rcpt", "rcp", "recipients"})
@@ -6582,10 +6631,16 @@ def pmta_domains_overview(*, smtp_host: str) -> dict:
         if deferred is None:
             deferred = _deep_sum_ints_by_key_pred(it, lambda k: "defer" in k, max_nodes=800)
 
+        old = out.get(dom) or {}
         out[dom] = {
-            "queued": int(queued or 0),
-            "deferred": int(deferred or 0),
-            "active": (int(active) if active is not None else None),
+            # multiple queues/vMTAs can belong to same domain, so aggregate
+            "queued": int(old.get("queued") or 0) + int(queued or 0),
+            "deferred": int(old.get("deferred") or 0) + int(deferred or 0),
+            "active": (
+                (int(old.get("active") or 0) + int(active or 0))
+                if (active is not None or old.get("active") is not None)
+                else None
+            ),
         }
 
     return {"ok": True, "reason": "ok", "url": url, "domains": out}
