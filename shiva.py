@@ -3656,48 +3656,27 @@ This will remove it from Jobs history.`);
       const qR  = _pmFmt(pm.queued_recipients);
       const qM  = _pmFmt(pm.queued_messages);
       const con = _pmFmt(pm.active_connections);
-      const def = _pmFmt(pm.deferred_total);
+      const conIn = _pmFmt(pm.smtp_in_connections);
+      const conOut = _pmFmt(pm.smtp_out_connections);
+      const hrIn = _pmFmt(pm.traffic_last_hr_in);
+      const hrOut = _pmFmt(pm.traffic_last_hr_out);
+      const minIn = _pmFmt(pm.traffic_last_min_in);
+      const minOut = _pmFmt(pm.traffic_last_min_out);
       const ts  = pm.ts ? String(pm.ts) : '';
 
       const spR_n = _pmNum(pm.spool_recipients);
       const qR_n  = _pmNum(pm.queued_recipients);
       const con_n = _pmNum(pm.active_connections);
-      const def_n = _pmNum(pm.deferred_total);
+      const hrIn_n = _pmNum(pm.traffic_last_hr_in);
+      const hrOut_n = _pmNum(pm.traffic_last_hr_out);
+      const minIn_n = _pmNum(pm.traffic_last_min_in);
+      const minOut_n = _pmNum(pm.traffic_last_min_out);
 
       const toneSp = _pmTone('backlog', spR_n);
       const toneQ  = _pmTone('backlog', qR_n);
-      const toneD  = _pmTone('deferred', def_n);
+      const toneHr = _pmTone('deferred', (hrIn_n || 0) + (hrOut_n || 0));
+      const toneMin = _pmTone('deferred', (minIn_n || 0) + (minOut_n || 0));
       const toneC  = _pmTone('conns', con_n);
-
-      // pressure chip
-      let pTagTone = '';
-      let pTagLabel = '';
-      let pBody = '';
-      try{
-        if(pr && pr.enabled && pr.ok){
-          const lvl = Number(pr.level || 0);
-          pTagTone = _pmTone('pressure', lvl);
-          pTagLabel = 'L' + String(lvl);
-          const bits = [];
-          if(pr.delay_min !== undefined && pr.delay_min !== null) bits.push('delay≥' + pr.delay_min);
-          if(pr.workers_max !== undefined && pr.workers_max !== null) bits.push('workers≤' + pr.workers_max);
-          if(pr.chunk_size_max !== undefined && pr.chunk_size_max !== null) bits.push('chunk≤' + pr.chunk_size_max);
-          if(pr.sleep_min !== undefined && pr.sleep_min !== null) bits.push('sleep≥' + pr.sleep_min);
-          if(bits.length){
-            pBody = `<div class="pmtaSub">${esc(bits.join(' · '))}</div>`;
-          } else {
-            pBody = `<div class="pmtaSub">no limits</div>`;
-          }
-        } else {
-          pTagTone = 'good';
-          pTagLabel = 'L0';
-          pBody = `<div class="pmtaSub">ok</div>`;
-        }
-      }catch(e){
-        pTagTone = 'warn';
-        pTagLabel = '';
-        pBody = `<div class="pmtaSub">—</div>`;
-      }
 
       // top queues
       let topTxt = '—';
@@ -3723,9 +3702,9 @@ This will remove it from Jobs history.`);
         <div class="pmtaGrid">
           ${_box('Spool', toneSp, 'rcpt', _kv('RCPT', spR, toneSp, true) + _kv('MSG', spM, toneSp, false))}
           ${_box('Queue', toneQ, 'rcpt', _kv('RCPT', qR, toneQ, true) + _kv('MSG', qM, toneQ, false))}
-          ${_box('Connections', toneC, '', _kv('SMTP', con, toneC, true) + `<div class="pmtaSub">active in+out</div>`)}
-          ${_box('Deferred', toneD, '', _kv('TOTAL', def, toneD, true) + `<div class="pmtaSub">deferrals now</div>`)}
-          ${_box('Pressure', pTagTone, pTagLabel, pBody)}
+          ${_box('Connections', toneC, '', _kv('SMTP In', conIn, toneC, true) + _kv('SMTP Out', conOut, toneC, true) + _kv('Total', con, toneC, false))}
+          ${_box('Last minute', toneMin, '', _kv('In', minIn, toneMin, true) + _kv('Out', minOut, toneMin, true) + `<div class="pmtaSub">traffic recipients / minute</div>`)}
+          ${_box('Last hour', toneHr, '', _kv('In', hrIn, toneHr, true) + _kv('Out', hrOut, toneHr, true) + `<div class="pmtaSub">traffic recipients / hour</div>`)}
           ${_box('Top queues', (topTxt === '—' ? 'good' : 'warn'), '', `<div class="pmtaSub">${esc(topTxt)}</div>`)}
           ${_box('Time', 'good', '', `<div class="pmtaSub">${esc(ts || '—')}</div>`)}
         </div>
@@ -6842,7 +6821,9 @@ def pmta_live_panel(*, smtp_host: str) -> dict:
         enabled, ok, reason, ts,
         spool_recipients, spool_messages,
         queued_recipients, queued_messages,
-        active_connections,
+        active_connections, smtp_in_connections, smtp_out_connections,
+        traffic_last_hr_in, traffic_last_hr_out,
+        traffic_last_min_in, traffic_last_min_out,
         deferred_total,
         top_queues,
         status_url, queues_url
@@ -6866,6 +6847,8 @@ def pmta_live_panel(*, smtp_host: str) -> dict:
             return st
         data = obj.get("data")
         if isinstance(data, dict):
+            if isinstance(data.get("status"), dict):
+                return data.get("status")  # type: ignore
             mta = data.get("mta")
             if isinstance(mta, dict) and isinstance(mta.get("status"), dict):
                 return mta.get("status")  # type: ignore
@@ -6906,6 +6889,8 @@ def pmta_live_panel(*, smtp_host: str) -> dict:
 
     # Connections (sum in+out)
     active_conns: Optional[int] = None
+    smtp_in_conns: Optional[int] = None
+    smtp_out_conns: Optional[int] = None
     conn = stn.get("conn") if isinstance(stn.get("conn"), dict) else {}
     if isinstance(conn, dict) and conn:
         smtp_in = conn.get("smtpIn") if isinstance(conn.get("smtpIn"), dict) else {}
@@ -6915,15 +6900,42 @@ def pmta_live_panel(*, smtp_host: str) -> dict:
         if isinstance(smtp_in, dict):
             iv = _to_int(smtp_in.get("cur"))
             if iv is not None:
+                smtp_in_conns = int(iv)
                 a += int(iv)
                 got = True
         if isinstance(smtp_out, dict):
             iv = _to_int(smtp_out.get("cur"))
             if iv is not None:
+                smtp_out_conns = int(iv)
                 a += int(iv)
                 got = True
         if got:
             active_conns = int(a)
+
+    # Traffic stats (recipients): last hour + last minute (in/out)
+    traffic_last_hr_in: Optional[int] = None
+    traffic_last_hr_out: Optional[int] = None
+    traffic_last_min_in: Optional[int] = None
+    traffic_last_min_out: Optional[int] = None
+    traffic = stn.get("traffic") if isinstance(stn.get("traffic"), dict) else {}
+    if isinstance(traffic, dict) and traffic:
+        last_hr = traffic.get("lastHr") if isinstance(traffic.get("lastHr"), dict) else {}
+        if isinstance(last_hr, dict) and last_hr:
+            hr_in = last_hr.get("in") if isinstance(last_hr.get("in"), dict) else {}
+            hr_out = last_hr.get("out") if isinstance(last_hr.get("out"), dict) else {}
+            if isinstance(hr_in, dict):
+                traffic_last_hr_in = _to_int(hr_in.get("rcp"))
+            if isinstance(hr_out, dict):
+                traffic_last_hr_out = _to_int(hr_out.get("rcp"))
+
+        last_min = traffic.get("lastMin") if isinstance(traffic.get("lastMin"), dict) else {}
+        if isinstance(last_min, dict) and last_min:
+            min_in = last_min.get("in") if isinstance(last_min.get("in"), dict) else {}
+            min_out = last_min.get("out") if isinstance(last_min.get("out"), dict) else {}
+            if isinstance(min_in, dict):
+                traffic_last_min_in = _to_int(min_in.get("rcp"))
+            if isinstance(min_out, dict):
+                traffic_last_min_out = _to_int(min_out.get("rcp"))
 
     # NOTE: Do NOT use deep-int fallback for connections.
     # Some PMTA nodes are dicts like {'cur':0,'max':1200,'top':2} and naive parsing can produce fake numbers (e.g., 12002).
@@ -6981,6 +6993,18 @@ def pmta_live_panel(*, smtp_host: str) -> dict:
             queued_msg = int(queued_rcpt)
         if active_conns is None:
             active_conns = 0
+        if smtp_in_conns is None:
+            smtp_in_conns = 0
+        if smtp_out_conns is None:
+            smtp_out_conns = 0
+        if traffic_last_hr_in is None:
+            traffic_last_hr_in = 0
+        if traffic_last_hr_out is None:
+            traffic_last_hr_out = 0
+        if traffic_last_min_in is None:
+            traffic_last_min_in = 0
+        if traffic_last_min_out is None:
+            traffic_last_min_out = 0
 
     return {
         "enabled": True,
@@ -6993,6 +7017,12 @@ def pmta_live_panel(*, smtp_host: str) -> dict:
         "queued_recipients": queued_rcpt,
         "queued_messages": queued_msg,
         "active_connections": active_conns,
+        "smtp_in_connections": smtp_in_conns,
+        "smtp_out_connections": smtp_out_conns,
+        "traffic_last_hr_in": traffic_last_hr_in,
+        "traffic_last_hr_out": traffic_last_hr_out,
+        "traffic_last_min_in": traffic_last_min_in,
+        "traffic_last_min_out": traffic_last_min_out,
         "deferred_total": int(deferred_total or 0),
         "top_queues": top_queues,
         "ts": now_iso(),
