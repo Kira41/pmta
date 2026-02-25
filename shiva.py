@@ -298,6 +298,9 @@ class SendJob:
     # Per-minute series for simple trends (each item: {t_min, delivered, bounced, deferred, complained})
     outcome_series: list[dict] = field(default_factory=list)
     accounting_last_ts: str = ""
+    # Accounting error rollups (response classes from accounting rows)
+    accounting_error_counts: dict[str, int] = field(default_factory=dict)
+    accounting_last_errors: list[dict] = field(default_factory=list)  # {ts, email, type, kind, detail}
 
     # Spam score gate (computed before sending)
     spam_threshold: float = 4.0
@@ -755,6 +758,8 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "complained": int(job.complained or 0),
         "outcome_series": (job.outcome_series or [])[-180:],
         "accounting_last_ts": job.accounting_last_ts or "",
+        "accounting_error_counts": job.accounting_error_counts or {},
+        "accounting_last_errors": (job.accounting_last_errors or [])[-50:],
         "spam_threshold": float(job.spam_threshold or 4.0),
         "spam_score": job.spam_score,
         "spam_detail": (job.spam_detail or "")[:2000],
@@ -972,6 +977,8 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job.complained = int(s.get("complained") or 0)
         job.outcome_series = list(s.get("outcome_series") or [])
         job.accounting_last_ts = str(s.get("accounting_last_ts") or "")
+        job.accounting_error_counts = dict(s.get("accounting_error_counts") or {})
+        job.accounting_last_errors = list(s.get("accounting_last_errors") or [])
 
         job.spam_threshold = float(s.get("spam_threshold") or 4.0)
         job.spam_score = s.get("spam_score")
@@ -2941,8 +2948,10 @@ PAGE_JOBS = r"""
     .outChip.cmp .v{color: #ff8bd6;}
     .outTrend{
       margin-top:10px;
-      padding-top:10px;
-      border-top:1px dashed rgba(255,255,255,.12);
+      padding:10px;
+      border:1px dashed rgba(255,255,255,.14);
+      border-radius:10px;
+      background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.01));
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
       font-size:12px;
       line-height:1.5;
@@ -2950,6 +2959,14 @@ PAGE_JOBS = r"""
       overflow-wrap:anywhere;
       word-break:break-word;
     }
+    .trendHead{ color: rgba(255,255,255,.66); margin-right:8px; font-weight:800; }
+    .trendSeg{ display:inline-flex; align-items:center; gap:6px; margin:2px 8px 2px 0; }
+    .trendSeg .lbl{ font-weight:900; letter-spacing:.5px; }
+    .trendSeg .spark{ font-size:13px; }
+    .trendSeg.del .lbl, .trendSeg.del .spark{ color: var(--good); }
+    .trendSeg.bnc .lbl, .trendSeg.bnc .spark{ color: var(--bad); }
+    .trendSeg.def .lbl, .trendSeg.def .spark{ color: var(--warn); }
+    .trendSeg.cmp .lbl, .trendSeg.cmp .spark{ color: #ff8bd6; }
     .outMeta{ margin-top:8px; font-size:11px; color:rgba(255,255,255,.62); }
     @media (max-width: 560px){ .outcomesGrid{ grid-template-columns: 1fr; } }
 
@@ -3294,20 +3311,28 @@ This will remove it from Jobs history.`);
   }
 
   function renderErrorTypes(card, j){
-    const ec = j.error_counts || {};
+    const ec = j.accounting_error_counts || {};
     const entries = Object.entries(ec).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0));
     const el = qk(card,'errorTypes');
     if(!el){ return; }
     if(!entries.length){ el.textContent = '—'; return; }
-    el.innerHTML = entries.map(([k,v]) => `${esc(k)}: <b>${Number(v||0)}</b>`).join(' · ');
+    const labels = {
+      accepted: '2XX accepted',
+      temporary_error: '4XX temporary',
+      blocked: '5XX blocked'
+    };
+    el.innerHTML = entries.map(([k,v]) => `${esc(labels[k] || k)}: <b>${Number(v||0)}</b>`).join(' · ');
 
-    // last errors from recent_results
-    const re = (j.recent_results || []).slice().reverse().filter(x => !x.ok).slice(0,10);
+    // last accounting errors (last 10)
+    const re = (j.accounting_last_errors || []).slice().reverse().slice(0,10);
     const el2 = qk(card,'lastErrors');
     if(el2){
       if(!re.length){ el2.textContent = '—'; }
       else{
-        el2.innerHTML = re.map(x => `• ${esc(x.email)} — ${esc(x.detail)}`).join('<br>');
+        el2.innerHTML = re.map(x => {
+          const kk = (x.kind === 'accepted') ? '2XX' : ((x.kind === 'temporary_error') ? '4XX' : '5XX');
+          return `• [${esc(kk)}] ${esc(x.email || '—')} — ${esc(x.detail || '')}`;
+        }).join('<br>');
       }
     }
   }
@@ -3669,7 +3694,17 @@ This will remove it from Jobs history.`);
       const bncV = tail.map(x=>Number(x.bounced||0));
       const defV = tail.map(x=>Number(x.deferred||0));
       const cmpV = tail.map(x=>Number(x.complained||0));
-      trEl.textContent = tail.length ? (`Trend · DEL ${spark(delV)} · BNC ${spark(bncV)} · DEF ${spark(defV)} · CMP ${spark(cmpV)}`) : 'Trend · —';
+      if(tail.length){
+        trEl.innerHTML = [
+          `<span class="trendHead">Trend</span>`,
+          `<span class="trendSeg del"><span class="lbl">DEL</span><span class="spark">${esc(spark(delV))}</span></span>`,
+          `<span class="trendSeg bnc"><span class="lbl">BNC</span><span class="spark">${esc(spark(bncV))}</span></span>`,
+          `<span class="trendSeg def"><span class="lbl">DEF</span><span class="spark">${esc(spark(defV))}</span></span>`,
+          `<span class="trendSeg cmp"><span class="lbl">CMP</span><span class="spark">${esc(spark(cmpV))}</span></span>`
+        ].join(' ');
+      } else {
+        trEl.textContent = 'Trend · —';
+      }
     }
 
     // 5) Top domains
@@ -7126,10 +7161,25 @@ def _parse_accounting_line(line: str, *, path: str = "") -> Optional[dict]:
     # Heuristic fallback
     if fields:
         ev["type"] = fields[0]
-    for f in fields:
-        if EMAIL_RE.match((f or "").strip()):
-            ev["rcpt"] = (f or "").strip()
-            break
+
+    # Common PMTA acct CSV fallback mapping (no header).
+    # Example:
+    # b,<time>,<time>,mailfrom,rcpt,,failed,5.1.1 (...),"smtp;550 ...",...
+    if len(fields) >= 9:
+        ev["mailfrom"] = fields[3]
+        ev["rcpt"] = fields[4]
+        ev["status"] = fields[6]
+        ev["dsnStatus"] = fields[7]
+        ev["dsnDiag"] = fields[8]
+
+    # Recipient fallback: prefer 2nd email-looking token (mailfrom is usually first).
+    em_pos = [(i, (f or "").strip()) for i, f in enumerate(fields) if EMAIL_RE.match((f or "").strip())]
+    if em_pos:
+        if len(em_pos) >= 2:
+            ev["rcpt"] = em_pos[1][1]
+        elif "rcpt" not in ev:
+            ev["rcpt"] = em_pos[0][1]
+
     for f in fields:
         if "@local" in f or "<" in f:
             ev["msgid"] = f
@@ -7201,6 +7251,60 @@ def _apply_outcome_to_job(job: SendJob, rcpt: str, kind: str) -> None:
     job.accounting_last_ts = now_iso()
 
 
+def _classify_accounting_response(ev: dict, typ: str) -> tuple[str, str]:
+    """Return (kind, full_error_text) using accounting response data.
+
+    kind is one of: accepted, temporary_error, blocked.
+    """
+    bits = [
+        _event_value(ev, "response", "smtp-response", "smtp_response"),
+        _event_value(ev, "dsnStatus", "dsn_status", "enhanced-status", "enhanced_status"),
+        _event_value(ev, "dsnDiag", "dsn_diag", "diag", "diagnostic", "smtp-diagnostic"),
+        _event_value(ev, "status", "result", "state"),
+    ]
+    parts = [str(x).strip() for x in bits if str(x or "").strip()]
+    full = " | ".join(parts)
+
+    probe = " ".join(parts).lower()
+    code_match = re.search(r"\b([245])[0-9]{2}\b", probe)
+    if not code_match:
+        code_match = re.search(r"\b([245])\.[0-9]\.[0-9]\b", probe)
+
+    if code_match:
+        lead = code_match.group(1)
+        if lead == "2":
+            return "accepted", full
+        if lead == "4":
+            return "temporary_error", full
+        if lead == "5":
+            return "blocked", full
+
+    # Fallback from normalized outcome when code is missing.
+    t = (typ or "").strip().lower()
+    if t == "delivered":
+        return "accepted", full
+    if t == "deferred":
+        return "temporary_error", full
+    if t in {"bounced", "complained"}:
+        return "blocked", full
+    return "temporary_error", full
+
+
+def _record_accounting_error(job: SendJob, rcpt: str, typ: str, ev: dict) -> None:
+    kind, detail = _classify_accounting_response(ev, typ)
+    job.accounting_error_counts[kind] = int(job.accounting_error_counts.get(kind, 0) or 0) + 1
+    entry = {
+        "ts": now_iso(),
+        "email": (rcpt or "").strip(),
+        "type": typ,
+        "kind": kind,
+        "detail": detail,
+    }
+    job.accounting_last_errors.append(entry)
+    if len(job.accounting_last_errors) > 80:
+        job.accounting_last_errors = job.accounting_last_errors[-40:]
+
+
 def process_pmta_accounting_event(ev: dict) -> dict:
     """Process one accounting event dict. Returns small result info."""
     if not isinstance(ev, dict):
@@ -7265,6 +7369,7 @@ def process_pmta_accounting_event(ev: dict) -> dict:
             return {"ok": False, "reason": "job_not_found", "job_id": job_id, "campaign_id": campaign_id, "rcpt": rcpt}
 
         _apply_outcome_to_job(job, rcpt, typ)
+        _record_accounting_error(job, rcpt, typ, ev)
         job.maybe_persist()
 
     return {"ok": True, "job_id": job.id, "campaign_id": job.campaign_id, "type": typ, "rcpt": rcpt}
@@ -7313,6 +7418,7 @@ def process_campaign_accounting_payload(payload: dict) -> dict:
                 continue
 
             _apply_outcome_to_job(job, rcpt, typ)
+            _record_accounting_error(job, rcpt, typ, item)
             job.maybe_persist()
             accepted += 1
 
@@ -8633,6 +8739,8 @@ def job_api(job_id: str):
                 "complained": job.complained,
                 "outcome_series": (job.outcome_series or [])[-60:],
                 "accounting_last_ts": job.accounting_last_ts,
+                "accounting_error_counts": job.accounting_error_counts,
+                "accounting_last_errors": (job.accounting_last_errors or [])[-20:],
                 "spam_threshold": job.spam_threshold,
                 "spam_score": job.spam_score,
                 "spam_detail": job.spam_detail,
