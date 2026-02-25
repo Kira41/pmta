@@ -92,6 +92,16 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 SMTP_CODE_RE = re.compile(r"\b([245])\d{2}\b")
 SMTP_ENHANCED_CODE_RE = re.compile(r"\b([245])\.\d\.\d{1,3}\b")
 
+RECIPIENT_FILTER_ENABLE_SMTP_PROBE = (os.getenv("RECIPIENT_FILTER_ENABLE_SMTP_PROBE", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+try:
+    RECIPIENT_FILTER_SMTP_PROBE_LIMIT = int((os.getenv("RECIPIENT_FILTER_SMTP_PROBE_LIMIT", "25") or "25").strip())
+except Exception:
+    RECIPIENT_FILTER_SMTP_PROBE_LIMIT = 25
+try:
+    RECIPIENT_FILTER_SMTP_TIMEOUT = float((os.getenv("RECIPIENT_FILTER_SMTP_TIMEOUT", "5") or "5").strip())
+except Exception:
+    RECIPIENT_FILTER_SMTP_TIMEOUT = 5.0
+
 # Extract emails from messy text (handles weird separators / pasted content)
 EMAIL_FIND_RE = re.compile(
     r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
@@ -1944,6 +1954,7 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
       <div class="mini"><b>Recipients:</b> <span id="domRecTotals">—</span></div>
       <div class="mini"><b>Safe list:</b> <span id="domSafeTotals">—</span></div>
       <div class="mini"><b>Live sending:</b> <span id="domJobTotals">—</span></div>
+      <div class="mini"><b>Recipient filter:</b> <span id="domFilterTotals">—</span></div>
       <div class="mini">Live numbers come from the latest active Job for this campaign (running/backoff).</div>
     </div>
 
@@ -2524,6 +2535,9 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
           if(active){ forceNew = true; }
         }
 
+        // Start recipient pre-send filter before submitting.
+        toast('فلتر البريد', 'بدأ فلتر التحقق من العناوين قبل الإرسال...', 'warn');
+
         // Only NOW show submitting toast (and lock start button) — job creation in progress.
         toast('Sending', 'Submitting... please wait', 'warn');
 
@@ -2600,6 +2614,7 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
     const safeTotals = document.getElementById('domSafeTotals');
 
     const jobTotals = document.getElementById('domJobTotals');
+    const filterTotals = document.getElementById('domFilterTotals');
 
     if(!_domCache || !_domCache.ok){
       if(recBody) recBody.innerHTML = `<tr><td colspan="9" class="muted">No data yet. Click “Refresh”.</td></tr>`;
@@ -2607,6 +2622,7 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
       if(recTotals) recTotals.textContent = '—';
       if(safeTotals) safeTotals.textContent = '—';
       if(jobTotals) jobTotals.textContent = '—';
+      if(filterTotals) filterTotals.textContent = '—';
       return;
     }
 
@@ -2618,6 +2634,12 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
     }
     if(safeTotals){
       safeTotals.textContent = `${safe.total_emails || 0} emails · ${safe.unique_domains || 0} domains · invalid=${safe.invalid_emails || 0}`;
+    }
+
+    const filter = rec.filter || {};
+    if(filterTotals){
+      const checks = Array.isArray(filter.checks) ? filter.checks.join('+') : 'syntax+mx';
+      filterTotals.textContent = `kept=${filter.kept || 0} · dropped=${filter.dropped || 0} · smtp_probe=${filter.smtp_probe_used || 0}/${filter.smtp_probe_limit || 0} · checks=${checks}`;
     }
 
     const live = (_domLiveJob && _domLiveJob.ok && _domLiveJob.job) ? _domLiveJob.job : null;
@@ -5578,6 +5600,102 @@ def filter_emails_by_mx(emails: list[str]) -> tuple[list[str], list[str], dict]:
             ok.append(e)
 
     return ok, bad, meta
+
+
+def _smtp_rcpt_probe(email: str, route: dict) -> dict:
+    """Best-effort SMTP RCPT probe (no DATA).
+
+    Notes:
+    - Not all providers allow RCPT verification before DATA.
+    - Catch-all domains may return accepted for any user.
+    """
+    rcpt = (email or "").strip().lower()
+    dom = _extract_domain_from_email(rcpt)
+    hosts = list(route.get("mx_hosts") or [])
+    host = hosts[0] if hosts else dom
+    if not host:
+        return {"ok": False, "code": 0, "detail": "no_host"}
+
+    server = None
+    try:
+        server = smtplib.SMTP(host=host, port=25, timeout=float(RECIPIENT_FILTER_SMTP_TIMEOUT or 5.0))
+        server.ehlo_or_helo_if_needed()
+        server.mail("<>")
+        code, detail = server.rcpt(rcpt)
+        text = ""
+        if isinstance(detail, bytes):
+            text = detail.decode("utf-8", errors="ignore")
+        else:
+            text = str(detail or "")
+
+        # accepted / cannot-verify-yet
+        if int(code or 0) in {250, 251, 252}:
+            return {"ok": True, "code": int(code or 0), "detail": text[:220], "host": host}
+        return {"ok": False, "code": int(code or 0), "detail": text[:220], "host": host}
+    except Exception as e:
+        return {"ok": False, "code": 0, "detail": str(e)[:220], "host": host}
+    finally:
+        try:
+            if server is not None:
+                server.quit()
+        except Exception:
+            pass
+
+
+def pre_send_recipient_filter(emails: list[str], *, smtp_probe: bool = True) -> tuple[list[str], list[str], dict]:
+    """Pre-send recipient filter with syntax/domain checks + optional SMTP probes."""
+    ok: list[str] = []
+    bad: list[str] = []
+
+    report: dict[str, Any] = {
+        "enabled": True,
+        "checks": ["syntax", "mx_or_a"],
+        "smtp_probe": bool(smtp_probe and RECIPIENT_FILTER_ENABLE_SMTP_PROBE),
+        "smtp_probe_limit": int(max(0, RECIPIENT_FILTER_SMTP_PROBE_LIMIT or 0)),
+        "smtp_probe_used": 0,
+        "rejected": {"no_route": 0, "smtp": 0},
+        "domains": {},
+    }
+
+    seen_domain_probe: set[str] = set()
+
+    for e in emails or []:
+        em = (e or "").strip()
+        d = _extract_domain_from_email(em)
+        if not d:
+            bad.append(em)
+            continue
+
+        route = domain_mail_route(d)
+        status = route.get("status", "unknown")
+        report["domains"][d] = route
+
+        if status == "none":
+            bad.append(em)
+            report["rejected"]["no_route"] += 1
+            continue
+
+        do_probe = (
+            report["smtp_probe"]
+            and status in {"mx", "a_fallback"}
+            and d not in seen_domain_probe
+            and int(report["smtp_probe_used"] or 0) < int(report["smtp_probe_limit"] or 0)
+        )
+        if do_probe:
+            probe = _smtp_rcpt_probe(em, route)
+            seen_domain_probe.add(d)
+            report["smtp_probe_used"] = int(report["smtp_probe_used"] or 0) + 1
+            report["domains"][d] = {**route, "smtp_probe": probe}
+            if not probe.get("ok") and int(probe.get("code") or 0) >= 500:
+                bad.append(em)
+                report["rejected"]["smtp"] += 1
+                continue
+
+        ok.append(em)
+
+    report["kept"] = len(ok)
+    report["dropped"] = len(bad)
+    return ok, bad, report
 
 
 def resolve_sender_domain_ips(domain: str) -> list[str]:
@@ -9362,7 +9480,7 @@ def api_campaign_domains_stats(campaign_id: str):
     def compute(text: str) -> dict:
         emails = parse_recipients(text)
         valid_syntax, invalid_syntax = filter_valid_emails(emails)
-        valid_mx, invalid_mx, meta = filter_emails_by_mx(valid_syntax)
+        valid_mx, invalid_mx, filter_report = pre_send_recipient_filter(valid_syntax, smtp_probe=True)
 
         invalid_all = list(invalid_syntax) + list(invalid_mx)
 
@@ -9381,7 +9499,7 @@ def api_campaign_domains_stats(campaign_id: str):
         out_items: list[dict] = []
 
         for idx, (dom, cnt) in enumerate(domains_sorted):
-            route = meta.get("domains", {}).get(dom) or domain_mail_route(dom)
+            route = filter_report.get("domains", {}).get(dom) or domain_mail_route(dom)
             mx_status = route.get("status", "unknown")
             mx_hosts = route.get("mx_hosts", [])
 
@@ -9414,6 +9532,7 @@ def api_campaign_domains_stats(campaign_id: str):
             "invalid_emails": len(invalid_all),
             "unique_domains": len(counts),
             "domains": out_items,
+            "filter": filter_report,
         }
 
     resp = jsonify({"ok": True, "campaign": {"id": c["id"], "name": c["name"]}, "recipients": compute(rec_text), "safe": compute(safe_text)})
@@ -10143,8 +10262,8 @@ def start():
     recipients = parse_recipients("\n".join(recipients))  # dedupe again
     valid, invalid = filter_valid_emails(recipients)
 
-    # MX/A best-effort cleanup for recipients
-    valid, mx_invalid, _mx_meta = filter_emails_by_mx(valid)
+    # Pre-send recipient filter (syntax/domain + optional SMTP probe)
+    valid, mx_invalid, recipient_filter = pre_send_recipient_filter(valid, smtp_probe=True)
     if mx_invalid:
         invalid.extend(mx_invalid)
 
@@ -10153,8 +10272,8 @@ def start():
     safe_raw = parse_recipients(safe_text)
     safe_valid, safe_invalid = filter_valid_emails(safe_raw)
 
-    # MX/A best-effort cleanup for safe list
-    safe_valid, safe_mx_invalid, _safe_mx_meta = filter_emails_by_mx(safe_valid)
+    # Apply the same pre-send filter for safe list
+    safe_valid, safe_mx_invalid, safe_filter = pre_send_recipient_filter(safe_valid, smtp_probe=True)
     if safe_mx_invalid:
         safe_invalid.extend(safe_mx_invalid)
 
@@ -10234,7 +10353,14 @@ def start():
     job.domain_sent = {}
     job.domain_failed = {}
     # MX stats note
-    job.log("INFO", f"MX check applied: recipients_invalid_mx={len(mx_invalid) if 'mx_invalid' in locals() else 0} safe_invalid_mx={len(safe_mx_invalid) if 'safe_mx_invalid' in locals() else 0}")
+    job.log(
+        "INFO",
+        "Recipient filter applied: "
+        f"checks={'+'.join(recipient_filter.get('checks') or ['syntax','mx_or_a'])} "
+        f"kept={recipient_filter.get('kept', len(valid))} dropped={recipient_filter.get('dropped', len(mx_invalid))} "
+        f"smtp_probe={recipient_filter.get('smtp_probe_used', 0)}/{recipient_filter.get('smtp_probe_limit', 0)}; "
+        f"safe_kept={safe_filter.get('kept', len(safe_valid))} safe_dropped={safe_filter.get('dropped', len(safe_mx_invalid))}",
+    )
 
     # PMTA monitor snapshot (if enabled)
     try:
