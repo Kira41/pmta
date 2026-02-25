@@ -89,6 +89,8 @@ _MX_CACHE: dict[str, dict] = {}
 # Safety / Validation
 # =========================
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+SMTP_CODE_RE = re.compile(r"\b([245])\d{2}\b")
+SMTP_ENHANCED_CODE_RE = re.compile(r"\b([245])\.\d\.\d{1,3}\b")
 
 # Extract emails from messy text (handles weird separators / pasted content)
 EMAIL_FIND_RE = re.compile(
@@ -3237,6 +3239,8 @@ PAGE_JOBS = r"""
     lastBackoff: {},
     lastAbandoned: {},
     lastFailed: {},
+    lastAdaptive: {},
+    lastRoute: {},
   };
 
   async function controlJob(jobId, action){
@@ -3505,6 +3509,7 @@ This will remove it from Jobs history.`);
       const pmtaReason = (ci.pmta_reason || '').toString();
       const pmtaReasonShort = pmtaReason.length > 80 ? (pmtaReason.slice(0,80) + '…') : pmtaReason;
       let pmtaSlowShort = '';
+      let adaptiveShort = '';
       try{
         const ps = ci.pmta_slow || {};
         const dmin = (ps.delay_min !== undefined && ps.delay_min !== null) ? Number(ps.delay_min) : null;
@@ -3517,9 +3522,25 @@ This will remove it from Jobs history.`);
         }
       }catch(e){ /* ignore */ }
 
+      try{
+        const ah = ci.adaptive_health || {};
+        if(ah && ah.ok){
+          const lvl = Number(ah.level || 0);
+          const reduced = !!ah.reduced;
+          const action = (ah.action || '').toString();
+          const ap = ah.applied || {};
+          const bits = [];
+          if(ap.workers !== undefined) bits.push(`w=${Number(ap.workers)}`);
+          if(ap.chunk_size !== undefined) bits.push(`chunk=${Number(ap.chunk_size)}`);
+          if(ap.delay_s !== undefined) bits.push(`delay=${Number(ap.delay_s)}s`);
+          adaptiveShort = `health[L${lvl}${reduced ? '↓' : ''}${action ? (':' + action) : ''}${bits.length ? (' ' + bits.join(',')) : ''}]`;
+        }
+      }catch(e){ /* ignore */ }
+
       chunkLine = `#${cnum} size=${Number(ci.size||0)} · workers=${Number(ci.workers||0)} · delay=${Number(ci.delay_s||0)}s · attempt=${at} · sender=${sender} · spam=${spam} · bl=${blShort} · subject=${subjShort}`+
         (pmtaReasonShort ? (` · pmta=${pmtaReasonShort}`) : '')+
-        (pmtaSlowShort ? (` · pmta_slow(${pmtaSlowShort})`) : '');
+        (pmtaSlowShort ? (` · pmta_slow(${pmtaSlowShort})`) : '')+
+        (adaptiveShort ? (` · ${adaptiveShort}`) : '');
     }
     qk(card,'chunkLine').textContent = chunkLine;
 
@@ -3820,6 +3841,50 @@ This will remove it from Jobs history.`);
       toast('High fail rate', `Job ${jobId}: failed=${failNow}/${done} (${Math.round(failRatio*100)}%)`, 'warn');
     }
     state.lastFailed[jobId] = failNow;
+
+    // Adaptive pressure toasts (health/accounting-driven)
+    try{
+      const ah = (j.current_chunk_info && j.current_chunk_info.adaptive_health) ? j.current_chunk_info.adaptive_health : null;
+      if(ah && ah.ok){
+        const targetDomain = ((j.current_chunk_info && j.current_chunk_info.target_domain) || '').toString();
+        const signature = [
+          Number(ah.level || 0),
+          !!ah.reduced,
+          (ah.action || '').toString(),
+          JSON.stringify(ah.applied || {}),
+          (ah.reason || '').toString(),
+          targetDomain
+        ].join('|');
+        if(signature && state.lastAdaptive[jobId] !== signature){
+          if(ah.reduced){
+            const ap = ah.applied || {};
+            toast(
+              'Adaptive throttle',
+              `Job ${jobId}${targetDomain ? (' · ' + targetDomain) : ''}: reduced pressure (L${Number(ah.level||0)}) · workers=${Number(ap.workers||0)} chunk=${Number(ap.chunk_size||0)} delay=${Number(ap.delay_s||0)}s`,
+              'warn'
+            );
+          }else if((ah.action || '') === 'speed_up'){
+            toast('Adaptive speed-up', `Job ${jobId}: healthy delivery, increasing throughput gradually.`, 'good');
+          }
+          state.lastAdaptive[jobId] = signature;
+        }
+      }
+    }catch(e){ /* ignore */ }
+
+    // Route/IP/domain switch toast per provider domain
+    try{
+      const ci2 = j.current_chunk_info || {};
+      const pDom = (ci2.target_domain || '').toString();
+      const senderNow = (ci2.sender || '').toString();
+      if(pDom && senderNow){
+        const key = `${jobId}:${pDom}`;
+        const prevSender = (state.lastRoute[key] || '').toString();
+        if(prevSender && prevSender !== senderNow){
+          toast('Route switched', `Provider ${pDom}: switched sender/IP from ${prevSender} to ${senderNow}.`, 'warn');
+        }
+        state.lastRoute[key] = senderNow;
+      }
+    }catch(e){ /* ignore */ }
 
     // Disable/enable controls based on state
     const btnPause = card.querySelector('[data-action="pause"]');
@@ -7727,6 +7792,7 @@ def smtp_send_job(
     last_pmta_domains = 0.0
     last_pmta_pressure = 0.0
     last_pressure_level = 0
+    last_health_level = -1
 
     # Backoff tuning
     max_backoff_retries = max(0, min(10, int(cfg_get_int("BACKOFF_MAX_RETRIES", 3))))
@@ -7847,6 +7913,136 @@ def smtp_send_job(
 
     def _spam_check(from_email: str, subject: str, body_text: str, body_format2: str) -> tuple[Optional[float], str]:
         return compute_spam_score(subject=subject, body=body_text, body_format=body_format2, from_email=from_email)
+
+    def _smtp_code_class(detail: str) -> Optional[int]:
+        txt = (detail or "").strip()
+        if not txt:
+            return None
+        m = SMTP_CODE_RE.search(txt)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                return None
+        m2 = SMTP_ENHANCED_CODE_RE.search(txt)
+        if m2:
+            try:
+                return int(m2.group(1))
+            except Exception:
+                return None
+        return None
+
+    def _accounting_health_policy(
+        *,
+        workers: int,
+        delay: float,
+        chunk_sz: int,
+        sleep_between: float,
+    ) -> dict:
+        """Adaptive throttle based on live accounting + SMTP response classes."""
+        with JOBS_LOCK:
+            delivered = int(job.delivered or 0)
+            bounced = int(job.bounced or 0)
+            deferred = int(job.deferred or 0)
+            complained = int(job.complained or 0)
+            recent_results = list(job.recent_results or [])[-140:]
+
+        smtp_4xx = 0
+        smtp_5xx = 0
+        smtp_sample = 0
+        for rr in recent_results:
+            if not isinstance(rr, dict):
+                continue
+            if bool(rr.get("ok")):
+                continue
+            code_cls = _smtp_code_class(str(rr.get("detail") or ""))
+            if code_cls is None:
+                continue
+            smtp_sample += 1
+            if code_cls == 4:
+                smtp_4xx += 1
+            elif code_cls == 5:
+                smtp_5xx += 1
+
+        total_outcomes = delivered + bounced + deferred + complained
+        bad_weighted = bounced + complained + (deferred * 0.6)
+        bad_ratio = (float(bad_weighted) / float(total_outcomes)) if total_outcomes > 0 else 0.0
+        smtp_4xx_ratio = (float(smtp_4xx) / float(smtp_sample)) if smtp_sample > 0 else 0.0
+        smtp_5xx_ratio = (float(smtp_5xx) / float(smtp_sample)) if smtp_sample > 0 else 0.0
+
+        level = 0
+        if complained >= 3 or bad_ratio >= 0.35 or smtp_5xx_ratio >= 0.20:
+            level = 3
+        elif bad_ratio >= 0.20 or smtp_5xx_ratio >= 0.10 or smtp_4xx_ratio >= 0.30:
+            level = 2
+        elif bad_ratio >= 0.10 or smtp_4xx_ratio >= 0.12:
+            level = 1
+
+        new_workers = int(max(1, workers))
+        new_delay = float(max(0.0, delay))
+        new_chunk = int(max(1, chunk_sz))
+        new_sleep = float(max(0.0, sleep_between))
+        action = "steady"
+
+        if level == 1:
+            new_workers = min(new_workers, 8)
+            new_chunk = min(new_chunk, 220)
+            new_delay = max(new_delay, 0.05)
+            action = "soft_slowdown"
+        elif level == 2:
+            new_workers = min(new_workers, 4)
+            new_chunk = min(new_chunk, 120)
+            new_delay = max(new_delay, 0.20)
+            new_sleep = max(new_sleep, 0.30)
+            action = "slowdown"
+        elif level == 3:
+            new_workers = min(new_workers, 2)
+            new_chunk = min(new_chunk, 60)
+            new_delay = max(new_delay, 0.60)
+            new_sleep = max(new_sleep, 1.00)
+            action = "hard_slowdown"
+        else:
+            # Healthy signals: gently recover throughput.
+            if total_outcomes >= 80 and bad_ratio <= 0.03 and smtp_5xx == 0:
+                new_workers = min(200, new_workers + 1)
+                new_chunk = min(50000, max(new_chunk, int(new_chunk * 1.20)))
+                if new_delay > 0:
+                    new_delay = max(0.0, round(new_delay * 0.70, 3))
+                action = "speed_up"
+
+        reduced = (
+            (new_workers < int(max(1, workers)))
+            or (new_chunk < int(max(1, chunk_sz)))
+            or (new_delay > float(max(0.0, delay)))
+            or (new_sleep > float(max(0.0, sleep_between)))
+        )
+
+        reason = (
+            f"lvl={level} outcomes={total_outcomes} bad={bad_ratio:.2f} "
+            f"smtp4xx={smtp_4xx}/{smtp_sample} smtp5xx={smtp_5xx}/{smtp_sample}"
+        )
+        return {
+            "ok": True,
+            "level": level,
+            "action": action,
+            "reason": reason,
+            "metrics": {
+                "delivered": delivered,
+                "bounced": bounced,
+                "deferred": deferred,
+                "complained": complained,
+                "smtp_sample": smtp_sample,
+                "smtp_4xx": smtp_4xx,
+                "smtp_5xx": smtp_5xx,
+            },
+            "applied": {
+                "workers": int(new_workers),
+                "chunk_size": int(new_chunk),
+                "delay_s": float(new_delay),
+                "sleep_chunks": float(new_sleep),
+            },
+            "reduced": bool(reduced),
+        }
 
     def _render_body(local_rng: random.Random, base_body: str, urls2: list[str], src2: list[str]) -> str:
         rendered = base_body
@@ -8050,6 +8246,32 @@ def smtp_send_job(
 
             # PMTA pressure-based adaptive speed control (global)
             pmta_pressure_applied: dict[str, Any] = {}
+            health_policy_applied: dict[str, Any] = {}
+
+            # Adaptive policy from accounting + SMTP responses.
+            try:
+                health_policy_applied = _accounting_health_policy(
+                    workers=workers2,
+                    delay=delay2,
+                    chunk_sz=cs,
+                    sleep_between=sleep2,
+                )
+                if health_policy_applied.get("ok"):
+                    ap = health_policy_applied.get("applied") or {}
+                    workers2 = int(ap.get("workers") or workers2)
+                    cs = int(ap.get("chunk_size") or cs)
+                    delay2 = float(ap.get("delay_s") if ap.get("delay_s") is not None else delay2)
+                    sleep2 = float(ap.get("sleep_chunks") if ap.get("sleep_chunks") is not None else sleep2)
+
+                    h_lvl = int(health_policy_applied.get("level") or 0)
+                    if h_lvl != int(last_health_level):
+                        last_health_level = h_lvl
+                        with JOBS_LOCK:
+                            msg = f"Adaptive health policy level {h_lvl}: {health_policy_applied.get('reason','')}"
+                            job.log("WARN" if h_lvl >= 2 else "INFO", msg)
+            except Exception:
+                health_policy_applied = {}
+
             if PMTA_PRESSURE_CONTROL:
                 try:
                     # Refresh PMTA live snapshot (rate-limited)
@@ -8163,6 +8385,7 @@ def smtp_send_job(
                     "delay_s": delay2,
                     "sleep_chunks": sleep2,
                     "pmta_pressure": pmta_pressure_applied,
+                    "adaptive_health": health_policy_applied,
                     "attempt": 0,
                     "sender": "",
                     "subject": "",
