@@ -85,6 +85,9 @@ if dns is not None:
 
 # MX/A cache to avoid repeated DNS queries
 _MX_CACHE: dict[str, dict] = {}
+_MX_CACHE_EXPIRES_AT: dict[str, float] = {}
+MX_CACHE_TTL_OK = 3600.0
+MX_CACHE_TTL_SOFT_FAIL = 120.0
 
 # =========================
 # Safety / Validation
@@ -5569,8 +5572,19 @@ def domain_mail_route(domain: str) -> dict:
     if not d:
         return {"domain": d, "status": "none", "mx_hosts": []}
 
-    if d in _MX_CACHE:
+    now_ts = time.time()
+    exp = float(_MX_CACHE_EXPIRES_AT.get(d, 0.0) or 0.0)
+    if d in _MX_CACHE and exp > now_ts:
         return _MX_CACHE[d]
+    if d in _MX_CACHE and exp <= now_ts:
+        _MX_CACHE.pop(d, None)
+        _MX_CACHE_EXPIRES_AT.pop(d, None)
+
+    def _cache_and_return(out: dict) -> dict:
+        ttl = MX_CACHE_TTL_OK if out.get("status") in {"mx", "a_fallback"} else MX_CACHE_TTL_SOFT_FAIL
+        _MX_CACHE[d] = out
+        _MX_CACHE_EXPIRES_AT[d] = time.time() + float(ttl)
+        return out
 
     mx_hosts: list[str] = []
 
@@ -5584,44 +5598,37 @@ def domain_mail_route(domain: str) -> dict:
                     mx_hosts.append(exch)
             if mx_hosts:
                 out = {"domain": d, "status": "mx", "mx_hosts": mx_hosts[:8]}
-                _MX_CACHE[d] = out
-                return out
+                return _cache_and_return(out)
         except Exception as e:
             # If clearly no MX, we'll check A fallback below.
             msg = str(e).lower()
             # Treat timeouts/servfail as unknown.
             if "timeout" in msg or "servfail" in msg or "refused" in msg:
                 out = {"domain": d, "status": "unknown", "mx_hosts": []}
-                _MX_CACHE[d] = out
-                return out
+                return _cache_and_return(out)
 
         # A fallback
         try:
             a = DNS_RESOLVER.resolve(d, "A")  # type: ignore
             has_a = any(str(x) for x in a)
             out = {"domain": d, "status": ("a_fallback" if has_a else "none"), "mx_hosts": []}
-            _MX_CACHE[d] = out
-            return out
+            return _cache_and_return(out)
         except Exception as e:
             msg = str(e).lower()
             if "timeout" in msg or "servfail" in msg or "refused" in msg:
                 out = {"domain": d, "status": "unknown", "mx_hosts": []}
-                _MX_CACHE[d] = out
-                return out
+                return _cache_and_return(out)
             out = {"domain": d, "status": "none", "mx_hosts": []}
-            _MX_CACHE[d] = out
-            return out
+            return _cache_and_return(out)
 
     # Fallback without dnspython: do not hard-fail; try A resolution only.
     try:
         _ = socket.gethostbyname(d)
         out = {"domain": d, "status": "a_fallback", "mx_hosts": []}
-        _MX_CACHE[d] = out
-        return out
+        return _cache_and_return(out)
     except Exception:
         out = {"domain": d, "status": "unknown", "mx_hosts": []}
-        _MX_CACHE[d] = out
-        return out
+        return _cache_and_return(out)
 
 
 def filter_emails_by_mx(emails: list[str]) -> tuple[list[str], list[str], dict]:
@@ -10387,11 +10394,19 @@ def start():
 
     recipients = parse_recipients("\n".join(recipients))  # dedupe again
     valid, invalid = filter_valid_emails(recipients)
+    syntax_valid = list(valid)
 
     # Pre-send recipient filter (syntax/domain + optional SMTP probe)
     valid, mx_invalid, recipient_filter = pre_send_recipient_filter(valid, smtp_probe=True)
     if mx_invalid:
         invalid.extend(mx_invalid)
+
+    # Safety fallback: if DNS/probe temporarily rejects everything, do not hard-block
+    # a send that already passed syntax validation. This avoids false negatives after
+    # transient resolver/provider issues and lets runtime delivery decide.
+    if syntax_valid and not valid:
+        valid = syntax_valid
+        recipient_filter = {**recipient_filter, "degraded_fallback": True, "degraded_reason": "all_filtered_by_route_checks"}
 
     # Safe list (optional whitelist)
     safe_text = request.form.get("maillist_safe") or ""
