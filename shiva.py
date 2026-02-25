@@ -188,6 +188,22 @@ def count_recipient_domains(emails: list[str]) -> dict[str, int]:
     return counts
 
 
+def build_provider_buckets(recipients: list[str]) -> tuple[dict[str, list[str]], list[str]]:
+    """Group recipients by recipient domain while preserving first-seen order.
+
+    Each bucket is treated as one "provider queue" (gmail.com, yahoo.com, ...).
+    """
+    buckets: dict[str, list[str]] = {}
+    order: list[str] = []
+    for rcpt in recipients or []:
+        dom = _extract_domain_from_email(rcpt) or "unknown"
+        if dom not in buckets:
+            buckets[dom] = []
+            order.append(dom)
+        buckets[dom].append(rcpt)
+    return buckets, order
+
+
 def split_body_variants(body: str) -> list[str]:
     """Allow multiple body variants separated by a delimiter line:
 
@@ -7976,8 +7992,33 @@ def smtp_send_job(
     try:
         # Dynamic chunking (chunk_size can change during run)
         total = len(recipients)
-        idx = 0
         chunk_idx = 0
+
+        # Provider-aware queues: one recipient domain per queue.
+        # Chunks are scheduled in round-robin between domains, so each domain/provider
+        # gets short sending windows and cool-down gaps before its next chunk.
+        provider_buckets, provider_order = build_provider_buckets(recipients)
+        provider_cursor = 0
+
+        # Per-provider sender rotation cursor: if a provider has many recipients,
+        # chunk#1 can use sender/IP-A, chunk#2 sender/IP-B, ... then wrap.
+        provider_sender_cursor: dict[str, int] = {}
+
+        def _remaining_total() -> int:
+            return sum(len(v) for v in provider_buckets.values())
+
+        def _next_provider_domain() -> Optional[str]:
+            nonlocal provider_cursor
+            if not provider_order:
+                return None
+            n = len(provider_order)
+            for step in range(n):
+                idx2 = (provider_cursor + step) % n
+                dom2 = provider_order[idx2]
+                if provider_buckets.get(dom2):
+                    provider_cursor = (idx2 + 1) % n
+                    return dom2
+            return None
 
         with JOBS_LOCK:
             # initial estimate
@@ -7985,7 +8026,7 @@ def smtp_send_job(
             job.chunks_total = (total + cs0 - 1) // cs0
             job.log("INFO", f"Prepared dynamic chunks (initial chunk_size={cs0}).")
 
-        while idx < total:
+        while _remaining_total() > 0:
             if not _wait_ready():
                 _stop_job("stop requested")
                 return
@@ -8061,7 +8102,13 @@ def smtp_send_job(
                 except Exception:
                     pmta_pressure_applied = {}
 
-            chunk = recipients[idx : idx + cs]
+            target_domain = _next_provider_domain()
+            if not target_domain:
+                break
+
+            bucket = provider_buckets.get(target_domain) or []
+            chunk = bucket[:cs]
+            provider_buckets[target_domain] = bucket[len(chunk):]
             if not chunk:
                 break
 
@@ -8110,6 +8157,7 @@ def smtp_send_job(
                 job.current_chunk_info = {
                     "chunk": chunk_idx,
                     "size": len(chunk),
+                    "target_domain": target_domain,
                     "chunk_size": cs,
                     "workers": workers2,
                     "delay_s": delay2,
@@ -8124,16 +8172,17 @@ def smtp_send_job(
                 }
 
             # keep chunks_total roughly correct
-            remaining = max(0, total - idx)
+            remaining = max(0, _remaining_total())
             est_remaining = (remaining + cs - 1) // cs
             with JOBS_LOCK:
                 job.chunks_total = max(job.chunks_total, job.chunks_done + est_remaining)
 
             # Per-chunk attempt loop (GLOBAL backoff)
             attempt = 0
+            sender_cursor_base = int(provider_sender_cursor.get(target_domain, 0) or 0)
             while True:
-                # rotate on attempt
-                rot = chunk_idx + attempt
+                # rotate per provider (domain), and shift again on each retry
+                rot = sender_cursor_base + attempt
 
                 fe = from_emails2[rot % len(from_emails2)]
                 fn = from_names2[rot % len(from_names2)] if from_names2 else "Sender"
@@ -8194,6 +8243,7 @@ def smtp_send_job(
                         "blacklist": bl_detail,
                         "pmta_reason": pmta_reason,
                         "pmta_slow": pmta_slow,
+                        "target_domain": target_domain,
                     })
 
                 if blocked:
@@ -8227,7 +8277,9 @@ def smtp_send_job(
                                 "next_retry_ts": 0,
                                 "reason": "abandoned",
                             })
-                            job.log("ERROR", f"Chunk {chunk_idx+1}: ABANDONED after {attempt-1} retries ({rtxt})")
+                            job.log("ERROR", f"Chunk {chunk_idx+1} [{target_domain}]: ABANDONED after {attempt-1} retries ({rtxt})")
+                            if from_emails2:
+                                provider_sender_cursor[target_domain] = (sender_cursor_base + 1) % max(1, len(from_emails2))
                         break
 
                     wait_s = min(backoff_max_s, backoff_base_s * (2 ** max(0, attempt - 1)))
@@ -8250,7 +8302,7 @@ def smtp_send_job(
                         job.chunks_backoff += 1
                         job.push_backoff(entry)
                         job.push_chunk_state({**entry, "status": "backoff"})
-                        job.log("WARN", f"Chunk {chunk_idx+1}: BACKOFF retry#{attempt} wait={int(wait_s)}s ({rtxt})")
+                        job.log("WARN", f"Chunk {chunk_idx+1} [{target_domain}]: BACKOFF retry#{attempt} wait={int(wait_s)}s ({rtxt})")
 
                     # Global pause (but responsive to pause/stop)
                     if not _sleep_checked(wait_s):
@@ -8278,7 +8330,7 @@ def smtp_send_job(
                         "next_retry_ts": 0,
                         "reason": "",
                     })
-                    job.log("INFO", f"Chunk {chunk_idx+1}: sending size={len(chunk)} sender={fe} workers={workers2}")
+                    job.log("INFO", f"Chunk {chunk_idx+1} [{target_domain}]: sending size={len(chunk)} sender={fe} workers={workers2}")
 
                 if not _wait_ready():
                     _stop_job("stop requested")
@@ -8320,15 +8372,16 @@ def smtp_send_job(
                         "next_retry_ts": 0,
                         "reason": "",
                     })
+                if from_emails2:
+                    provider_sender_cursor[target_domain] = (sender_cursor_base + 1) % max(1, len(from_emails2))
                 break
 
             # next chunk
-            idx += len(chunk)
             chunk_idx += 1
 
-            if sleep2 > 0 and idx < total:
+            if sleep2 > 0 and _remaining_total() > 0:
                 with JOBS_LOCK:
-                    job.log("INFO", f"Sleeping {sleep2}s between chunks...")
+                    job.log("INFO", f"Sleeping {sleep2}s between chunks (round-robin providers)...")
                 if not _sleep_checked(sleep2):
                     _stop_job("stop requested")
                     return
@@ -9907,7 +9960,7 @@ def start():
     job.log(
         "INFO",
         f"Sender inputs: names={len(from_names)} emails_valid={len(valid_sender_emails)} emails_invalid={len(invalid_sender_emails)} subjects={len(subjects)}. "
-        f"Sending mode: chunked rotation by chunk (one chunk -> one sender email).",
+        f"Sending mode: provider-aware round-robin chunks (one recipient-domain chunk -> one sender email/IP rotation).",
     )
     job.log(
         "INFO",
