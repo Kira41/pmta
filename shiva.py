@@ -7749,6 +7749,8 @@ def smtp_send_job(
     chunk_size: int,
     thread_workers: int,
     sleep_chunks: float,
+    use_ai_rewrite: bool,
+    ai_token: str,
 ):
     """Send job in chunks.
 
@@ -7756,6 +7758,8 @@ def smtp_send_job(
     - Per-CHUNK preflight (Spam score + DNSBL/DBL blacklist checks)
     - Global backoff (option 2): if a chunk is blocked, the whole job pauses and retries that chunk.
     - Rotates sender/subject/body per chunk, and on retry uses next variant (chunk_idx + attempt).
+    - Optional AI rewrite chain: when enabled, each chunk rewrites the previous chunk content,
+      then uses that rewritten subject/body for sending.
     - Live settings sync (phase 1): before each chunk + each retry, we read campaign_form from SQLite and apply
       delay/workers/sleep/spam_threshold + sender/subject/body lists.
     """
@@ -7784,6 +7788,10 @@ def smtp_send_job(
         sender_names = ["Sender"]
     if not subjects:
         subjects = ["(no subject)"]
+
+    ai_enabled = bool(use_ai_rewrite and (ai_token or "").strip())
+    ai_subject_chain = [str(x).strip() for x in (subjects or []) if str(x).strip()] or ["(no subject)"]
+    ai_body_chain = str(body or "")
 
     smtp_host_ips = _resolve_ipv4(smtp_host) if smtp_host else []
 
@@ -8401,6 +8409,39 @@ def smtp_send_job(
                 job.chunks_total = max(job.chunks_total, job.chunks_done + est_remaining)
 
             # Per-chunk attempt loop (GLOBAL backoff)
+            # Per-chunk AI rewrite chain (optional): rewrite from last accepted message,
+            # then carry rewritten output forward as input for next chunk.
+            chunk_subjects = list(subjects2 or subjects)
+            chunk_body_variants = list(body_variants2 or split_body_variants(body))
+
+            if ai_enabled:
+                ai_in_subjects = list(ai_subject_chain or chunk_subjects)
+                ai_in_body = ai_body_chain if ai_body_chain.strip() else (chunk_body_variants[0] if chunk_body_variants else body)
+                try:
+                    ai_new_subjects, ai_new_body, ai_backend = ai_rewrite_subjects_and_body(
+                        token=ai_token,
+                        subjects=ai_in_subjects,
+                        body=ai_in_body,
+                        body_format=body_format2,
+                    )
+                    ai_new_subjects = [str(x).strip() for x in (ai_new_subjects or []) if str(x).strip()]
+                    if ai_new_subjects:
+                        chunk_subjects = ai_new_subjects
+                        ai_subject_chain = ai_new_subjects
+
+                    if str(ai_new_body or "").strip():
+                        ai_body_chain = str(ai_new_body)
+                        chunk_body_variants = split_body_variants(ai_body_chain)
+
+                    with JOBS_LOCK:
+                        job.log(
+                            "INFO",
+                            f"Chunk {chunk_idx+1} [{target_domain}]: AI rewrite applied ({ai_backend}) subj={len(chunk_subjects)} body_variants={len(chunk_body_variants)}",
+                        )
+                except Exception as e:
+                    with JOBS_LOCK:
+                        job.log("WARN", f"Chunk {chunk_idx+1} [{target_domain}]: AI rewrite failed, using previous content ({e})")
+
             attempt = 0
             sender_cursor_base = int(provider_sender_cursor.get(target_domain, 0) or 0)
             while True:
@@ -8409,8 +8450,8 @@ def smtp_send_job(
 
                 fe = from_emails2[rot % len(from_emails2)]
                 fn = from_names2[rot % len(from_names2)] if from_names2 else "Sender"
-                sb = subjects2[rot % len(subjects2)]
-                b_used = body_variants2[rot % len(body_variants2)] if body_variants2 else body
+                sb = chunk_subjects[rot % len(chunk_subjects)]
+                b_used = chunk_body_variants[rot % len(chunk_body_variants)] if chunk_body_variants else body
 
                 # Update PMTA live metrics for UI (rate-limited)
                 if PMTA_QUEUE_BACKOFF:
@@ -8461,7 +8502,7 @@ def smtp_send_job(
                         "attempt": attempt,
                         "sender": fe,
                         "subject": sb,
-                        "body_variant": (rot % max(1, len(body_variants2))) if body_variants2 else 0,
+                        "body_variant": (rot % max(1, len(chunk_body_variants))) if chunk_body_variants else 0,
                         "spam_score": sc,
                         "blacklist": bl_detail,
                         "pmta_reason": pmta_reason,
@@ -10004,23 +10045,8 @@ def start():
         spam_threshold = 4.0
     spam_threshold = max(1.0, min(10.0, spam_threshold))
 
-    # If AI is enabled, rewrite subject/body once before sending.
-    # Single rewrite per job (not per recipient) to keep behavior predictable.
-    if use_ai:
-        if not ai_token:
-            return "AI token is required when 'Use AI rewrite' is enabled.", 400
-        try:
-            new_subjects, new_body, backend = ai_rewrite_subjects_and_body(
-                token=ai_token,
-                subjects=subjects,
-                body=body,
-                body_format=body_format,
-            )
-            subjects = new_subjects
-            subject = subjects[0] if subjects else subject
-            body = new_body
-        except Exception as e:
-            return f"AI rewrite failed: {e}", 400
+    if use_ai and not ai_token:
+        return "AI token is required when 'Use AI rewrite' is enabled.", 400
 
     # --- Better validation (more helpful than "Missing required fields")
     errors: list[str] = []
@@ -10220,6 +10246,8 @@ def start():
             chunk_size,
             thread_workers,
             sleep_chunks,
+            use_ai,
+            ai_token,
         ),
     )
     t.start()
