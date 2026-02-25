@@ -3624,6 +3624,20 @@ This will remove it from Jobs history.`);
       return 'good';
     }
 
+    function _pmTrafficTone(inCount, outCount){
+      const inN = _pmNum(inCount);
+      const outN = _pmNum(outCount);
+      if(inN === null || outN === null) return '';
+      if(inN <= 0){
+        if(outN <= 0) return 'warn';
+        return 'good';
+      }
+      const ratio = outN / inN;
+      if(ratio < 0.25) return 'bad';
+      if(ratio <= 0.5) return 'warn';
+      return 'good';
+    }
+
     function _tagHtml(tone, label){
       const cls = tone ? ('tag ' + tone) : 'tag';
       return `<span class="${cls}">${esc(label)}</span>`;
@@ -3673,8 +3687,8 @@ This will remove it from Jobs history.`);
 
       const toneSp = _pmTone('backlog', spR_n);
       const toneQ  = _pmTone('backlog', qR_n);
-      const toneHr = _pmTone('deferred', (hrIn_n || 0) + (hrOut_n || 0));
-      const toneMin = _pmTone('deferred', (minIn_n || 0) + (minOut_n || 0));
+      const toneHr = _pmTrafficTone(hrIn_n, hrOut_n);
+      const toneMin = _pmTrafficTone(minIn_n, minOut_n);
       const toneC  = _pmTone('conns', con_n);
 
       // top queues
