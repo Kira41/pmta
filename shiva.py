@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import csv
 import random
 import re
@@ -365,8 +366,6 @@ class SendJob:
             pass
 
         self.recent_results.append({"ts": now_iso(), "email": email, "ok": ok, "detail": detail})
-        if len(self.recent_results) > 200:
-            self.recent_results = self.recent_results[-200:]
 
         self.maybe_persist()
     def push_chunk_state(self, item: dict):
@@ -4902,6 +4901,11 @@ PAGE_JOB = r"""
 
     <div class="card">
       <h3 style="margin:0 0 10px">Recent Results</h3>
+      <div class="row" style="margin-bottom:8px; align-items:center; gap:8px">
+        <button class="navBtn" id="resultsPrevBtn" type="button">← Prev</button>
+        <button class="navBtn" id="resultsNextBtn" type="button">Next →</button>
+        <span class="muted" id="resultsPageMeta">Page 1</span>
+      </div>
       <div style="overflow:auto">
         <table>
           <thead>
@@ -4925,6 +4929,9 @@ PAGE_JOB = r"""
 
 <script>
   const jobId = "{{job_id}}";
+  const RESULTS_PAGE_SIZE = 100;
+  let resultsPage = 1;
+  let resultsTotalPages = 1;
   function esc(s){ return (s ?? "").toString().replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;"); }
 
   function pct(n,d){
@@ -4932,8 +4939,23 @@ PAGE_JOB = r"""
     return dd ? Math.min(100, Math.round((nn/dd)*100)) : 0;
   }
 
+  function renderResultsPager(){
+    const meta = document.getElementById('resultsPageMeta');
+    const prevBtn = document.getElementById('resultsPrevBtn');
+    const nextBtn = document.getElementById('resultsNextBtn');
+    const total = Number(resultsTotalPages || 1);
+    const page = Number(resultsPage || 1);
+    if(meta) meta.textContent = `Page ${page} / ${total} · ${RESULTS_PAGE_SIZE} emails per page`;
+    if(prevBtn) prevBtn.disabled = page <= 1;
+    if(nextBtn) nextBtn.disabled = page >= total;
+  }
+
   async function tick(){
-    const r = await fetch(`/api/job/${jobId}`);
+    const qp = new URLSearchParams({
+      recent_page: String(resultsPage),
+      recent_page_size: String(RESULTS_PAGE_SIZE),
+    });
+    const r = await fetch(`/api/job/${jobId}?${qp.toString()}`);
     if(!r.ok){ return; }
     const j = await r.json();
 
@@ -5012,12 +5034,15 @@ PAGE_JOB = r"""
       }).join('') || `<tr><td colspan="8" class="muted">No chunk states yet.</td></tr>`;
     }
 
-    // Recent results
-    const rrows = (j.recent_results || []).slice().reverse().map(x => {
+    // Recent results (paginated at API level)
+    resultsPage = Number(j.recent_page || 1);
+    resultsTotalPages = Number(j.recent_total_pages || 1);
+    const rrows = (j.recent_results || []).map(x => {
       const ok = x.ok ? '<span class="ok">YES</span>' : '<span class="no">NO</span>';
       return `<tr><td>${esc(x.ts)}</td><td>${esc(x.email)}</td><td>${ok}</td><td>${esc(x.detail)}</td></tr>`;
     }).join("");
     document.getElementById("results").innerHTML = rrows || `<tr><td colspan="4" class="muted">No results yet...</td></tr>`;
+    renderResultsPager();
 
     // Logs
     const logs = (j.logs || []).slice(-80).map(l => `[${l.ts}] ${l.level}: ${l.message}`).join("\n");
@@ -5029,6 +5054,25 @@ PAGE_JOB = r"""
     }
   }
 
+  const prevBtn = document.getElementById('resultsPrevBtn');
+  if(prevBtn){
+    prevBtn.addEventListener('click', async () => {
+      if(resultsPage <= 1) return;
+      resultsPage -= 1;
+      await tick();
+    });
+  }
+
+  const nextBtn = document.getElementById('resultsNextBtn');
+  if(nextBtn){
+    nextBtn.addEventListener('click', async () => {
+      if(resultsPage >= resultsTotalPages) return;
+      resultsPage += 1;
+      await tick();
+    });
+  }
+
+  renderResultsPager();
   tick();
   window._t = setInterval(tick, 1200);
 </script>
@@ -9283,10 +9327,29 @@ def job_page(job_id: str):
 
 @app.get("/api/job/<job_id>")
 def job_api(job_id: str):
+    try:
+        recent_page = max(1, int(request.args.get("recent_page") or 1))
+    except Exception:
+        recent_page = 1
+    try:
+        requested_page_size = int(request.args.get("recent_page_size") or 100)
+    except Exception:
+        requested_page_size = 100
+    recent_page_size = max(1, min(200, requested_page_size))
+
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if (not job) or getattr(job, 'deleted', False):
             return jsonify({"error": "not found"}), 404
+
+        total_recent = len(job.recent_results or [])
+        recent_total_pages = max(1, math.ceil(total_recent / recent_page_size))
+        recent_page = min(recent_page, recent_total_pages)
+        end_idx = total_recent - ((recent_page - 1) * recent_page_size)
+        start_idx = max(0, end_idx - recent_page_size)
+        recent_page_rows = (job.recent_results or [])[start_idx:end_idx]
+        recent_page_rows.reverse()  # newest first within current page
+
         return jsonify(
             {
                 "id": job.id,
@@ -9346,7 +9409,11 @@ def job_api(job_id: str):
                 "pmta_domains": job.pmta_domains,
                 "pmta_domains_ts": job.pmta_domains_ts,
                 "logs": [l.__dict__ for l in job.logs[-200:]],
-                "recent_results": job.recent_results[-200:],
+                "recent_results": recent_page_rows,
+                "recent_page": recent_page,
+                "recent_page_size": recent_page_size,
+                "recent_total": total_recent,
+                "recent_total_pages": recent_total_pages,
             }
         )
 
