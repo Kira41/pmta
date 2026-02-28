@@ -284,3 +284,148 @@ PMTA_BRIDGE_PULL_S=5
 PMTA_BRIDGE_PULL_MAX_LINES=2000
 ```
 
+
+---
+
+## 10) شرح تفصيلي (Arabic Deep Dive) — نقطة البداية + مجال العمل + User Story
+
+> طريقة القراءة لكل متغيّر:
+> - **نقطة البداية**: من أين يتم تحميله (Environment / `.env`) ومتى يدخل في القرار.
+> - **مجال العمل**: الجزء الوظيفي الذي يؤثر عليه.
+> - **User Story**: سيناريو عملي مختصر يوضح لماذا تضبطه.
+
+### 10.1 Anti-spam / SpamAssassin
+
+- **SPAMCHECK_BACKEND**
+  - نقطة البداية: يُقرأ عند تهيئة منطق فحص الرسائل قبل الإرسال.
+  - مجال العمل: يحدد محرك الفحص (`spamd` أو بديل لاحقًا).
+  - User Story: كمسؤول تسليم بريد، أريد تبديل backend بسرعة عند تجربة مزود Anti-spam مختلف بدون تعديل الكود.
+
+- **SPAMD_HOST**
+  - نقطة البداية: يُستخدم عند فتح الاتصال مع خدمة `spamd`.
+  - مجال العمل: التوجيه الشبكي نحو خادم الفحص.
+  - User Story: كمسؤول بنية، أريد نقل خدمة spamd إلى سيرفر مستقل وتعديل العنوان فقط.
+
+- **SPAMD_PORT**
+  - نقطة البداية: يُقرأ مع `SPAMD_HOST` عند إنشاء socket/HTTP call نحو spamd.
+  - مجال العمل: منفذ الاتصال بخدمة الفحص.
+  - User Story: كـ DevOps أريد تغيير المنفذ بعد hardening للشبكة بدون إعادة بناء التطبيق.
+
+- **SPAMD_TIMEOUT**
+  - نقطة البداية: يُطبّق أثناء انتظار رد spamd.
+  - مجال العمل: زمن الانتظار قبل اعتبار الفحص فاشلًا/متأخرًا.
+  - User Story: كمالك منتج، أريد منع تعليق الإرسال طويلًا إذا كانت خدمة الفحص بطيئة.
+
+### 10.2 Recipient Filtering (SMTP Probe)
+
+- **RECIPIENT_FILTER_ENABLE_SMTP_PROBE**
+  - نقطة البداية: يُقرأ قبل مرحلة التحقق من صلاحية المستلمين.
+  - مجال العمل: تشغيل/إيقاف probe من نوع RCPT check.
+  - User Story: كمدير حملة، أريد إغلاق probe مؤقتًا أثناء ضغط عالٍ لتقليل زمن المعالجة.
+
+- **RECIPIENT_FILTER_SMTP_PROBE_LIMIT**
+  - نقطة البداية: يدخل عند بناء batch العناوين المختبرة.
+  - مجال العمل: سقف عدد المستلمين المفحوصين لكل دورة.
+  - User Story: كمسؤول عمليات، أريد حدًا أعلى حتى لا يستهلك النظام وقتًا كبيرًا في validation قبل الإرسال.
+
+- **RECIPIENT_FILTER_SMTP_TIMEOUT**
+  - نقطة البداية: يُستخدم لكل جلسة SMTP probe.
+  - مجال العمل: مهلة تحقق المستلمين عبر SMTP.
+  - User Story: كمسؤول تسليم، أريد timeout قصيرًا للشبكات البطيئة حتى لا تتراكم الطوابير.
+
+### 10.3 DNSBL / DBL
+
+- **RBL_ZONES**
+  - نقطة البداية: تُحمّل كقائمة zones قبل فحص السمعة.
+  - مجال العمل: Blacklist فحص IP المرسل/البنية.
+  - User Story: كفريق مكافحة إساءة الاستخدام، أريد إضافة/حذف Zone حسب سياسات السمعة.
+
+- **DBL_ZONES**
+  - نقطة البداية: تُحمّل ضمن مرحلة فحص domain reputation.
+  - مجال العمل: Blacklist فحص الدومينات داخل الرسائل/الروابط.
+  - User Story: كمسؤول امتثال، أريد التحقق من الدومينات ضد DBL لمنع إرسال محتوى عالي المخاطر.
+
+- **SEND_DNSBL**
+  - نقطة البداية: قرار بوابة قبل تنفيذ DNSBL/DBL checks.
+  - مجال العمل: تفعيل الفحص السمعة قبل الإرسال.
+  - User Story: كمدير منصة، أريد تعطيل الفحص مؤقتًا أثناء troubleshooting إذا كان مزود DNS يعاني انقطاعًا.
+
+### 10.4 PMTA Monitor & Health
+
+- **PMTA_MONITOR_TIMEOUT_S**: مهلة طلبات monitor؛ لضمان ألا تتوقف قرارات الإرسال على monitor بطيء.
+- **PMTA_MONITOR_SCHEME**: يحدد `http/https/auto` عند تركيب URL المراقبة؛ مناسب لاختلاف بيئات staging/prod.
+- **PMTA_MONITOR_BASE_URL**: إذا وُضع، يصبح المصدر المباشر لجميع نداءات monitor.
+- **PMTA_MONITOR_API_KEY**: حقن auth token/مفتاح API في طلبات monitor المؤمنة.
+- **PMTA_HEALTH_REQUIRED**: يتحكم هل الصحة شرط إلزامي قبل الإرسال.
+- **PMTA_MAX_SPOOL_RECIPIENTS**: عتبة إنذار/منع حسب عدد recipients في spool.
+- **PMTA_MAX_SPOOL_MESSAGES**: عتبة ضغط spool بعدد الرسائل.
+- **PMTA_MAX_QUEUED_RECIPIENTS**: عتبة ازدحام queue بعدد recipients.
+- **PMTA_MAX_QUEUED_MESSAGES**: عتبة ازدحام queue بعدد الرسائل.
+
+**User Story مشتركة (هذه المجموعة):**
+كـ SRE، أريد وضع حدود صحية واضحة على الـ spool/queue بحيث يبطئ أو يوقف النظام الإرسال تلقائيًا قبل الوصول لحالة اختناق PMTA.
+
+### 10.5 Backoff / Retry
+
+- **ENABLE_BACKOFF**: مفتاح تشغيل استراتيجية التباطؤ عند مؤشرات الخطأ.
+- **BACKOFF_MAX_RETRIES**: أقصى عدد إعادة محاولة لكل عملية إرسال/دفعة.
+- **BACKOFF_BASE_S**: زمن التأخير الابتدائي.
+- **BACKOFF_MAX_S**: سقف التأخير لمنع backoff غير محدود.
+
+**User Story:**
+كمدير تسليم بريد، أريد retry ذكيًا بدل الإرسال العنيف عند وجود deferrals حتى أحافظ على سمعة الـ IP وأقلل الرفض.
+
+### 10.6 PMTA Diagnostics, Queue & Pressure Control
+
+- **PMTA_DIAG_ON_ERROR**: يبدأ تشخيص PMTA تلقائيًا عند الخطأ.
+- **PMTA_DIAG_RATE_S**: يمنع تكرار التشخيص بوتيرة عالية جدًا.
+- **PMTA_QUEUE_TOP_N**: يحدد كم عنصر من أعلى queue يظهر للتحليل.
+- **PMTA_QUEUE_BACKOFF**: يربط queue stats بقرار backoff.
+- **PMTA_QUEUE_REQUIRED**: يجعل بيانات queue شرطًا لاتخاذ القرار.
+- **PMTA_LIVE_POLL_S**: تردد polling اللحظي.
+- **PMTA_DOMAIN_CHECK_TOP_N**: عدد الدومينات ذات الأولوية للفحص.
+- **PMTA_DETAIL_CACHE_TTL_S**: مدة صلاحية cache لنتائج PMTA التفصيلية.
+- **PMTA_DOMAIN_DEFERRALS_BACKOFF**: عتبة deferrals للدخول في backoff.
+- **PMTA_DOMAIN_ERRORS_BACKOFF**: عتبة errors للدخول في backoff.
+- **PMTA_DOMAIN_DEFERRALS_SLOW**: عتبة deferrals لتفعيل slow mode.
+- **PMTA_DOMAIN_ERRORS_SLOW**: عتبة errors لتفعيل slow mode.
+- **PMTA_SLOW_DELAY_S**: التأخير بين الإرسال في slow mode.
+- **PMTA_SLOW_WORKERS_MAX**: أقصى workers في slow mode.
+- **PMTA_PRESSURE_CONTROL**: تفعيل خوارزمية التحكم بالضغط.
+- **PMTA_PRESSURE_POLL_S**: معدل تحديث قياس الضغط.
+- **PMTA_DOMAIN_STATS**: تشغيل تجميع stats حسب الدومين.
+- **PMTA_DOMAINS_POLL_S**: فترة سحب إحصاءات الدومينات.
+- **PMTA_DOMAINS_TOP_N**: عدد الدومينات المعروضة في snapshot.
+
+**User Story مشتركة:**
+كفريق deliverability، أريد مراقبة الضغط لكل دومين والتبديل تلقائيًا بين normal/slow/backoff لتفادي موجات الرفض والحظر.
+
+### 10.7 AI / OpenRouter
+
+- **OPENROUTER_ENDPOINT**: نقطة النهاية التي تستقبل طلب إعادة الصياغة/المعالجة.
+- **OPENROUTER_MODEL**: اختيار النموذج المؤثر في الجودة/السرعة/التكلفة.
+- **OPENROUTER_TIMEOUT_S**: مهلة استجابة مزود الـ AI.
+
+**User Story:**
+كصاحب منتج، أريد تغيير model وtimeout بسرعة حسب الميزانية وحجم الحمل بدون تعديل كود الخدمة.
+
+### 10.8 Accounting Flow (Shiva ⇄ Bridge)
+
+- **PMTA_BRIDGE_PULL_ENABLED**: تفعيل نمط pull من Shiva إلى bridge.
+- **PMTA_BRIDGE_PULL_URL**: المسار الكامل لجلب أحدث accounting lines.
+- **PMTA_BRIDGE_PULL_TOKEN**: Bearer token للمصادقة بين الخدمتين.
+- **PMTA_BRIDGE_PULL_S**: تردد السحب الدوري.
+- **PMTA_BRIDGE_PULL_MAX_LINES**: حجم الدفعة القصوى في كل عملية pull.
+
+**User Story:**
+كـ Backend Engineer، أريد مزامنة accounting بشكل دوري وآمن وبحجم دفعات مضبوط حتى لا أفقد أحداث التسليم.
+
+### 10.9 Bridge API (`pmta_accounting_bridge.py`)
+
+- **PMTA_LOG_DIR**: جذر ملفات PMTA logs التي يقرأها bridge.
+- **ALLOW_NO_AUTH**: يسمح/يمنع الوصول دون auth (للاختبار فقط عادة).
+- **DEFAULT_PUSH_MAX_LINES**: قيمة افتراضية لحجم push عندما لا تُمرر من العميل.
+- **CORS_ORIGINS**: قائمة origins المسموحة لاستهلاك الـ API من الواجهة.
+
+**User Story:**
+كـ Platform Engineer، أريد ضبط أمن bridge (auth + CORS) ومصدر السجلات وحدود الدفع لتشغيل API مستقر في بيئات متعددة.
