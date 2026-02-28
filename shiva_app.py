@@ -507,7 +507,45 @@ def _release_start_guard(exc):
 # SQLite Form Storage (replaces browser localStorage)
 # =========================
 APP_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path(os.getcwd())
-DB_PATH = str(APP_DIR / "smtp_sender.db")
+
+
+def _resolve_db_path() -> str:
+    """Resolve SQLite path with writable fallback locations.
+
+    Why: deployments sometimes run this app from a read-only code directory
+    (for example under /opt or a bind-mounted volume). In that case SQLite
+    writes fail and UI config save returns HTTP 500.
+    """
+    env_path = (os.getenv("SHIVA_DB_PATH") or os.getenv("SMTP_SENDER_DB_PATH") or "").strip()
+    candidates: List[Path] = []
+    if env_path:
+        candidates.append(Path(env_path).expanduser())
+
+    candidates.extend(
+        [
+            APP_DIR / "smtp_sender.db",
+            Path.home() / ".local" / "state" / "shivamta" / "smtp_sender.db",
+            Path("/tmp") / "shivamta" / "smtp_sender.db",
+        ]
+    )
+
+    for p in candidates:
+        try:
+            parent = p.parent
+            parent.mkdir(parents=True, exist_ok=True)
+            probe = parent / f".db_write_probe_{uuid.uuid4().hex}"
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("ok")
+            probe.unlink(missing_ok=True)
+            return str(p)
+        except Exception:
+            continue
+
+    # Last resort (keeps legacy behavior if all probes fail)
+    return str(APP_DIR / "smtp_sender.db")
+
+
+DB_PATH = _resolve_db_path()
 DB_LOCK = threading.Lock()
 
 BROWSER_COOKIE = "smtp_sender_bid"
@@ -922,10 +960,10 @@ def db_list_app_config() -> dict:
     return out
 
 
-def db_set_app_config(key: str, value: str) -> bool:
+def db_set_app_config(key: str, value: str) -> Tuple[bool, str]:
     k = (key or "").strip()
     if not k:
-        return False
+        return False, "missing key"
     v = "" if value is None else str(value)
     if len(v) > 20000:
         v = v[:20000]
@@ -941,9 +979,9 @@ def db_set_app_config(key: str, value: str) -> bool:
                 conn.commit()
             finally:
                 conn.close()
-        return True
-    except Exception:
-        return False
+        return True, ""
+    except Exception as e:
+        return False, str(e)
 
 
 def db_delete_app_config(key: str) -> bool:
@@ -9911,8 +9949,11 @@ def api_config_set():
             if not ok:
                 errors[key] = err
                 continue
-            if db_set_app_config(key, canon):
+            ok_save, save_err = db_set_app_config(key, canon)
+            if ok_save:
                 saved += 1
+            else:
+                errors[key] = save_err or "failed to save"
         try:
             reload_runtime_config()
         except Exception:
@@ -9925,8 +9966,9 @@ def api_config_set():
     if not ok:
         return jsonify({"ok": False, "error": err}), 400
 
-    if not db_set_app_config(key, canon):
-        return jsonify({"ok": False, "error": "failed to save"}), 500
+    ok_save, save_err = db_set_app_config(key, canon)
+    if not ok_save:
+        return jsonify({"ok": False, "error": (save_err or "failed to save")}), 500
 
     try:
         reload_runtime_config()
