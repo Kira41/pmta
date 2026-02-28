@@ -114,3 +114,43 @@ curl -s -X POST "http://127.0.0.1:5000/api/accounting/bridge/pull"
 
 - الملف `ENVIRONMENT_VARIABLES.md` متروك بشكل مستقل لأنه ملف مرجعي خاص بالمتغيرات.
 - جميع الشروحات التشغيلية الأخرى تم تجميعها هنا لتسهيل الوصول.
+
+---
+
+## 3) دليل شرح المتغيرات (Variables Explanation Guide)
+
+هذا القسم يكمّل `ENVIRONMENT_VARIABLES.md` بشكل تشغيلي سريع، ويربط المتغيرات مباشرةً مع الدوال التي تعتمد عليها.
+
+### متى أرجع لأي ملف؟
+- **تفصيل كامل لكل متغير (الدوال + التأثير + السيناريو):** راجع القسم 16 في `ENVIRONMENT_VARIABLES.md`.
+- **تشغيل يومي سريع:** استخدم هذا القسم كـ playbook مختصر.
+
+### Playbook مختصر حسب السيناريو
+
+1. **Bridge لا يرجع بيانات accounting**
+   - راجع: `PMTA_LOG_DIR`, `PMTA_BRIDGE_PULL_URL`, `PMTA_BRIDGE_PULL_MAX_LINES`.
+   - الدوال المؤثرة: `list_dir_files`, `_find_latest_file`, `_poll_accounting_bridge_once`.
+
+2. **401/403 بين Shiva وBridge**
+   - راجع: `ALLOW_NO_AUTH`, `PMTA_BRIDGE_PULL_TOKEN`.
+   - الدوال المؤثرة: `require_token`, `_poll_accounting_bridge_once`.
+
+3. **تباطؤ شديد مع ضغط على PMTA**
+   - راجع: `PMTA_PRESSURE_*`, `PMTA_QUEUE_BACKOFF`, `PMTA_DOMAIN_*`.
+   - الدوال المؤثرة: `pmta_pressure_policy_from_live`, `pmta_chunk_policy`.
+
+4. **مشاكل false timeout في المراقبة**
+   - راجع: `PMTA_MONITOR_TIMEOUT_S`, `PMTA_MONITOR_SCHEME`, `PMTA_MONITOR_BASE_URL`.
+   - الدوال المؤثرة: `_http_get_json`, `pmta_health_check`, `pmta_probe_endpoints`.
+
+5. **جودة لوائح ضعيفة / bounce مرتفع**
+   - راجع: `RECIPIENT_FILTER_ENABLE_SMTP_PROBE`, `RECIPIENT_FILTER_SMTP_PROBE_LIMIT`, `RECIPIENT_FILTER_SMTP_TIMEOUT`.
+   - الدالة المؤثرة: `pre_send_recipient_filter`.
+
+6. **تحسين تقييم المحتوى قبل الإرسال**
+   - راجع: `SPAMCHECK_BACKEND`, `SPAMD_HOST`, `SPAMD_PORT`, `SPAMD_TIMEOUT`.
+   - الدوال المؤثرة: `compute_spam_score`, `_score_via_spamd`.
+
+7. **AI rewrite بطيء أو غير مناسب**
+   - راجع: `OPENROUTER_MODEL`, `OPENROUTER_TIMEOUT_S`, `OPENROUTER_ENDPOINT`.
+   - الدالة المؤثرة: `ai_rewrite_subjects_and_body`.

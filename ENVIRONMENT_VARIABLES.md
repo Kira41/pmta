@@ -610,3 +610,248 @@ OPENROUTER_TIMEOUT_S=40
 5. احتفظ بخطة rollback (`.env` سابق + restart procedure).
 
 بهذا الأسلوب تستطيع ضبط النظام بأمان ووضوح، وتعرف بدقة لماذا النتيجة تغيّرت بعد أي تعديل.
+
+---
+
+## 16) ملحق تنفيذي: كل متغير + الدوال التي تستخدمه + سيناريو الاستخدام
+
+> هذا الملحق يركّز على المطلوب التشغيلي: **أين يُستخدم المتغير داخل الدوال**، **ماذا يفعل هناك**، و**متى تستخدمه فعليًا**.
+
+### A) متغيرات Bridge (`pmta_accounting_bridge.py`)
+
+- `PMTA_LOG_DIR`
+  - **الدوال المستخدمة:** `list_dir_files`, `_find_latest_file`, `health`, `get_files`.
+  - **وظيفته داخل الدوال:** تحديد المسار الذي يتم منه قراءة ملفات `acct/diag/log`؛ الدوال تعتمد عليه لتعداد الملفات، اختيار أحدث ملف، وإظهار مسار العمل في الاستجابة.
+  - **ماذا يعطي:** مصدر البيانات الأساسي للسحب.
+  - **سيناريو الاستخدام:** تغييره عند وضع Logs في مسار غير قياسي مثل `/opt/pmta/logs`.
+
+- `ALLOW_NO_AUTH`
+  - **الدالة المستخدمة:** `require_token`.
+  - **وظيفته داخل الدالة:** إذا كانت قيمته `1` تتجاوز الدالة التحقق من التوكن؛ وإذا `0` تُلزم الطلبات بالمصادقة.
+  - **ماذا يعطي:** نمط أمني `Strict` أو `Bypass`.
+  - **سيناريو الاستخدام:** Debug محلي مؤقت فقط.
+
+- `DEFAULT_PUSH_MAX_LINES`
+  - **الدالة المستخدمة:** `pull_latest_accounting` (قيمة افتراضية للوسيط `max_lines`).
+  - **وظيفته داخل الدالة:** يحدد حجم الدفعة إن لم يرسل العميل `max_lines`.
+  - **ماذا يعطي:** توازن بين عدد الطلبات وحجم كل طلب.
+  - **سيناريو الاستخدام:** رفعه عند backlog كبير لتسريع catch-up.
+
+- `CORS_ORIGINS`
+  - **الموضع المستخدم:** `app.add_middleware(CORSMiddleware, allow_origins=...)`.
+  - **وظيفته:** التحكم بالـ Origins المسموح لها بالوصول من المتصفح.
+  - **ماذا يعطي:** حدود وصول Frontend على مستوى المتصفح.
+  - **سيناريو الاستخدام:** تحديد دومينات لوحة الإدارة بدل `*` في الإنتاج.
+
+- `BIND_ADDR`, `PORT`
+  - **الدالة المستخدمة:** كتلة التشغيل `if __name__ == "__main__"` عبر `uvicorn.run(...)`.
+  - **وظيفتهما:** تحديد عنوان/منفذ الاستماع لخدمة Bridge.
+  - **ماذا يعطي:** عنوان endpoint النهائي.
+  - **سيناريو الاستخدام:** تغيير المنفذ عند التعارض أو التشغيل خلف Proxy.
+
+### B) متغيرات Runtime العامة (`shiva_app.py`)
+
+- `SHIVA_HOST`, `SHIVA_PORT`
+  - **الدالة المستخدمة:** `main()` (تشغيل Flask).
+  - **وظيفتهما:** تحديد عنوان/منفذ تشغيل تطبيق Shiva.
+  - **سيناريو الاستخدام:** ربطه مع Nginx/Container Port Mapping.
+
+- `DB_CLEAR_ON_START`
+  - **الدالة المستخدمة:** `init_db()`.
+  - **وظيفته داخل الدالة:** عند التفعيل ينفذ `DELETE` للجداول الأساسية قبل الاستمرار.
+  - **سيناريو الاستخدام:** Reset كامل في بيئات الاختبار فقط.
+
+### C) Spam / SpamAssassin
+
+- `SPAMCHECK_BACKEND`
+  - **الدالة المستخدمة:** `compute_spam_score`.
+  - **وظيفته:** اختيار المسار التنفيذي (`spamd` أو `spamc` أو `spamassassin` أو `module` أو `off`).
+  - **سيناريو الاستخدام:** التحويل إلى `off` عند اختبار throughput بدون spam scoring.
+
+- `SPAMD_HOST`, `SPAMD_PORT`, `SPAMD_TIMEOUT`
+  - **الدوال المستخدمة:** `_score_via_spamd`, `_score_via_spamc_cli`, `_score_via_spamassassin_cli`.
+  - **وظيفتها:** تحديد endpoint/مهلة محرك spam backend.
+  - **سيناريو الاستخدام:** Spamd مركزي على سيرفر آخر أو شبكة بطيئة تتطلب timeout أكبر.
+
+### D) Recipient Filtering
+
+- `RECIPIENT_FILTER_ENABLE_SMTP_PROBE`
+  - **الدالة المستخدمة:** `pre_send_recipient_filter`.
+  - **وظيفته:** تفعيل/تعطيل probe قبل الإرسال.
+  - **سيناريو الاستخدام:** تعطيله مؤقتًا عند استيراد قوائم ضخمة بسرعة عالية.
+
+- `RECIPIENT_FILTER_SMTP_PROBE_LIMIT`
+  - **الدالة المستخدمة:** `pre_send_recipient_filter`.
+  - **وظيفته:** سقف عدد العناوين التي تُفحص بـ SMTP probe في الدورة.
+  - **سيناريو الاستخدام:** رفعه عندما تريد دقة أعلى قبل الإرسال.
+
+- `RECIPIENT_FILTER_SMTP_TIMEOUT`
+  - **الدالة المستخدمة:** مسار probe داخل `pre_send_recipient_filter` (اتصال `smtplib.SMTP`).
+  - **وظيفته:** مهلة فحص SMTP لكل هدف.
+  - **سيناريو الاستخدام:** زيادته في شبكات WAN أو مزودات بطيئة.
+
+### E) DNSBL / DBL
+
+- `RBL_ZONES`
+  - **الدالة المستخدمة:** `check_ip_dnsbl`.
+  - **وظيفته:** قائمة المناطق التي يتم Query عليها لسمعة IP.
+  - **سيناريو الاستخدام:** إضافة/إزالة zones حسب سياسة السمعة لديك.
+
+- `DBL_ZONES`
+  - **الدالة المستخدمة:** `check_domain_dnsbl`.
+  - **وظيفته:** قائمة مناطق DBL لفحص الدومين/الروابط.
+  - **سيناريو الاستخدام:** تشديد التحقق على الروابط المضمنة في المحتوى.
+
+- `SEND_DNSBL`
+  - **الدالة/المسار المستخدم:** قرار الإرسال في مسار pre-send policy.
+  - **وظيفته:** تحديد هل listing يؤدي لتحذير فقط أو منع أشد.
+  - **سيناريو الاستخدام:** ضبط سياسة المخاطرة حسب نوع الحملات.
+
+### F) PMTA Monitor + Health Gate
+
+- `PMTA_MONITOR_TIMEOUT_S`
+  - **الدوال المستخدمة:** `_http_get_json`, `pmta_health_check`, `pmta_probe_endpoints`.
+  - **وظيفته:** مهلة طلبات monitor API.
+  - **سيناريو الاستخدام:** رفعه عند RTT عالٍ لمنع false negatives.
+
+- `PMTA_MONITOR_BASE_URL`, `PMTA_MONITOR_SCHEME`
+  - **الدوال المستخدمة:** `_pmta_base_from_smtp_host`, `_pmta_norm_base`.
+  - **وظيفتهما:** بناء الرابط النهائي للـ PMTA Monitor (auto/http/https أو override مباشر).
+  - **سيناريو الاستخدام:** عندما endpoint المراقبة مختلف عن SMTP host.
+
+- `PMTA_MONITOR_API_KEY`
+  - **الدالة المستخدمة:** `_pmta_headers`.
+  - **وظيفته:** تمرير `X-API-Key` مع كل طلب monitor.
+  - **سيناريو الاستخدام:** عند تفعيل `http-api-key` في PMTA.
+
+- `PMTA_HEALTH_REQUIRED`
+  - **الدوال المستخدمة:** `pmta_health_check` ومسار بدء الإرسال.
+  - **وظيفته:** جعل فشل الفحص مانعًا للإرسال أو مجرد تحذير.
+  - **سيناريو الاستخدام:** Production عادة `1`.
+
+- `PMTA_MAX_SPOOL_RECIPIENTS`, `PMTA_MAX_SPOOL_MESSAGES`, `PMTA_MAX_QUEUED_RECIPIENTS`, `PMTA_MAX_QUEUED_MESSAGES`
+  - **الدوال المستخدمة:** `pmta_health_check`.
+  - **وظيفتها:** عتبات Busy Gate لتحديد overload قبل البدء.
+  - **سيناريو الاستخدام:** تخفيضها لحماية IP warm-up؛ رفعها في البنى الأقوى.
+
+### G) Backoff العام
+
+- `ENABLE_BACKOFF`
+  - **الدالة/المسار المستخدم:** مسار الإرسال (Default behavior للواجهة/الوظيفة).
+  - **وظيفته:** تفعيل السلوك الافتراضي للعودة التدريجية عند المنع المؤقت.
+  - **سيناريو الاستخدام:** عادة يبقى مفعّلًا في الإنتاج.
+
+- `BACKOFF_MAX_RETRIES`, `BACKOFF_BASE_S`, `BACKOFF_MAX_S`
+  - **الدالة/المسار المستخدم:** حساب backoff داخل send flow.
+  - **وظيفتها:** عدد المحاولات، بداية التأخير، والسقف الأقصى.
+  - **سيناريو الاستخدام:** موازنة التعافي السريع مقابل تخفيف الضغط على PMTA/providers.
+
+### H) PMTA Live / Domain Detail Backoff
+
+- `PMTA_DIAG_ON_ERROR`, `PMTA_DIAG_RATE_S`
+  - **الدالة المستخدمة:** `pmta_diag_on_error`.
+  - **وظيفتهما:** تشغيل التشخيص عند الخطأ وتحديد معدل تنفيذ التشخيص.
+  - **سيناريو الاستخدام:** التحقيق في bounce/defer المفاجئ.
+
+- `PMTA_QUEUE_TOP_N`
+  - **الدوال المستخدمة:** `pmta_live_panel`, `pmta_health_check`.
+  - **وظيفته:** عدد أهم الصفوف المعروضة/المحللة.
+  - **سيناريو الاستخدام:** رفعه عند تحليل تفصيلي متعدد المزودات.
+
+- `PMTA_QUEUE_BACKOFF`, `PMTA_QUEUE_REQUIRED`
+  - **الدالة المستخدمة:** `pmta_chunk_policy`.
+  - **وظيفتهما:** تفعيل backoff المعتمد على queue/domain وجعل التفاصيل شرطًا إلزاميًا أو اختياريًا.
+  - **سيناريو الاستخدام:** `REQUIRED=1` في بيئات حساسة لا تقبل الإرسال الأعمى.
+
+- `PMTA_LIVE_POLL_S`
+  - **الدالة المستخدمة:** `pmta_live_panel`.
+  - **وظيفته:** فترة تحديث بيانات live.
+  - **سيناريو الاستخدام:** تقليلها للمراقبة اللحظية أثناء incident.
+
+- `PMTA_DOMAIN_CHECK_TOP_N`
+  - **الدالة المستخدمة:** `pmta_chunk_policy`.
+  - **وظيفته:** عدد الدومينات الأعلى وزنًا التي تُفحص لكل chunk.
+  - **سيناريو الاستخدام:** رفعه عندما الحمل موزع على دومينات كثيرة.
+
+- `PMTA_DETAIL_CACHE_TTL_S`
+  - **الدوال المستخدمة:** `_pmta_cached`, `_pmta_cache_put`, `pmta_domain_detail_metrics`, `pmta_queue_detail_metrics`.
+  - **وظيفته:** تقليل إعادة طلب endpoints التفصيلية بزمن TTL قصير.
+  - **سيناريو الاستخدام:** رفعه لتخفيف الضغط على monitor API.
+
+- `PMTA_DOMAIN_DEFERRALS_BACKOFF`, `PMTA_DOMAIN_ERRORS_BACKOFF`
+  - **الدالة المستخدمة:** `pmta_chunk_policy`.
+  - **وظيفتهما:** حدود التحول إلى block/backoff.
+  - **سيناريو الاستخدام:** تشديد السياسة عند مزودات حساسة للسمعة.
+
+- `PMTA_DOMAIN_DEFERRALS_SLOW`, `PMTA_DOMAIN_ERRORS_SLOW`
+  - **الدالة المستخدمة:** `pmta_chunk_policy`.
+  - **وظيفتهما:** حدود الدخول في slow mode قبل الحظر الكامل.
+  - **سيناريو الاستخدام:** تباطؤ مبكر لحماية IP قبل الوصول للـ hard backoff.
+
+- `PMTA_SLOW_DELAY_S`, `PMTA_SLOW_WORKERS_MAX`
+  - **الدالة المستخدمة:** `pmta_chunk_policy` (قيمة `slow` الناتجة).
+  - **وظيفتهما:** زمن تهدئة الإرسال والحد الأعلى للعمال أثناء slow mode.
+  - **سيناريو الاستخدام:** ضبط throughput أثناء التدهور الجزئي.
+
+### I) PMTA Pressure Control
+
+- `PMTA_PRESSURE_CONTROL`, `PMTA_PRESSURE_POLL_S`
+  - **الدوال المستخدمة:** `pmta_pressure_policy_from_live` ومسار التحديث الدوري للّوحة.
+  - **وظيفتهما:** تشغيل محرك الضغط وتحديد فترة إعادة الحساب.
+  - **سيناريو الاستخدام:** إبقاؤه مفعّلًا مع poll قصير عند أحجام إرسال كبيرة.
+
+- `PMTA_DOMAIN_STATS`, `PMTA_DOMAINS_POLL_S`, `PMTA_DOMAINS_TOP_N`
+  - **الدالة المستخدمة:** `pmta_domains_overview`.
+  - **وظيفتها:** تفعيل snapshot للدومينات والتحكم بمعدل/حجم التحديث.
+  - **سيناريو الاستخدام:** مراقبة top domains عند تفاوت أداء providers.
+
+- `PMTA_PRESSURE_Q1/Q2/Q3`, `PMTA_PRESSURE_S1/S2/S3`, `PMTA_PRESSURE_D1/D2/D3`
+  - **الدالة المستخدمة:** `pmta_pressure_policy_from_live`.
+  - **وظيفتها:** عتبات تصنيف المستوى 1/2/3 حسب queue/spool/deferred.
+  - **سيناريو الاستخدام:** تعديل الحساسية حسب سعة البنية.
+
+- `PMTA_PRESSURE_L1_*`, `PMTA_PRESSURE_L2_*`, `PMTA_PRESSURE_L3_*`
+  - **الدالة المستخدمة:** `pmta_pressure_policy_from_live` (إخراج policy التنفيذية).
+  - **وظيفتها:** تحديد delay/workers/chunk/sleep لكل مستوى.
+  - **سيناريو الاستخدام:** تخفيض `*_CHUNK_MAX` و`*_WORKERS_MAX` في المستويات العالية لتقليل الانفجار.
+
+### J) Accounting Bridge Pull (داخل Shiva)
+
+- `PMTA_BRIDGE_PULL_ENABLED`
+  - **الدوال المستخدمة:** `start_accounting_bridge_poller_if_needed`, `api_accounting_bridge_status`.
+  - **وظيفته:** تشغيل/إيقاف خيط poller بالكامل.
+  - **سيناريو الاستخدام:** تعطيله مؤقتًا أثناء صيانة bridge.
+
+- `PMTA_BRIDGE_PULL_URL`
+  - **الدوال المستخدمة:** `_poll_accounting_bridge_once`, `api_accounting_bridge_status`, `api_accounting_bridge_pull_once`.
+  - **وظيفته:** endpoint الذي تسحب منه Shiva أحداث accounting.
+  - **سيناريو الاستخدام:** تغيير IP/Port bridge أو المسار.
+
+- `PMTA_BRIDGE_PULL_TOKEN`
+  - **الدالة المستخدمة:** `_poll_accounting_bridge_once`.
+  - **وظيفته:** إضافة `Authorization: Bearer` عند السحب.
+  - **سيناريو الاستخدام:** عندما bridge يعمل بمصادقة إلزامية.
+
+- `PMTA_BRIDGE_PULL_S`
+  - **الدوال المستخدمة:** `_accounting_bridge_poller_thread`, `api_accounting_bridge_status`.
+  - **وظيفته:** الفاصل الزمني بين محاولات السحب.
+  - **سيناريو الاستخدام:** خفضه لتقليل latency في تحديث النتائج.
+
+- `PMTA_BRIDGE_PULL_MAX_LINES`
+  - **الدوال المستخدمة:** `_poll_accounting_bridge_once`, `api_accounting_bridge_status`.
+  - **وظيفته:** حجم الدفعة لكل طلب pull.
+  - **سيناريو الاستخدام:** رفعه عند وجود backlog بعد انقطاع.
+
+### K) OpenRouter (AI Rewrite)
+
+- `OPENROUTER_ENDPOINT`, `OPENROUTER_MODEL`, `OPENROUTER_TIMEOUT_S`
+  - **الدالة المستخدمة:** `ai_rewrite_subjects_and_body`.
+  - **وظيفتها:** endpoint/model/timeout لطلبات إعادة الصياغة الذكية.
+  - **ماذا تعطي:** ناتج rewrite مع مصدر backend المحدد.
+  - **سيناريو الاستخدام:** تبديل النموذج لتحسين الجودة أو تقليل الكلفة.
+
+### L) ملاحظة مهمة عن الدوال الديناميكية
+
+- **الدوال:** `config_items`, `reload_runtime_config`, `cfg_get_*`.
+- **الفكرة:** عدد كبير من المتغيرات في هذا الملف يُعاد تحميله وقت التشغيل (UI > ENV > Default).
+- **السيناريو:** إذا لم يظهر أثر تعديل `.env`، راجع قيمة المتغير داخل واجهة الإعدادات أولًا.
