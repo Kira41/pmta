@@ -108,6 +108,29 @@ curl -s -X POST "http://127.0.0.1:5000/api/accounting/bridge/pull"
 - تقليل الاندفاع على provider واحد.
 - الحفاظ على سياسة الربط الصارم domain→IP داخل PMTA.
 
+### ماذا يحدث إذا دخل Chunk في Backoff؟
+
+هذا السؤال مهم لأنه يحدد هل التوقف يكون على مستوى chunk واحد أم على مستوى job كامل.
+
+1. **الـ backoff يطبق على الـ chunk الحالي فقط (المستهدف لدومين واحد)**
+   - كل chunk يتم بناؤه من bucket خاص بـ recipient domain واحد (`target_domain`).
+   - إذا فشل pre-check (spam/PMTA policy/blacklist) لهذا chunk، يدخل في backoff مع retry لنفس chunk.
+
+2. **لا يتم الانتقال مباشرةً لباقي الشانكات أثناء انتظار backoff**
+   - الحلقة الرئيسية تنتظر انتهاء backoff (`sleep`) ثم تعيد فحص نفس chunk.
+   - يعني عمليًا التنفيذ sequential على مستوى الشانكات: إما chunk الحالي ينجح، أو يُترك (abandoned) بعد تجاوز عدد المحاولات.
+
+3. **تدوير المرسل يحصل تلقائيًا عند إعادة المحاولة**
+   - مع كل retry يزيد المؤشر (`attempt`) فيتغير `from_email`/`subject`/`body variant` (حسب الدوران).
+   - الهدف إعطاء فرصة لـ route/domain مختلف إذا القائمة تحتوي أكثر من sender domain.
+
+4. **في حالة تعدد الدومينات (recipient domains كثيرة)**
+   - Shiva يختار الدومينات بنمط round-robin بين buckets (`gmail` ثم `yahoo` ثم `outlook` ...).
+   - إذا chunk لدومين معين دخل backoff، يتأخر التقدم العام مؤقتًا لأن التنفيذ لا يقفز فورًا لـ domain آخر قبل حسم chunk الحالي.
+   - بعد نجاح/abandon لهذا chunk، يكمل الدوران طبيعيًا على بقية الدومينات.
+
+> خلاصة تشغيلية: backoff **ليس إيقاف دائم لكل job**، لكنه **pause مؤقت لمسار التنفيذ الحالي** حتى يُعاد تقييم نفس chunk، مع تدوير sender تلقائيًا لمحاولة تحسين المرور.
+
 ---
 
 ## ملاحظات تنظيمية
