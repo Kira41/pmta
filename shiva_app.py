@@ -5471,6 +5471,7 @@ def compute_spam_score(*, subject: str, body: str, body_format: str, from_email:
 
 _RBL_ZONES_RAW = (os.getenv("RBL_ZONES") or "zen.spamhaus.org,bl.spamcop.net,cbl.abuseat.org").strip()
 _DBL_ZONES_RAW = (os.getenv("DBL_ZONES") or "dbl.spamhaus.org").strip()
+SEND_DNSBL = (os.getenv("SEND_DNSBL") or "1").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _parse_zones(raw: str) -> List[str]:
@@ -8212,7 +8213,7 @@ def smtp_send_job(
 
         Sender-domain DNSBL hits are reported for visibility but do not trigger
         chunk backoff, because this signal can be noisy for shared/content
-        domains. SMTP host IP DNSBL hits still trigger backoff.
+        domains. SMTP host IP DNSBL hits trigger backoff only when SEND_DNSBL is disabled.
         """
         parts: List[str] = []
         listed = False
@@ -8227,9 +8228,10 @@ def smtp_send_job(
         for ip in smtp_host_ips:
             hits = check_ip_dnsbl(ip)
             if hits:
-                listed = True
+                listed = listed or (not SEND_DNSBL)
                 zones = ",".join(x.get("zone", "") for x in hits if x.get("zone"))
-                parts.append(f"ip:{ip}=>{zones or 'listed'}")
+                mode = "send-enabled" if SEND_DNSBL else "backoff-enabled"
+                parts.append(f"ip:{ip}=>{zones or 'listed'} ({mode})")
 
         return listed, " | ".join([p for p in parts if p])
 
@@ -8810,7 +8812,11 @@ def smtp_send_job(
                         pmta_sig = {"enabled": True, "ok": False, "blocked": False, "slow": None, "reason": "pmta policy error"}
 
                 # DNSBL is visibility-only; do not pause chunks due to blacklist hits.
-                blocked = backoff_enabled and ((sc is not None and sc > job.spam_threshold) or bool(pmta_reason))
+                blocked = backoff_enabled and (
+                    (sc is not None and sc > job.spam_threshold)
+                    or bool(_bl_listed)
+                    or bool(pmta_reason)
+                )
 
                 with JOBS_LOCK:
                     job.current_chunk = chunk_idx
@@ -9001,6 +9007,8 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "Comma-separated IP DNSBL zones (RBL). Empty disables IP blacklist checks."},
     {"key": "DBL_ZONES", "type": "str", "default": "dbl.spamhaus.org", "group": "DNSBL", "restart_required": False,
      "desc": "Comma-separated domain DBL zones. Empty disables domain blacklist checks."},
+    {"key": "SEND_DNSBL", "type": "bool", "default": "true", "group": "DNSBL", "restart_required": False,
+     "desc": "If true, continue sending even when SMTP host IP appears in DNSBL (logs listing as info only)."},
 
     # PMTA monitor
     {"key": "PMTA_MONITOR_TIMEOUT_S", "type": "float", "default": "3", "group": "PMTA Monitor", "restart_required": False,
@@ -9027,7 +9035,7 @@ APP_CONFIG_SCHEMA: List[dict] = [
 
     # Sender backoff (preflight)
     {"key": "BACKOFF_MAX_RETRIES", "type": "int", "default": "3", "group": "Backoff", "restart_required": False,
-     "desc": "Max backoff retries per chunk when spam/PMTA policy blocks sending (blacklist checks are info-only)."},
+     "desc": "Max backoff retries per chunk when spam/blacklist/PMTA policy blocks sending."},
     {"key": "BACKOFF_BASE_S", "type": "float", "default": "60", "group": "Backoff", "restart_required": False,
      "desc": "Base backoff wait in seconds (exponential)."},
     {"key": "BACKOFF_MAX_S", "type": "float", "default": "1800", "group": "Backoff", "restart_required": False,
@@ -9203,7 +9211,7 @@ def reload_runtime_config() -> dict:
     """
     try:
         global SPAMCHECK_BACKEND, SPAMD_HOST, SPAMD_PORT, SPAMD_TIMEOUT
-        global _RBL_ZONES_RAW, _DBL_ZONES_RAW, RBL_ZONES_LIST, DBL_ZONES_LIST
+        global _RBL_ZONES_RAW, _DBL_ZONES_RAW, RBL_ZONES_LIST, DBL_ZONES_LIST, SEND_DNSBL
         global PMTA_MONITOR_TIMEOUT_S, PMTA_MONITOR_BASE_URL, PMTA_MONITOR_SCHEME, PMTA_MONITOR_API_KEY, PMTA_HEALTH_REQUIRED
         global PMTA_DIAG_ON_ERROR, PMTA_DIAG_RATE_S, PMTA_QUEUE_TOP_N
         global PMTA_QUEUE_BACKOFF, PMTA_QUEUE_REQUIRED
@@ -9226,6 +9234,7 @@ def reload_runtime_config() -> dict:
         _DBL_ZONES_RAW = (cfg_get_str("DBL_ZONES", "dbl.spamhaus.org") or "").strip()
         RBL_ZONES_LIST = _parse_zones(_RBL_ZONES_RAW)
         DBL_ZONES_LIST = _parse_zones(_DBL_ZONES_RAW)
+        SEND_DNSBL = bool(cfg_get_bool("SEND_DNSBL", True))
 
         # PMTA monitor
         PMTA_MONITOR_TIMEOUT_S = float(cfg_get_float("PMTA_MONITOR_TIMEOUT_S", 3.0))
@@ -10582,7 +10591,7 @@ def start():
         "INFO",
         f"Chunk controls: chunk_size={chunk_size} workers={thread_workers} sleep_between_chunks={sleep_chunks}s delay_between_messages={delay_s}s",
     )
-    job.log("INFO", f"Backoff protection: {'ON' if enable_backoff else 'OFF'} (covers spam/blacklist/PMTA policy checks).")
+    job.log("INFO", f"Backoff protection: {'ON' if enable_backoff else 'OFF'} (covers spam/blacklist/PMTA policy checks; SEND_DNSBL={'ON' if SEND_DNSBL else 'OFF'}).")
 
     with JOBS_LOCK:
         JOBS[job_id] = job
