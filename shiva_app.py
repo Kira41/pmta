@@ -1824,7 +1824,7 @@ PAGE_FORM = r"""
           <div class="check" style="margin-top:10px">
             <input type="checkbox" name="enable_backoff" {% if default_enable_backoff %}checked{% endif %}>
             <div>
-              Enable backoff protection (spam/IP blacklist/PMTA policy). Turn this OFF to continue sending even when spam, SMTP IP DNSBL, or PMTA policy signals would pause a chunk. Sender-domain DNSBL is info-only.
+              Enable backoff protection (spam/PMTA policy). Turn this OFF to continue sending even when spam or PMTA policy signals would pause a chunk. DNSBL (domain/IP blacklist) is info-only.
             </div>
           </div>
         </div>
@@ -8781,7 +8781,7 @@ def smtp_send_job(
                         pass
 
                 sc, det = _spam_check(fe, sb, b_used, body_format2)
-                bl_listed, bl_detail = _blacklist_check(fe)
+                _bl_listed, bl_detail = _blacklist_check(fe)
 
                 # PMTA domain/queue adaptive backoff (best-effort)
                 pmta_sig = {"enabled": False, "ok": True, "blocked": False, "slow": None, "reason": ""}
@@ -8809,7 +8809,8 @@ def smtp_send_job(
                     except Exception:
                         pmta_sig = {"enabled": True, "ok": False, "blocked": False, "slow": None, "reason": "pmta policy error"}
 
-                blocked = backoff_enabled and ((sc is not None and sc > job.spam_threshold) or bl_listed or bool(pmta_reason))
+                # DNSBL is visibility-only; do not pause chunks due to blacklist hits.
+                blocked = backoff_enabled and ((sc is not None and sc > job.spam_threshold) or bool(pmta_reason))
 
                 with JOBS_LOCK:
                     job.current_chunk = chunk_idx
@@ -9026,7 +9027,7 @@ APP_CONFIG_SCHEMA: List[dict] = [
 
     # Sender backoff (preflight)
     {"key": "BACKOFF_MAX_RETRIES", "type": "int", "default": "3", "group": "Backoff", "restart_required": False,
-     "desc": "Max backoff retries per chunk when spam/blacklist/PMTA policy blocks sending."},
+     "desc": "Max backoff retries per chunk when spam/PMTA policy blocks sending (blacklist checks are info-only)."},
     {"key": "BACKOFF_BASE_S", "type": "float", "default": "60", "group": "Backoff", "restart_required": False,
      "desc": "Base backoff wait in seconds (exponential)."},
     {"key": "BACKOFF_MAX_S", "type": "float", "default": "1800", "group": "Backoff", "restart_required": False,
