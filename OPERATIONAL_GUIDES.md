@@ -177,3 +177,86 @@ curl -s -X POST "http://127.0.0.1:5000/api/accounting/bridge/pull"
 7. **AI rewrite بطيء أو غير مناسب**
    - راجع: `OPENROUTER_MODEL`, `OPENROUTER_TIMEOUT_S`, `OPENROUTER_ENDPOINT`.
    - الدالة المؤثرة: `ai_rewrite_subjects_and_body`.
+
+---
+
+## 4) Troubleshooting سريع: PMTA Monitor errors + Backoff
+
+هذا القسم يجاوب مباشرةً على أكثر سؤالين شائعين:
+
+1) لماذا أخطاء PMTA لا تظهر في الـ monitor داخل الـ dashboard؟
+2) خيار backoff يكون `active` أم `disable`؟
+
+### A) إعداد PMTA الصحيح لوصول بيانات الأخطاء إلى الـ monitor
+
+تأكد أن PMTA يسمح للـ monitor API + يكتب ملفات `acct/diag`:
+
+```pmta
+# PMTA monitor API
+http-mgmt-port 8080
+http-access 0.0.0.0/0 admin
+http-access 0.0.0.0/0 monitor
+
+# accounting + diagnostics logs
+<acct-file /var/log/pmta/acct.csv>
+    max-size 50M
+</acct-file>
+
+<acct-file /var/log/pmta/diag.csv>
+    move-interval 1d
+    delete-after never
+    records t
+</acct-file>
+```
+
+> أمنيًا في الإنتاج: بدّل `0.0.0.0/0` بـ IP محدد (`x.x.x.x/32`) بدل فتحه للجميع.
+
+### B) إعداد Shiva الصحيح للاتصال بالـ monitor
+
+ضع هذه القيم في `.env` (أو Environment):
+
+```bash
+# PMTA monitor connectivity
+PMTA_MONITOR_SCHEME=auto
+# إن كان monitor على نفس smtp_host اترك BASE_URL فارغ
+PMTA_MONITOR_BASE_URL=
+PMTA_MONITOR_TIMEOUT_S=3
+# إذا عندك http-api-key في PMTA
+PMTA_MONITOR_API_KEY=
+
+# مهم: اجعلها 1 لكي يعتبر monitor failure خطأ فعلي
+PMTA_HEALTH_REQUIRED=1
+
+# Backoff global (checkbox default)
+ENABLE_BACKOFF=1
+BACKOFF_MAX_RETRIES=3
+BACKOFF_BASE_S=60
+BACKOFF_MAX_S=1800
+
+# PMTA policy-based backoff
+PMTA_QUEUE_BACKOFF=1
+PMTA_QUEUE_REQUIRED=0
+```
+
+### C) جواب مباشر: backoff يكون Active أم Disable؟
+
+- **القيمة الصحيحة لتفعيل backoff الطبيعي هي: `active` (أو `1` / ON).**
+- إذا وضعت **disable** فمعناه أنك **أوقفت** آلية backoff، وبالتالي الإرسال يكمل حتى مع إشارات منع/ضغط.
+
+### D) فحص سريع إذا الأخطاء لا تزال لا تظهر
+
+نفّذ الاختبارات التالية بالترتيب:
+
+```bash
+# 1) PMTA status API
+curl -sk "https://<PMTA_IP>:8080/status?format=json"
+
+# 2) PMTA queues API (مصدر last_error/deferrals)
+curl -sk "https://<PMTA_IP>:8080/queues?format=json"
+
+# 3) Shiva يقرأ monitor كما يجب
+curl -s "http://127.0.0.1:5000/api/config/runtime" | jq '.PMTA_MONITOR_BASE_URL,.PMTA_MONITOR_SCHEME,.PMTA_HEALTH_REQUIRED,.PMTA_QUEUE_BACKOFF,.ENABLE_BACKOFF'
+```
+
+لو (1) أو (2) فشلوا، المشكلة من PMTA monitor access / scheme / api-key.  
+لو نجحوا لكن dashboard لا يعكس الأخطاء، المشكلة غالبًا من قيم backoff أو من runtime config غير معمولة لها reload.
