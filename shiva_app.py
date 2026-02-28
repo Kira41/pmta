@@ -1824,7 +1824,7 @@ PAGE_FORM = r"""
           <div class="check" style="margin-top:10px">
             <input type="checkbox" name="enable_backoff" {% if default_enable_backoff %}checked{% endif %}>
             <div>
-              Enable backoff protection (spam/blacklist/PMTA policy). Turn this OFF to continue sending even when sender IP/domain is blacklisted.
+              Enable backoff protection (spam/IP blacklist/PMTA policy). Turn this OFF to continue sending even when spam, SMTP IP DNSBL, or PMTA policy signals would pause a chunk. Sender-domain DNSBL is info-only.
             </div>
           </div>
         </div>
@@ -8208,6 +8208,12 @@ def smtp_send_job(
         return out
 
     def _blacklist_check(from_email: str) -> Tuple[bool, str]:
+        """Return (should_backoff, detail).
+
+        Sender-domain DNSBL hits are reported for visibility but do not trigger
+        chunk backoff, because this signal can be noisy for shared/content
+        domains. SMTP host IP DNSBL hits still trigger backoff.
+        """
         parts: List[str] = []
         listed = False
 
@@ -8215,9 +8221,8 @@ def smtp_send_job(
         if dom:
             dl = check_domain_dnsbl(dom)
             if dl:
-                listed = True
                 zones = ",".join(x.get("zone", "") for x in dl if x.get("zone"))
-                parts.append(f"domain:{dom}=>{zones or 'listed'}")
+                parts.append(f"domain:{dom}=>{zones or 'listed'} (info-only)")
 
         for ip in smtp_host_ips:
             hits = check_ip_dnsbl(ip)
