@@ -1,0 +1,3 @@
+Flask<2.1
+# Needed only when running on Python 3.6 (built in on 3.7+)
+dataclasses; python_version < "3.7"
