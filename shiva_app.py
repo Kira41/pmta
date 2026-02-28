@@ -527,6 +527,7 @@ _ALLOWED_FORM_FIELDS = {
     "chunk_size",
     "thread_workers",
     "sleep_chunks",
+    "enable_backoff",
     "ai_token",
     "use_ai",
     "remember_ai",
@@ -1817,6 +1818,13 @@ PAGE_FORM = r"""
             </div>
             <div>
               <div class="mini" style="margin-top:26px">Tip: start with <b>chunk size 20–100</b> and <b>workers 2–10</b>.</div>
+            </div>
+          </div>
+
+          <div class="check" style="margin-top:10px">
+            <input type="checkbox" name="enable_backoff" checked>
+            <div>
+              Enable backoff protection (spam/blacklist/PMTA policy). Turn this OFF to continue sending even when sender IP/domain is blacklisted.
             </div>
           </div>
         </div>
@@ -8036,6 +8044,7 @@ def smtp_send_job(
     chunk_size: int,
     thread_workers: int,
     sleep_chunks: float,
+    enable_backoff: bool,
     use_ai_rewrite: bool,
     ai_token: str,
 ):
@@ -8093,6 +8102,7 @@ def smtp_send_job(
     max_backoff_retries = max(0, min(10, int(cfg_get_int("BACKOFF_MAX_RETRIES", 3))))
     backoff_base_s = max(1.0, float(cfg_get_float("BACKOFF_BASE_S", 60.0)))
     backoff_max_s = max(backoff_base_s, float(cfg_get_float("BACKOFF_MAX_S", 1800.0)))
+    backoff_enabled = bool(enable_backoff)
 
     def _should_stop() -> bool:
         with JOBS_LOCK:
@@ -8153,12 +8163,24 @@ def smtp_send_job(
             except Exception:
                 return default
 
+        def as_bool(key: str, default: bool) -> bool:
+            val = form.get(key, default)
+            if isinstance(val, bool):
+                return val
+            s = str(val or "").strip().lower()
+            if s in {"1", "true", "yes", "on"}:
+                return True
+            if s in {"0", "false", "no", "off"}:
+                return False
+            return bool(default)
+
         out: Dict[str, Any] = {}
 
         out["chunk_size"] = max(1, min(50000, as_int("chunk_size", chunk_size)))
         out["thread_workers"] = max(1, min(200, as_int("thread_workers", thread_workers)))
         out["sleep_chunks"] = max(0.0, min(120.0, as_float("sleep_chunks", sleep_chunks)))
         out["delay_s"] = max(0.0, min(10.0, as_float("delay_s", delay_s)))
+        out["enable_backoff"] = as_bool("enable_backoff", backoff_enabled)
 
         # spam threshold can change while running
         try:
@@ -8528,6 +8550,7 @@ def smtp_send_job(
             workers2 = int(rt.get("thread_workers", thread_workers))
             sleep2 = float(rt.get("sleep_chunks", sleep_chunks))
             delay2 = float(rt.get("delay_s", delay_s))
+            backoff_enabled = bool(rt.get("enable_backoff", backoff_enabled))
             job.spam_threshold = float(rt.get("spam_threshold", job.spam_threshold))
 
             from_names2 = rt.get("from_names") or sender_names
@@ -8781,7 +8804,7 @@ def smtp_send_job(
                     except Exception:
                         pmta_sig = {"enabled": True, "ok": False, "blocked": False, "slow": None, "reason": "pmta policy error"}
 
-                blocked = (sc is not None and sc > job.spam_threshold) or bl_listed or bool(pmta_reason)
+                blocked = backoff_enabled and ((sc is not None and sc > job.spam_threshold) or bl_listed or bool(pmta_reason))
 
                 with JOBS_LOCK:
                     job.current_chunk = chunk_idx
@@ -10312,6 +10335,7 @@ def start():
 
     # AI rewrite controls
     use_ai = (request.form.get("use_ai") == "on")
+    enable_backoff = (request.form.get("enable_backoff") == "on")
     ai_token = (request.form.get("ai_token") or "").strip()
 
     reply_to = (request.form.get("reply_to") or "").strip()
@@ -10541,6 +10565,7 @@ def start():
         "INFO",
         f"Chunk controls: chunk_size={chunk_size} workers={thread_workers} sleep_between_chunks={sleep_chunks}s delay_between_messages={delay_s}s",
     )
+    job.log("INFO", f"Backoff protection: {'ON' if enable_backoff else 'OFF'} (covers spam/blacklist/PMTA policy checks).")
 
     with JOBS_LOCK:
         JOBS[job_id] = job
@@ -10572,6 +10597,7 @@ def start():
             chunk_size,
             thread_workers,
             sleep_chunks,
+            enable_backoff,
             use_ai,
             ai_token,
         ),
