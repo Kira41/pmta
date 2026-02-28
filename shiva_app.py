@@ -9143,9 +9143,6 @@ def _cfg_get_raw_and_source(key: str) -> Tuple[Optional[str], str, Optional[str]
         return ui, "ui", ui, os.getenv(k)
 
     envv = os.getenv(k)
-    if envv is None and k == "ENABLE_BACKOFF":
-        # Backward-compatible alias for a common misspelling in deployments.
-        envv = os.getenv("ENABLE_BACCKOFF")
     if envv is not None:
         return envv, "env", ui, envv
     return None, "default", ui, envv

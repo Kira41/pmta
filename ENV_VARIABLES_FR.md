@@ -94,10 +94,6 @@ Ce document résume **toutes les variables d’environnement détectées** dans 
   Active la logique de backoff (ralentissement/retry intelligent).  
   Exemple: `ENABLE_BACKOFF=1`
 
-- `ENABLE_BACCKOFF` (alias historique, faute de frappe)  
-  Alias de compatibilité lu si `ENABLE_BACKOFF` est absent.  
-  Exemple: `ENABLE_BACCKOFF=1`
-
 - `BACKOFF_MAX_RETRIES` (défaut: `3`)  
   Nombre max de tentatives de retry.  
   Exemple: `BACKOFF_MAX_RETRIES=5`
