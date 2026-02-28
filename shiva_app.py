@@ -10579,4 +10579,8 @@ def start():
 
 if __name__ == "__main__":
     # For local use. In production, use a real WSGI server (gunicorn/waitress).
-    app.run(host="127.0.0.1", port=5001, debug=True)
+    app.run(
+        host=(os.getenv("SHIVA_HOST", "0.0.0.0") or "0.0.0.0").strip(),
+        port=int((os.getenv("SHIVA_PORT", "5001") or "5001").strip()),
+        debug=True,
+    )
