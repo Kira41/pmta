@@ -971,11 +971,27 @@ def db_set_app_config(key: str, value: str) -> Tuple[bool, str]:
         with DB_LOCK:
             conn = _db_conn()
             try:
-                conn.execute(
-                    "INSERT INTO app_config(key, value, updated_at) VALUES(?,?,?) "
-                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-                    (k, v, now_iso()),
-                )
+                ts = now_iso()
+                # Prefer modern SQLite UPSERT syntax, but keep a legacy fallback for
+                # older SQLite builds that raise: `near "ON": syntax error`.
+                try:
+                    conn.execute(
+                        "INSERT INTO app_config(key, value, updated_at) VALUES(?,?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                        (k, v, ts),
+                    )
+                except Exception as upsert_err:
+                    if "near \"ON\"" not in str(upsert_err):
+                        raise
+                    cur = conn.execute(
+                        "UPDATE app_config SET value=?, updated_at=? WHERE key=?",
+                        (v, ts, k),
+                    )
+                    if (cur.rowcount or 0) <= 0:
+                        conn.execute(
+                            "INSERT INTO app_config(key, value, updated_at) VALUES(?,?,?)",
+                            (k, v, ts),
+                        )
                 conn.commit()
             finally:
                 conn.close()
