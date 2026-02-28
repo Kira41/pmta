@@ -544,6 +544,10 @@ _ALLOWED_FORM_FIELDS = {
     "maillist_safe",
 }
 
+# Accept custom form keys so newly-added campaign/job variables are persisted
+# without requiring a code change to this static whitelist.
+_FORM_FIELD_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
+
 
 def _db_conn() -> sqlite3.Connection:
     return sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -660,17 +664,20 @@ def _sanitize_form_data(data: dict) -> dict:
         return {}
     out: Dict[str, Any] = {}
     for k, v in data.items():
-        if k not in _ALLOWED_FORM_FIELDS:
+        key = str(k or "").strip()
+        if not key:
+            continue
+        if key not in _ALLOWED_FORM_FIELDS and _FORM_FIELD_KEY_RE.fullmatch(key) is None:
             continue
         if isinstance(v, bool):
-            out[k] = v
+            out[key] = v
         elif v is None:
-            out[k] = ""
+            out[key] = ""
         else:
             s = str(v)
             if len(s) > 200000:
                 s = s[:200000]
-            out[k] = s
+            out[key] = s
     return out
 
 
