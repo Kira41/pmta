@@ -1234,11 +1234,15 @@ def db_save_campaign_form(browser_id: str, campaign_id: str, data: dict) -> bool
     with DB_LOCK:
         conn = _db_conn()
         try:
-            conn.execute(
-                "INSERT INTO campaign_form(campaign_id, data, updated_at) VALUES(?,?,?) "
-                "ON CONFLICT(campaign_id) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at",
-                (campaign_id, payload, ts),
+            cur = conn.execute(
+                "UPDATE campaign_form SET data=?, updated_at=? WHERE campaign_id=?",
+                (payload, ts, campaign_id),
             )
+            if cur.rowcount == 0:
+                conn.execute(
+                    "INSERT INTO campaign_form(campaign_id, data, updated_at) VALUES(?,?,?)",
+                    (campaign_id, payload, ts),
+                )
             conn.execute(
                 "UPDATE campaigns SET updated_at=? WHERE browser_id=? AND id=?",
                 (ts, browser_id, campaign_id),
