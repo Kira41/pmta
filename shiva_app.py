@@ -5824,11 +5824,25 @@ def db_mark_job_recipient(job_id: str, campaign_id: str, rcpt: str) -> None:
     with DB_LOCK:
         conn = _db_conn()
         try:
-            conn.execute(
-                "INSERT INTO job_recipients(job_id, campaign_id, rcpt, first_seen_at, last_seen_at) VALUES(?,?,?,?,?) "
-                "ON CONFLICT(job_id, rcpt) DO UPDATE SET campaign_id=excluded.campaign_id, last_seen_at=excluded.last_seen_at",
-                (jid, cid, em, ts, ts),
-            )
+            try:
+                conn.execute(
+                    "INSERT INTO job_recipients(job_id, campaign_id, rcpt, first_seen_at, last_seen_at) VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(job_id, rcpt) DO UPDATE SET campaign_id=excluded.campaign_id, last_seen_at=excluded.last_seen_at",
+                    (jid, cid, em, ts, ts),
+                )
+            except sqlite3.OperationalError as e:
+                # Backward-compat for older SQLite builds that don't support UPSERT.
+                if "near \"ON\"" not in str(e):
+                    raise
+                cur = conn.execute(
+                    "UPDATE job_recipients SET campaign_id=?, last_seen_at=? WHERE job_id=? AND rcpt=?",
+                    (cid, ts, jid, em),
+                )
+                if cur.rowcount == 0:
+                    conn.execute(
+                        "INSERT INTO job_recipients(job_id, campaign_id, rcpt, first_seen_at, last_seen_at) VALUES(?,?,?,?,?)",
+                        (jid, cid, em, ts, ts),
+                    )
             conn.commit()
         finally:
             conn.close()
