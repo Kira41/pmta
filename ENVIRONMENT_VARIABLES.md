@@ -1,76 +1,128 @@
-# Environment Variables Reference
+# Environment Variables Reference (Deep Dive)
 
-هذا الملف يجمع **جميع متغيرات البيئة (Environment Variables)** المستخدمة في الشيفرة داخل المشروع، مع شرح عملي لكل متغير وأمثلة تشغيل.
+هذا المستند هو النسخة التفصيلية العميقة لشرح **كل متغيرات البيئة (Environment Variables)** المستخدمة داخل المشروع، مع توضيح:
 
-> ملاحظة مهمة: في `shiva_app.py` يوجد نظام إعدادات ديناميكي (`APP_CONFIG_SCHEMA`) يجعل القيمة الفعّالة تأتي بالترتيب التالي:
-> 1) قيمة من واجهة الإعدادات (UI) إن وُجدت،
-> 2) ثم Environment Variable،
-> 3) ثم القيمة الافتراضية (Default).
+- ماذا يفعل المتغير داخل الكود بالضبط (الخلفية البرمجية).
+- كيف تُقرأ القيمة وتُحوَّل (Parsing / Casting / Fallback).
+- ماذا يحدث لو غيّرت القيمة إلى رقم أعلى أو أقل أو عطّلت الخاصية.
+- العلاقات بين المتغيرات وتأثيرها على الأداء، الأمان، ودقة الإرسال.
+
+> الهدف: هذا الملف ليس مجرد "افتراضي/وصف"، بل **مرجع تشغيل Production** يساعدك على اتخاذ قرار صحيح لكل متغير.
+
+---
+
+## 0) كيف تُحسم القيمة النهائية لأي متغير؟ (مهم جدًا)
+
+داخل `shiva_app.py` يوجد نظام إعدادات ديناميكي (`APP_CONFIG_SCHEMA`) يجعل القيمة الفعلية لبعض المتغيرات تأتي بهذا الترتيب:
+
+1. **قيمة UI** (المخزنة في SQLite) إن وُجدت.
+2. ثم **Environment Variable**.
+3. ثم **Default** المعرّف في المخطط.
+
+**ماذا يعني ذلك عمليًا؟**
+- لو غيّرت `.env` ولن ترى أثرًا، غالبًا هناك Override من واجهة التطبيق.
+- إزالة القيمة من UI تعيدك مباشرةً إلى ENV/default.
+- ليست كل المتغيرات تخضع لـ UI؛ بعضها يقرأ مباشرة من ENV عند بدء العملية.
+
+**نمط الـ Parsing في المشروع:**
+- Boolean: غالبًا القيم التالية تعتبر `True`: `1`, `true`, `yes`, `on`.
+- Int/Float: أي قيمة غير قابلة للتحويل ترجع تلقائيًا إلى قيمة افتراضية آمنة.
+- Strings: غالبًا يتم `strip()` لإزالة المسافات من البداية والنهاية.
 
 ---
 
 ## 1) متغيرات خدمة الجسر `pmta_accounting_bridge.py`
 
+هذه المتغيرات تخص خدمة Bridge التي تقرأ Accounting/Log files وتقدّم API للسحب.
+
 ### `PMTA_LOG_DIR`
 - **الافتراضي:** `/var/log/pmta`
-- **الدور:** مسار ملفات لوج/أكاونتنغ PowerMTA التي يقرأ منها الـ Bridge.
-- **مثال عملي:**
-  - إذا وضعت: `PMTA_LOG_DIR=/opt/pmta/logs`
-  - سيبدأ endpoint مثل `/api/v1/files` و`/api/v1/pull/latest` بالقراءة من هذا المسار بدل الافتراضي.
+- **النوع:** `path`
+- **الخلفية البرمجية:** المسار الذي تعتمد عليه Endpoints لاكتشاف ملفات اللوج وقراءتها.
+- **تأثير تغييره:**
+  - إذا المسار صحيح وملفات PMTA موجودة → API ترجع ملفات وبيانات.
+  - إذا المسار خاطئ أو لا يملك صلاحيات قراءة → endpoints سترجع أخطاء أو قوائم فارغة.
+- **متى تغيّره؟**
+  - عند وجود PMTA في مسار مخصص مثل `/opt/pmta/logs`.
+- **أفضل ممارسة:**
+  - استخدم مسارًا ثابتًا ومقروءًا من user تشغيل الخدمة، وتأكد من rotation policy.
 
 ### `ALLOW_NO_AUTH`
 - **الافتراضي:** `0`
-- **الدور:** تعطيل/تفعيل التحقق بالتوكن للـ Bridge API.
-- **السلوك:**
-  - `1` = يسمح بالوصول بدون توكن (غير آمن للإنتاج).
-  - غير ذلك = يفرض التوكن.
-- **مثال:** في بيئة اختبار سريعة:
-  - `ALLOW_NO_AUTH=1`
+- **النوع:** `bool` (فعليًا في الكود: `== "1"` فقط)
+- **الخلفية البرمجية:** يفعّل/يعطل اشتراط Bearer token على API.
+- **السلوك الدقيق:**
+  - `1` → إلغاء التحقق الأمني (API مفتوح).
+  - أي قيمة أخرى → التوكن مطلوب.
+- **إذا غيّرته:**
+  - `0 -> 1`: مناسب فقط في dev/local debugging.
+  - `1 -> 0`: يجب التأكد أن المستهلك (Shiva) يرسل `PMTA_BRIDGE_PULL_TOKEN`.
+- **تحذير أمني:** لا تستخدم `1` في الإنتاج نهائيًا.
 
 ### `DEFAULT_PUSH_MAX_LINES`
 - **الافتراضي:** `5000`
-- **الدور:** عدد الأسطر الافتراضي التي يعيدها `/api/v1/pull/latest` إذا لم ترسل `max_lines` في الطلب.
-- **مثال:**
-  - `DEFAULT_PUSH_MAX_LINES=1000`
-  - أي سحب بدون `max_lines` سيقتصر على 1000 سطر.
+- **النوع:** `int`
+- **الخلفية البرمجية:** الحد الافتراضي لعدد الأسطر عند سحب `/api/v1/pull/latest` عندما لا يرسل العميل `max_lines`.
+- **تأثير زيادة القيمة:**
+  - دفعات أكبر = عدد طلبات أقل.
+  - لكن استهلاك RAM/CPU في الطلب الواحد أعلى، وزمن الاستجابة أطول.
+- **تأثير تقليل القيمة:**
+  - دفعات أصغر = تأخير أقل لكل طلب.
+  - لكن Polling أكثر للوصول لنفس الحجم الكلي.
+- **نصيحة تشغيل:**
+  - أحجام كبيرة جدًا (>20000) قد تسبب latency أو timeouts عند الضغط العالي.
 
 ### `CORS_ORIGINS`
 - **الافتراضي:** `*`
-- **الدور:** السماح للأصول (Origins) التي يمكنها استدعاء API من المتصفح.
-- **أمثلة:**
-  - `CORS_ORIGINS=*` (السماح للجميع)
-  - `CORS_ORIGINS=https://admin.example.com,https://ops.example.com`
+- **النوع:** `csv|string`
+- **الخلفية البرمجية:** يحدد Origins المسموح لها من المتصفح باستدعاء API.
+- **قيم شائعة:**
+  - `*` (كل شيء)
+  - `https://admin.example.com,https://ops.example.com`
+- **التأثير:**
+  - `*` أسرع إعدادًا لكنه أقل صرامة أمنيًا.
+  - تحديد دومينات يقلل مخاطر استهلاك API من UIs غير مصرح بها.
 
 ### `BIND_ADDR`
 - **الافتراضي:** `0.0.0.0`
-- **الدور:** عنوان الشبكة الذي تستمع عليه خدمة الـ Bridge عند التشغيل المباشر.
-- **مثال:** `BIND_ADDR=127.0.0.1` لجعل الخدمة محلية فقط.
+- **النوع:** `str`
+- **الخلفية:** عنوان الشبكة الذي تستمع عليه الخدمة عند التشغيل المباشر.
+- **التأثير:**
+  - `0.0.0.0` → متاح من كل الواجهات.
+  - `127.0.0.1` → محلي فقط.
 
 ### `PORT`
 - **الافتراضي:** `8090`
-- **الدور:** بورت تشغيل خدمة الـ Bridge.
-- **مثال:** `PORT=9090`.
+- **النوع:** `int`
+- **الخلفية:** بورت خدمة Bridge.
+- **ماذا يتغير عند تغييره؟**
+  - يجب تحديث `PMTA_BRIDGE_PULL_URL` في Shiva لنفس البورت، وإلا يفشل السحب الدوري.
 
 ---
 
-## 2) متغيرات تشغيل Flask الأساسي `shiva_app.py`
+## 2) متغيرات تشغيل تطبيق Shiva الأساسية
 
 ### `SHIVA_HOST`
 - **الافتراضي:** `0.0.0.0`
-- **الدور:** عنوان الاستماع لخدمة Shiva.
-- **مثال:** `SHIVA_HOST=127.0.0.1` للاستخدام المحلي فقط.
+- **الخلفية:** عنوان الاستماع لتطبيق Flask.
+- **التأثير:**
+  - `127.0.0.1` مناسب خلف reverse proxy محلي.
+  - `0.0.0.0` مطلوب إذا الوصول من شبكة أخرى/حاوية.
 
 ### `SHIVA_PORT`
 - **الافتراضي:** `5001`
-- **الدور:** بورت تشغيل Shiva.
-- **مثال:** `SHIVA_PORT=8081`.
+- **الخلفية:** بورت واجهة Shiva.
+- **ملاحظة:** إذا عندك Nginx/Load balancer يجب مواءمة upstream.
 
 ### `DB_CLEAR_ON_START`
 - **الافتراضي:** `0`
-- **الدور:** إذا كان `1` يتم تفريغ جداول SQLite عند بدء التطبيق.
-- **تحذير:** قد يمسح بيانات حملات/نتائج/recipients.
-- **مثال:**
-  - للتصفير في بيئة تطوير: `DB_CLEAR_ON_START=1`
+- **النوع:** `bool`
+- **الخلفية:** عند `1` يتم تنفيذ مسح جداول SQLite مع بداية التشغيل.
+- **الأثر التشغيلي:**
+  - `1` = إعادة بيئة نظيفة (مفيد للاختبار).
+  - لكن يمسح بيانات حملات/نتائج/مستلمين، لذلك خطر جدًا في production.
+- **أفضل ممارسة:**
+  - اتركه `0` دائمًا في الإنتاج.
 
 ---
 
@@ -78,25 +130,33 @@
 
 ### `SPAMCHECK_BACKEND`
 - **الافتراضي:** `spamd`
-- **القيم المقترحة:** `spamd | spamc | spamassassin | module | off`
-- **الدور:** يحدد محرك حساب spam score.
-- **مثال:**
-  - `SPAMCHECK_BACKEND=off` لتعطيل حساب السبام نهائياً.
+- **القيم المتوقعة:** `spamd | spamc | spamassassin | module | off`
+- **الخلفية:** يحدد آلية حساب spam score أثناء مسار الفحص.
+- **تأثير القيم:**
+  - `off`: تعطيل التقييم بالكامل (سرعة أعلى، حماية أقل).
+  - `spamd`: اتصال daemon عبر الشبكة/localhost.
+  - `spamc`/`spamassassin`: اعتماد نمط تنفيذ مختلف حسب المتاح في النظام.
+- **عند اختيار backend غير متاح:**
+  - يحصل فشل/تحذيرات حسب المسار، وغالبًا fallback داخل منطق التطبيق.
 
 ### `SPAMD_HOST`
 - **الافتراضي:** `127.0.0.1`
-- **الدور:** عنوان خادم `spamd`.
-- **مثال:** `SPAMD_HOST=10.0.0.15`.
+- **الخلفية:** عنوان خدمة spamd.
+- **سيناريوهات:**
+  - localhost عندما spamd على نفس السيرفر.
+  - IP داخلي عندما spamd مركزي في شبكة خاصة.
 
 ### `SPAMD_PORT`
 - **الافتراضي:** `783`
-- **الدور:** بورت `spamd`.
-- **مثال:** `SPAMD_PORT=1783`.
+- **الخلفية:** بورت spamd.
+- **الأثر عند الخطأ:** port خاطئ = timeouts/failures في scoring.
 
 ### `SPAMD_TIMEOUT`
-- **الافتراضي:** `5` ثواني
-- **الدور:** مهلة استدعاء spamd/spamc/spamassassin.
-- **مثال:** `SPAMD_TIMEOUT=10` لو الشبكة أبطأ.
+- **الافتراضي:** `5`
+- **النوع:** `float`
+- **الخلفية:** مهلة انتظار خدمة spam backend.
+- **إذا رفعته:** دقة أفضل في شبكات بطيئة لكن زمن معالجة أعلى.
+- **إذا خفضته جدًا:** throughput أعلى لكن احتمالية timeout أكبر.
 
 ---
 
@@ -104,18 +164,23 @@
 
 ### `RECIPIENT_FILTER_ENABLE_SMTP_PROBE`
 - **الافتراضي:** `1`
-- **الدور:** تفعيل فحص SMTP probe لصلاحية المستلمين.
-- **مثال:** `RECIPIENT_FILTER_ENABLE_SMTP_PROBE=0` لتعطيل الفحص.
+- **الخلفية:** تشغيل فحص SMTP probe للتحقق المسبق من صلاحية المستلمين.
+- **التأثير:**
+  - `1`: جودة لائحة أعلى، bounce أقل، لكن زمن pre-check أعلى.
+  - `0`: أسرع، لكن bounce أثناء الإرسال قد يزيد.
 
 ### `RECIPIENT_FILTER_SMTP_PROBE_LIMIT`
 - **الافتراضي:** `25`
-- **الدور:** حد أقصى لعدد probes في الدورة.
-- **مثال:** `RECIPIENT_FILTER_SMTP_PROBE_LIMIT=50`.
+- **الخلفية:** سقف probes في الدورة الواحدة.
+- **إذا رفعته:** تغطية أكبر لكل دورة، ضغط أعلى على DNS/SMTP الخارجي.
+- **إذا خفضته:** استهلاك أقل لكن الدقة تظهر أبطأ على القوائم الكبيرة.
 
 ### `RECIPIENT_FILTER_SMTP_TIMEOUT`
-- **الافتراضي:** `5` ثواني
-- **الدور:** timeout للاتصال أثناء probe.
-- **مثال:** `RECIPIENT_FILTER_SMTP_TIMEOUT=8`.
+- **الافتراضي:** `5`
+- **الخلفية:** timeout لاتصالات probe.
+- **توصية:**
+  - بيئة WAN بطيئة: 7–10.
+  - بيئة سريعة: 3–5.
 
 ---
 
@@ -123,151 +188,222 @@
 
 ### `RBL_ZONES`
 - **الافتراضي:** `zen.spamhaus.org,bl.spamcop.net,cbl.abuseat.org`
-- **الدور:** قائمة مناطق DNSBL لفحص IP.
-- **مثال:** `RBL_ZONES=zen.spamhaus.org`
+- **الخلفية:** مناطق DNSBL لفحص سمعة IP.
+- **كلما زادت المناطق:** دقة أعلى لكن زمن query أكبر.
 
 ### `DBL_ZONES`
 - **الافتراضي:** `dbl.spamhaus.org`
-- **الدور:** قائمة مناطق DBL لفحص الدومين.
-- **مثال:** `DBL_ZONES=dbl.spamhaus.org,uribl.spameatingmonkey.net`
+- **الخلفية:** مناطق DBL لفحص الدومين/الروابط.
 
 ### `SEND_DNSBL`
 - **الافتراضي:** `1`
-- **الدور:** إذا كان مفعّلًا يستمر الإرسال حتى لو ظهر listing (مع تسجيل معلومات).
-- **مثال:**
-  - `SEND_DNSBL=0` لتشديد السياسة وإيقاف الإرسال في سيناريوهات listing.
+- **الخلفية:** سياسة التعامل عند وجود listing.
+- **التأثير العملي:**
+  - `1`: لا يمنع الإرسال تلقائيًا (تسجيل/تحذير).
+  - `0`: تشديد أكثر وقد يوقف الإرسال في حالات listing.
 
 ---
 
-## 6) PMTA Monitor Health
+## 6) PMTA Monitor Health + Busy Gate
 
 ### `PMTA_MONITOR_TIMEOUT_S`
 - **الافتراضي:** `3`
-- **الدور:** timeout لطلبات PMTA monitor API.
+- **الخلفية:** timeout لطلبات PMTA monitor API.
+- **رفع القيمة:** يقل false negatives في الشبكات المتأخرة.
 
 ### `PMTA_MONITOR_BASE_URL`
 - **الافتراضي:** فارغ
-- **الدور:** Override لعنوان monitor بالكامل.
-- **مثال:** `PMTA_MONITOR_BASE_URL=https://194.116.172.135:8080`
+- **الخلفية:** إذا وضعته، يصبح عنوان monitor صريحًا ويغلب الاشتقاق التلقائي.
 
 ### `PMTA_MONITOR_SCHEME`
 - **الافتراضي:** `auto`
 - **القيم:** `auto | http | https`
-- **الدور:** يحدد بروتوكول monitor عند الاشتقاق التلقائي.
+- **الخلفية:** تحديد بروتوكول monitor عند البناء التلقائي للرابط.
 
 ### `PMTA_MONITOR_API_KEY`
 - **الافتراضي:** فارغ
-- **الدور:** مفتاح API يرسل في `X-API-Key` إذا كان monitor محمي.
+- **الخلفية:** يرسل كـ `X-API-Key` عند حماية monitor.
+- **تنبيه:** تعامل معه كسِر (لا تضعه في logs).
 
 ### `PMTA_HEALTH_REQUIRED`
 - **الافتراضي:** `1`
-- **الدور:**
-  - `1`: فشل monitor يمنع بدء الإرسال.
-  - `0`: يعطي تحذير فقط.
+- **الخلفية:** هل فشل health check يمنع بدء الإرسال؟
+- **السلوك:**
+  - `1`: gate صارم (الأمان التشغيلي أعلى).
+  - `0`: تحذير فقط ويستمر التشغيل.
 
-### عتبات Busy الخاصة بصحة PMTA
-> تستخدم لتحديد أن السيرفر "مشغول" وبالتالي يمنع بدء Job جديد.
+### عتبات Busy الرئيسية
+> تُستخدم قبل بدء jobs لتحديد هل PMTA تحت حمل عالٍ.
 
-- `PMTA_MAX_SPOOL_RECIPIENTS` (افتراضي: `200000`)
-- `PMTA_MAX_SPOOL_MESSAGES` (افتراضي: `50000`)
-- `PMTA_MAX_QUEUED_RECIPIENTS` (افتراضي: `250000`)
-- `PMTA_MAX_QUEUED_MESSAGES` (افتراضي: `60000`)
+#### `PMTA_MAX_SPOOL_RECIPIENTS` (200000)
+- إذا `spool.recipients` تجاوزها → يعتبر Busy.
 
-**مثال عملي:**
-- إذا كان `PMTA_MAX_QUEUED_RECIPIENTS=100000` وعدد queued الفعلي 140000، ستعتبر الحالة Busy وقد يتم منع start.
+#### `PMTA_MAX_SPOOL_MESSAGES` (50000)
+- إذا `spool.messages` تجاوزها → Busy.
+
+#### `PMTA_MAX_QUEUED_RECIPIENTS` (250000)
+- إذا `queued.recipients` تجاوزها → Busy.
+
+#### `PMTA_MAX_QUEUED_MESSAGES` (60000)
+- إذا `queued.messages` تجاوزها → Busy.
+
+**مثال قرار فعلي:**
+- لو `PMTA_MAX_QUEUED_RECIPIENTS=100000` والفعلي `140000` → منع start (عند تفعيل health gate).
 
 ---
 
-## 7) Backoff عام قبل الإرسال
+## 7) Backoff العام أثناء الإرسال
 
 ### `ENABLE_BACKOFF`
 - **الافتراضي:** `1`
-- **الدور:** الحالة الافتراضية لخيار backoff في واجهة الإرسال.
+- **الخلفية:** الحالة الافتراضية لخيار backoff في نموذج الإرسال (واجهة).
+- **مهم:** هذا ليس دائمًا تعطيل/تفعيل قسري لكل الأنظمة، بل default behavior للـ send flow.
 
 ### `BACKOFF_MAX_RETRIES`
 - **الافتراضي:** `3`
-- **الدور:** أقصى عدد retries لكل chunk عندما policy تمنع الإرسال مؤقتاً.
+- **الخلفية:** أقصى retries عند منع مؤقت من policy.
+- **منطقيًا في الكود:** القيمة تُقيّد ضمن نطاق آمن (0..10).
 
 ### `BACKOFF_BASE_S`
 - **الافتراضي:** `60`
-- **الدور:** زمن الانتظار الأساسي (ثوانٍ) في backoff الأسي.
+- **الخلفية:** زمن البداية في backoff الأسي.
 
 ### `BACKOFF_MAX_S`
 - **الافتراضي:** `1800`
-- **الدور:** الحد الأعلى لانتظار backoff.
+- **الخلفية:** سقف الانتظار مهما زادت المحاولات.
 
-**مثال:**
-- `BACKOFF_BASE_S=30`, `BACKOFF_MAX_S=600`, `BACKOFF_MAX_RETRIES=5` يعطي retries أسرع لكن بسقف 10 دقائق.
+**كيف تعمل معًا؟**
+- محاولات أكثر + base منخفض = استعادة أسرع لكن ضغط أعلى.
+- محاولات أقل + base أعلى = سلوك محافظ لكن recovery أبطأ.
 
 ---
 
 ## 8) PMTA Live + Domain Detail Backoff
 
-### متغيرات عامة
-- `PMTA_DIAG_ON_ERROR` (افتراضي `1`): تفعيل تشخيص PMTA عند أخطاء SMTP.
-- `PMTA_DIAG_RATE_S` (افتراضي `1.0`): معدل أخذ التشخيص (rate limit).
-- `PMTA_QUEUE_TOP_N` (افتراضي `6`): عدد top queues في لوحة PMTA Live.
-- `PMTA_QUEUE_BACKOFF` (افتراضي `1`): تفعيل منطق backoff بناءً على domain/queue detail.
-- `PMTA_QUEUE_REQUIRED` (افتراضي `0`): وضع strict إذا endpoints التفاصيل غير متاحة.
-- `PMTA_LIVE_POLL_S` (افتراضي `3`): فترة تحديث لوحة PMTA Live.
-- `PMTA_DOMAIN_CHECK_TOP_N` (افتراضي `2`): عدد أهم الدومينات التي تُفحَص لكل chunk.
-- `PMTA_DETAIL_CACHE_TTL_S` (افتراضي `3`): TTL كاش نداءات detail.
+### `PMTA_DIAG_ON_ERROR`
+- **الافتراضي:** `1`
+- **الخلفية:** عند أخطاء SMTP يفعل جمع تشخيص PMTA.
 
-### عتبات slow/backoff حسب أخطاء الدومين
-- `PMTA_DOMAIN_DEFERRALS_BACKOFF` (80)
-- `PMTA_DOMAIN_ERRORS_BACKOFF` (6)
-- `PMTA_DOMAIN_DEFERRALS_SLOW` (25)
-- `PMTA_DOMAIN_ERRORS_SLOW` (3)
-- `PMTA_SLOW_DELAY_S` (0.35)
-- `PMTA_SLOW_WORKERS_MAX` (3)
+### `PMTA_DIAG_RATE_S`
+- **الافتراضي:** `1.0`
+- **الخلفية:** Rate limit لأخذ التشخيص.
+- **خفضه كثيرًا:** معلومات أكثر لكن ضغط أعلى على monitor endpoints.
 
-**مثال عملي:**
-- إذا دومين معين وصل `deferrals=30` و`errors=2`:
-  - يتجاوز `PMTA_DOMAIN_DEFERRALS_SLOW` ⇒ التطبيق يخفض السرعة (`delay` أعلى وعدد workers أقل).
-- إذا وصل `deferrals=120` أو `errors=7`:
-  - يتجاوز عتبة backoff ⇒ chunk قد يتوقف مؤقتاً حسب السياسة.
+### `PMTA_QUEUE_TOP_N`
+- **الافتراضي:** `6`
+- **الخلفية:** عدد queue entries المعروضة في live view.
+
+### `PMTA_QUEUE_BACKOFF`
+- **الافتراضي:** `1`
+- **الخلفية:** تفعيل منطق backoff المبني على تفاصيل queue/domain.
+
+### `PMTA_QUEUE_REQUIRED`
+- **الافتراضي:** `0`
+- **الخلفية:** إذا `1` يصبح توفر endpoints التفصيلية شرطًا صارمًا.
+- **التأثير:**
+  - `1`: أكثر صرامة، قد يوقف التقدم عند فقد البيانات التفصيلية.
+  - `0`: مرونة أعلى.
+
+### `PMTA_LIVE_POLL_S`
+- **الافتراضي:** `3`
+- **الخلفية:** فترة التحديث للوحة PMTA live.
+
+### `PMTA_DOMAIN_CHECK_TOP_N`
+- **الافتراضي:** `2`
+- **الخلفية:** كم دومين "الأكثر تأثيرًا" يتم فحصه لكل chunk.
+
+### `PMTA_DETAIL_CACHE_TTL_S`
+- **الافتراضي:** `3`
+- **الخلفية:** TTL لكاش endpoint detail لتقليل الضغط.
+
+### عتبات سلوك الدومين
+
+#### `PMTA_DOMAIN_DEFERRALS_BACKOFF` (80)
+#### `PMTA_DOMAIN_ERRORS_BACKOFF` (6)
+- تجاوز أي منهما يدفع إلى backoff/hold حسب policy.
+
+#### `PMTA_DOMAIN_DEFERRALS_SLOW` (25)
+#### `PMTA_DOMAIN_ERRORS_SLOW` (3)
+- تجاوز أي منهما يفعّل slow mode (تقليل سرعة الإرسال).
+
+#### `PMTA_SLOW_DELAY_S` (0.35)
+#### `PMTA_SLOW_WORKERS_MAX` (3)
+- بارامترات التخفيف عند slow mode.
+
+**سيناريو تفصيلي:**
+- `deferrals=30` و `errors=2`:
+  - يتجاوز `DEFERRALS_SLOW` → Slow mode: delay أعلى + workers أقل.
+- `deferrals=120` أو `errors=7`:
+  - يتجاوز `*_BACKOFF` → توقف/تأخير أقوى حسب سياسة الإرسال.
 
 ---
 
-## 9) PMTA Pressure Control (التحكم حسب الحمل)
+## 9) PMTA Pressure Control (التحكم التلقائي بالحمل)
 
-### تفعيل ومعدل التحديث
-- `PMTA_PRESSURE_CONTROL` (افتراضي `1`): تفعيل سياسة التحكم التلقائي.
-- `PMTA_PRESSURE_POLL_S` (افتراضي `3`): فترة الحساب.
+### تفعيل ومعدل الحساب
+
+#### `PMTA_PRESSURE_CONTROL`
+- **الافتراضي:** `1`
+- **الخلفية:** محرك policy يقرأ queue/spool/deferred ويخرج level من 0 إلى 3.
+
+#### `PMTA_PRESSURE_POLL_S`
+- **الافتراضي:** `3`
+- **الخلفية:** كل كم ثانية يُعاد حساب مستوى الضغط.
 
 ### Domain snapshot
-- `PMTA_DOMAIN_STATS` (افتراضي `1`): تفعيل جلب `/domains` وعرض الإحصائيات.
-- `PMTA_DOMAINS_POLL_S` (افتراضي `4`)
-- `PMTA_DOMAINS_TOP_N` (افتراضي `6`)
 
-### عتبات مستويات الضغط
-> النظام يحسب مستوى ضغط 0..3 من queue/spool/deferred.
+#### `PMTA_DOMAIN_STATS` (افتراضي `1`)
+- يفعّل سحب `/domains` واستخدامه في الرؤية التشغيلية.
 
-- Queue thresholds: `PMTA_PRESSURE_Q1=50000`, `PMTA_PRESSURE_Q2=120000`, `PMTA_PRESSURE_Q3=250000`
-- Spool thresholds: `PMTA_PRESSURE_S1=30000`, `PMTA_PRESSURE_S2=80000`, `PMTA_PRESSURE_S3=160000`
-- Deferred thresholds: `PMTA_PRESSURE_D1=200`, `PMTA_PRESSURE_D2=800`, `PMTA_PRESSURE_D3=2000`
+#### `PMTA_DOMAINS_POLL_S` (افتراضي `4`)
+- interval لتحديث لقطة الدومينات.
+
+#### `PMTA_DOMAINS_TOP_N` (افتراضي `6`)
+- عدد الدومينات المعروضة/المحللة في اللقطة.
+
+### عتبات تحديد المستوى (Thresholds)
+
+#### Queue
+- `PMTA_PRESSURE_Q1=50000`
+- `PMTA_PRESSURE_Q2=120000`
+- `PMTA_PRESSURE_Q3=250000`
+
+#### Spool
+- `PMTA_PRESSURE_S1=30000`
+- `PMTA_PRESSURE_S2=80000`
+- `PMTA_PRESSURE_S3=160000`
+
+#### Deferred
+- `PMTA_PRESSURE_D1=200`
+- `PMTA_PRESSURE_D2=800`
+- `PMTA_PRESSURE_D3=2000`
+
+> المستوى النهائي = أعلى مستوى ناتج من Queue/Spool/Deferred.
 
 ### سياسة كل مستوى
-- Level 1:
-  - `PMTA_PRESSURE_L1_DELAY_MIN=0.15`
-  - `PMTA_PRESSURE_L1_WORKERS_MAX=6`
-  - `PMTA_PRESSURE_L1_CHUNK_MAX=80`
-  - `PMTA_PRESSURE_L1_SLEEP_MIN=0.5`
-- Level 2:
-  - `PMTA_PRESSURE_L2_DELAY_MIN=0.35`
-  - `PMTA_PRESSURE_L2_WORKERS_MAX=3`
-  - `PMTA_PRESSURE_L2_CHUNK_MAX=45`
-  - `PMTA_PRESSURE_L2_SLEEP_MIN=2.0`
-- Level 3:
-  - `PMTA_PRESSURE_L3_DELAY_MIN=0.75`
-  - `PMTA_PRESSURE_L3_WORKERS_MAX=2`
-  - `PMTA_PRESSURE_L3_CHUNK_MAX=25`
-  - `PMTA_PRESSURE_L3_SLEEP_MIN=4.0`
 
-**مثال عملي:**
-- إذا queued recipients = 130000 و deferred = 900:
-  - Queue يعطي مستوى 2 وDeferred يعطي مستوى 2 ⇒ policy النهائية مستوى 2.
-  - النتيجة: التطبيق يرفع أقل delay، ويقلل workers/chunk size حسب إعدادات Level 2.
+#### Level 1
+- `PMTA_PRESSURE_L1_DELAY_MIN=0.15`
+- `PMTA_PRESSURE_L1_WORKERS_MAX=6`
+- `PMTA_PRESSURE_L1_CHUNK_MAX=80`
+- `PMTA_PRESSURE_L1_SLEEP_MIN=0.5`
+
+#### Level 2
+- `PMTA_PRESSURE_L2_DELAY_MIN=0.35`
+- `PMTA_PRESSURE_L2_WORKERS_MAX=3`
+- `PMTA_PRESSURE_L2_CHUNK_MAX=45`
+- `PMTA_PRESSURE_L2_SLEEP_MIN=2.0`
+
+#### Level 3
+- `PMTA_PRESSURE_L3_DELAY_MIN=0.75`
+- `PMTA_PRESSURE_L3_WORKERS_MAX=2`
+- `PMTA_PRESSURE_L3_CHUNK_MAX=25`
+- `PMTA_PRESSURE_L3_SLEEP_MIN=4.0`
+
+**ماذا يحدث عند التغيير؟**
+- تخفيض thresholds = دخول أسرع لمستويات أعلى (محافظة أكبر).
+- رفع `WORKERS_MAX` في مستوى عالٍ قد يحسن throughput مؤقتًا لكن يزيد خطر التشبع/deferrals.
+- زيادة `CHUNK_MAX` تحت ضغط عالٍ قد تضر latency وتراكم الطوابير.
 
 ---
 
@@ -275,27 +411,31 @@
 
 ### `PMTA_BRIDGE_PULL_ENABLED`
 - **الافتراضي:** `1`
-- **الدور:** تشغيل/إيقاف خيط السحب الدوري من bridge.
+- **الخلفية:** تشغيل/إيقاف خيط السحب الدوري من bridge.
+- **إذا `0`:** لن يتم ingest محاسبة PMTA تلقائيًا.
 
 ### `PMTA_BRIDGE_PULL_URL`
 - **الافتراضي:** فارغ
-- **الدور:** رابط endpoint للسحب.
-- **مثال:** `http://194.116.172.135:8090/api/v1/pull/latest?kind=acct`
+- **الخلفية:** endpoint الذي يقرأ منه Shiva بيانات accounting.
+- **الشرط:** يجب أن يطابق host/port/path الحقيقية لخدمة Bridge.
 
 ### `PMTA_BRIDGE_PULL_TOKEN`
 - **الافتراضي:** فارغ
-- **الدور:** Bearer token يرسل مع طلب السحب للـ bridge.
+- **الخلفية:** Bearer token في طلبات السحب عند تفعيل auth بالـ bridge.
+- **حالة شائعة:**
+  - `ALLOW_NO_AUTH=0` وtoken فارغ → طلبات السحب سترفض (401/403).
 
 ### `PMTA_BRIDGE_PULL_S`
 - **الافتراضي:** `5`
-- **الدور:** فترة polling (ثوانٍ).
+- **الخلفية:** polling interval بالثواني.
+- **خفضه (مثلاً 1–2):** near-real-time أكثر، لكن load أعلى.
 
 ### `PMTA_BRIDGE_PULL_MAX_LINES`
 - **الافتراضي:** `2000`
-- **الدور:** قيمة `max_lines` في طلب السحب.
-
-**مثال:**
-- `PMTA_BRIDGE_PULL_S=2` و`PMTA_BRIDGE_PULL_MAX_LINES=5000` يعني سحب أسرع وبحجم أكبر لكل دفعة.
+- **الخلفية:** حجم الدفعة لكل سحب.
+- **الموازنة:**
+  - قيمة أعلى = catch-up أسرع بعد تأخر.
+  - قيمة أقل = طلبات أخف وأسرع.
 
 ---
 
@@ -303,25 +443,60 @@
 
 ### `OPENROUTER_ENDPOINT`
 - **الافتراضي:** `https://openrouter.ai/api/v1/chat/completions`
-- **الدور:** endpoint للاتصال بخدمة OpenRouter.
+- **الخلفية:** عنوان HTTP API الذي تُرسل له طلبات إعادة الصياغة.
 
 ### `OPENROUTER_MODEL`
 - **الافتراضي:** `arcee-ai/trinity-large-preview:free`
-- **الدور:** اسم الموديل المستخدم لإعادة الصياغة.
+- **الخلفية:** معرف النموذج المستخدم.
+- **إذا غيّرته:**
+  - قد تتغير جودة النص/السرعة/التكلفة حسب المزود.
 
 ### `OPENROUTER_TIMEOUT_S`
 - **الافتراضي:** `40`
-- **الدور:** timeout لطلبات OpenRouter.
-
-**مثال:**
-- `OPENROUTER_MODEL=openai/gpt-4o-mini` لاختيار موديل مختلف (حسب توفره في حسابك).
+- **الخلفية:** مهلة طلب AI.
+- **خفضه كثيرًا:** احتمال timeout أعلى للنماذج البطيئة.
+- **رفعه كثيرًا:** انتظار أطول للمستخدم قبل الفشل.
 
 ---
 
-## 12) مثال ملف `.env` تجميعي (Production-like)
+## 12) ملاحظات "ما الذي يدور في الخلفية" لكل الفئات
+
+### أ) متغيرات bool
+- تُستخدم لتشغيل/تعطيل Features أو للتحول بين strict/permissive policy.
+- تغييرها عادةً يعطي **فرق سلوكي مباشر** وليس مجرد tuning رقمي.
+
+### ب) متغيرات timeout / poll
+- timeout = كم ننتظر نفس العملية.
+- poll = كم نكرر الفحص.
+- المبالغة في تقليل poll قد تسبب load مرتفع، والمبالغة في رفعه تزيد latency في الاستجابة للأحداث.
+
+### ج) متغيرات thresholds
+- thresholds تحدد "متى" يتحول النظام من وضع طبيعي إلى slow/backoff/pressure.
+- القيم المنخفضة = حماية أكبر + throughput أقل.
+- القيم المرتفعة = throughput أعلى + مخاطرة أكبر تحت الضغط.
+
+### د) متغيرات workers/chunk/delay
+- `workers` أعلى = parallelism أعلى.
+- `chunk` أعلى = دفعة أكبر لكل دورة.
+- `delay` أعلى = تهدئة الإرسال.
+- هذه الثلاثة متلازمة؛ تعديل واحد غالبًا يحتاج تعديل الآخرين.
+
+---
+
+## 13) مصفوفة قرارات سريعة (إذا تغيّر X ماذا يحدث؟)
+
+- إذا زادت `PMTA_PRESSURE_* thresholds` كثيرًا → النظام يتأخر في الدخول لوضع الحماية، وقد ترى ضغطًا أكبر قبل أن يتدخل.
+- إذا قللت `PMTA_DOMAIN_*_BACKOFF` جدًا → backoff يشتغل مبكرًا، ما يقلل المخاطر لكنه قد يخفض throughput بشكل واضح.
+- إذا رفعت `BACKOFF_MAX_RETRIES` مع `BACKOFF_BASE_S` منخفضة → attempts أكثر في وقت أقصر (مفيد للتعافي السريع، لكنه يكرر الضغط).
+- إذا عطلت `PMTA_QUEUE_BACKOFF` أو `PMTA_PRESSURE_CONTROL` مع استمرار أخطاء PMTA → لازم تعتمد على مراقبة يدوية وإلا يمكن يتفاقم الوضع.
+- إذا جعلت `PMTA_BRIDGE_PULL_S` صغيرًا جدًا و`MAX_LINES` كبيرًا جدًا → عبء أعلى على Bridge وDB.
+
+---
+
+## 14) ملف `.env` مقترح (Production-like baseline)
 
 ```env
-# Bridge
+# --- Bridge ---
 PMTA_LOG_DIR=/var/log/pmta
 ALLOW_NO_AUTH=0
 DEFAULT_PUSH_MAX_LINES=5000
@@ -329,36 +504,109 @@ CORS_ORIGINS=https://panel.example.com
 BIND_ADDR=0.0.0.0
 PORT=8090
 
-# Shiva runtime
+# --- Shiva runtime ---
 SHIVA_HOST=0.0.0.0
 SHIVA_PORT=5001
 DB_CLEAR_ON_START=0
 
-# Spam
+# --- Spam ---
 SPAMCHECK_BACKEND=spamd
 SPAMD_HOST=127.0.0.1
 SPAMD_PORT=783
 SPAMD_TIMEOUT=5
 
-# PMTA monitor
+# --- Recipient probe ---
+RECIPIENT_FILTER_ENABLE_SMTP_PROBE=1
+RECIPIENT_FILTER_SMTP_PROBE_LIMIT=25
+RECIPIENT_FILTER_SMTP_TIMEOUT=5
+
+# --- DNSBL ---
+RBL_ZONES=zen.spamhaus.org,bl.spamcop.net,cbl.abuseat.org
+DBL_ZONES=dbl.spamhaus.org
+SEND_DNSBL=1
+
+# --- PMTA monitor ---
 PMTA_MONITOR_SCHEME=auto
 PMTA_MONITOR_BASE_URL=
 PMTA_MONITOR_TIMEOUT_S=3
 PMTA_MONITOR_API_KEY=
 PMTA_HEALTH_REQUIRED=1
+PMTA_MAX_SPOOL_RECIPIENTS=200000
+PMTA_MAX_SPOOL_MESSAGES=50000
+PMTA_MAX_QUEUED_RECIPIENTS=250000
+PMTA_MAX_QUEUED_MESSAGES=60000
 
-# PMTA accounting pull
+# --- Backoff ---
+ENABLE_BACKOFF=1
+BACKOFF_MAX_RETRIES=3
+BACKOFF_BASE_S=60
+BACKOFF_MAX_S=1800
+
+# --- PMTA domain/detail backoff ---
+PMTA_DIAG_ON_ERROR=1
+PMTA_DIAG_RATE_S=1.0
+PMTA_QUEUE_TOP_N=6
+PMTA_QUEUE_BACKOFF=1
+PMTA_QUEUE_REQUIRED=0
+PMTA_LIVE_POLL_S=3
+PMTA_DOMAIN_CHECK_TOP_N=2
+PMTA_DETAIL_CACHE_TTL_S=3
+PMTA_DOMAIN_DEFERRALS_BACKOFF=80
+PMTA_DOMAIN_ERRORS_BACKOFF=6
+PMTA_DOMAIN_DEFERRALS_SLOW=25
+PMTA_DOMAIN_ERRORS_SLOW=3
+PMTA_SLOW_DELAY_S=0.35
+PMTA_SLOW_WORKERS_MAX=3
+
+# --- Pressure control ---
+PMTA_PRESSURE_CONTROL=1
+PMTA_PRESSURE_POLL_S=3
+PMTA_DOMAIN_STATS=1
+PMTA_DOMAINS_POLL_S=4
+PMTA_DOMAINS_TOP_N=6
+PMTA_PRESSURE_Q1=50000
+PMTA_PRESSURE_Q2=120000
+PMTA_PRESSURE_Q3=250000
+PMTA_PRESSURE_S1=30000
+PMTA_PRESSURE_S2=80000
+PMTA_PRESSURE_S3=160000
+PMTA_PRESSURE_D1=200
+PMTA_PRESSURE_D2=800
+PMTA_PRESSURE_D3=2000
+PMTA_PRESSURE_L1_DELAY_MIN=0.15
+PMTA_PRESSURE_L1_WORKERS_MAX=6
+PMTA_PRESSURE_L1_CHUNK_MAX=80
+PMTA_PRESSURE_L1_SLEEP_MIN=0.5
+PMTA_PRESSURE_L2_DELAY_MIN=0.35
+PMTA_PRESSURE_L2_WORKERS_MAX=3
+PMTA_PRESSURE_L2_CHUNK_MAX=45
+PMTA_PRESSURE_L2_SLEEP_MIN=2.0
+PMTA_PRESSURE_L3_DELAY_MIN=0.75
+PMTA_PRESSURE_L3_WORKERS_MAX=2
+PMTA_PRESSURE_L3_CHUNK_MAX=25
+PMTA_PRESSURE_L3_SLEEP_MIN=4.0
+
+# --- Accounting pull in Shiva ---
 PMTA_BRIDGE_PULL_ENABLED=1
 PMTA_BRIDGE_PULL_URL=http://127.0.0.1:8090/api/v1/pull/latest?kind=acct
 PMTA_BRIDGE_PULL_TOKEN=
 PMTA_BRIDGE_PULL_S=5
 PMTA_BRIDGE_PULL_MAX_LINES=2000
+
+# --- AI ---
+OPENROUTER_ENDPOINT=https://openrouter.ai/api/v1/chat/completions
+OPENROUTER_MODEL=arcee-ai/trinity-large-preview:free
+OPENROUTER_TIMEOUT_S=40
 ```
 
 ---
 
-## 13) ملاحظات تشغيل مهمة
+## 15) Checklist قبل اعتماد أي تعديل في المتغيرات
 
-- أي قيمة غير صالحة في بعض المتغيرات الرقمية يتم fallback تلقائيًا إلى default داخل الشيفرة.
-- المتغيرات من نوع boolean غالبًا تقبل: `1/true/yes/on` للتفعيل.
-- بعض الإعدادات داخل Shiva يمكن تغييرها من UI، وقد تتغلب على قيمة Environment Variable.
+1. غيّر مجموعة صغيرة فقط (لا تغيّر 20 متغير دفعة واحدة).
+2. سجّل baseline قبل/بعد (throughput, deferrals, errors, queue depth).
+3. راقب 30–60 دقيقة على الأقل بعد كل تغيير.
+4. تأكد هل القيمة آتية من UI أم ENV.
+5. احتفظ بخطة rollback (`.env` سابق + restart procedure).
+
+بهذا الأسلوب تستطيع ضبط النظام بأمان ووضوح، وتعرف بدقة لماذا النتيجة تغيّرت بعد أي تعديل.
