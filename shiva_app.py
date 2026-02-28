@@ -8598,18 +8598,38 @@ def smtp_send_job(
         # Per-provider sender rotation cursor: if a provider has many recipients,
         # chunk#1 can use sender/IP-A, chunk#2 sender/IP-B, ... then wrap.
         provider_sender_cursor: Dict[str, int] = {}
+        # Backoff is scoped to relation: (receiver_domain, sender_domain).
+        # This allows other receivers and other sender domains to keep flowing.
+        relation_backoff_until: Dict[Tuple[str, str], float] = {}
+        relation_backoff_attempts: Dict[Tuple[str, str], int] = {}
+        provider_next_retry_ts: Dict[str, float] = {}
 
         def _remaining_total() -> int:
             return sum(len(v) for v in provider_buckets.values())
+
+        def _next_ready_in() -> float:
+            if not provider_next_retry_ts:
+                return 0.0
+            now_ts = time.time()
+            waits = [max(0.0, float(v or 0.0) - now_ts) for v in provider_next_retry_ts.values() if float(v or 0.0) > now_ts]
+            return min(waits) if waits else 0.0
 
         def _next_provider_domain() -> Optional[str]:
             nonlocal provider_cursor
             if not provider_order:
                 return None
+            now_ts = time.time()
             n = len(provider_order)
             for step in range(n):
                 idx2 = (provider_cursor + step) % n
                 dom2 = provider_order[idx2]
+                if not provider_buckets.get(dom2):
+                    continue
+                wait_until = float(provider_next_retry_ts.get(dom2, 0.0) or 0.0)
+                if wait_until > now_ts:
+                    continue
+                if dom2 in provider_next_retry_ts:
+                    provider_next_retry_ts.pop(dom2, None)
                 if provider_buckets.get(dom2):
                     provider_cursor = (idx2 + 1) % n
                     return dom2
@@ -8726,6 +8746,15 @@ def smtp_send_job(
 
             target_domain = _next_provider_domain()
             if not target_domain:
+                wait_for = _next_ready_in()
+                if wait_for > 0 and _remaining_total() > 0:
+                    with JOBS_LOCK:
+                        job.status = "running"
+                        job.log("INFO", f"All active receiver domains are in scoped backoff. wait={int(wait_for)}s")
+                    if not _sleep_checked(min(wait_for, 2.0)):
+                        _stop_job("stop requested")
+                        return
+                    continue
                 break
 
             bucket = provider_buckets.get(target_domain) or []
@@ -8800,7 +8829,7 @@ def smtp_send_job(
             with JOBS_LOCK:
                 job.chunks_total = max(job.chunks_total, job.chunks_done + est_remaining)
 
-            # Per-chunk attempt loop (GLOBAL backoff)
+            # Per-chunk attempt loop.
             # Per-chunk AI rewrite chain (optional): rewrite from last accepted message,
             # then carry rewritten output forward as input for next chunk.
             chunk_subjects = list(subjects2 or subjects)
@@ -8836,6 +8865,8 @@ def smtp_send_job(
 
             attempt = 0
             sender_cursor_base = int(provider_sender_cursor.get(target_domain, 0) or 0)
+            deferred_wait_until = 0.0
+            deferred_count = 0
             while True:
                 # rotate per provider (domain), and shift again on each retry
                 rot = sender_cursor_base + attempt
@@ -8844,6 +8875,38 @@ def smtp_send_job(
                 fn = from_names2[rot % len(from_names2)] if from_names2 else "Sender"
                 sb = chunk_subjects[rot % len(chunk_subjects)]
                 b_used = chunk_body_variants[rot % len(chunk_body_variants)] if chunk_body_variants else body
+                sender_domain = _extract_domain_from_email(fe) or ""
+                relation_key = (target_domain, sender_domain)
+                now_ts = time.time()
+                rel_wait_until = float(relation_backoff_until.get(relation_key, 0.0) or 0.0)
+
+                if rel_wait_until > now_ts:
+                    deferred_wait_until = max(deferred_wait_until, rel_wait_until)
+                    deferred_count += 1
+                    attempt += 1
+                    if deferred_count < max(1, len(from_emails2)):
+                        continue
+
+                    provider_buckets[target_domain] = chunk + (provider_buckets.get(target_domain) or [])
+                    provider_next_retry_ts[target_domain] = max(float(provider_next_retry_ts.get(target_domain, 0.0) or 0.0), deferred_wait_until)
+                    with JOBS_LOCK:
+                        job.current_chunk = -1
+                        job.current_chunk_info = {}
+                        job.current_chunk_domains = {}
+                        job.push_chunk_state({
+                            "chunk": chunk_idx,
+                            "status": "deferred",
+                            "size": len(chunk),
+                            "sender": fe,
+                            "subject": sb,
+                            "attempt": attempt,
+                            "next_retry_ts": deferred_wait_until,
+                            "reason": "relation_backoff_active",
+                            "receiver_domain": target_domain,
+                            "sender_domain": sender_domain,
+                        })
+                        job.log("WARN", f"Chunk {chunk_idx+1} [{target_domain}]: deferred due active scoped backoff sender_domain={sender_domain} wait={int(max(0.0, deferred_wait_until - now_ts))}s")
+                    break
 
                 # Update PMTA live metrics for UI (rate-limited)
                 if PMTA_QUEUE_BACKOFF:
@@ -8918,62 +8981,50 @@ def smtp_send_job(
                         reason.append(f"pmta={pmta_reason}")
                     rtxt = " ".join(reason) or "blocked"
 
-                    if attempt > max_backoff_retries:
-                        with JOBS_LOCK:
-                            job.skipped += len(chunk)
-                            job.chunks_abandoned += 1
-                            job.chunks_done += 1
-                            job.current_chunk = -1
-                            job.current_chunk_info = {}
-                            job.current_chunk_domains = {}
-                            job.push_chunk_state({
-                                "chunk": chunk_idx,
-                                "status": "abandoned",
-                                "size": len(chunk),
-                                "sender": fe,
-                                "subject": sb,
-                                "spam_score": sc,
-                                "blacklist": bl_detail,
-                                "attempt": attempt,
-                                "next_retry_ts": 0,
-                                "reason": "abandoned",
-                            })
-                            job.log("ERROR", f"Chunk {chunk_idx+1} [{target_domain}]: ABANDONED after {attempt-1} retries ({rtxt})")
-                            if from_emails2:
-                                provider_sender_cursor[target_domain] = (sender_cursor_base + 1) % max(1, len(from_emails2))
-                        break
+                    rel_attempt = int(relation_backoff_attempts.get(relation_key, 0) or 0) + 1
+                    relation_backoff_attempts[relation_key] = rel_attempt
 
-                    wait_s = min(backoff_max_s, backoff_base_s * (2 ** max(0, attempt - 1)))
+                    wait_s = min(backoff_max_s, backoff_base_s * (2 ** max(0, rel_attempt - 1)))
                     next_ts = time.time() + wait_s
+                    relation_backoff_until[relation_key] = next_ts
+                    deferred_wait_until = max(deferred_wait_until, next_ts)
 
                     entry = {
                         "chunk": chunk_idx,
                         "size": len(chunk),
-                        "attempt": attempt,
+                        "attempt": rel_attempt,
                         "next_retry_ts": next_ts,
                         "reason": rtxt,
                         "sender": fe,
                         "subject": sb,
                         "spam_score": sc,
                         "blacklist": bl_detail,
+                        "receiver_domain": target_domain,
+                        "sender_domain": sender_domain,
+                        "scope": "receiver_sender_domain",
                     }
 
                     with JOBS_LOCK:
-                        job.status = "backoff"
+                        job.status = "running"
                         job.chunks_backoff += 1
                         job.push_backoff(entry)
                         job.push_chunk_state({**entry, "status": "backoff"})
-                        job.log("WARN", f"Chunk {chunk_idx+1} [{target_domain}]: BACKOFF retry#{attempt} wait={int(wait_s)}s ({rtxt})")
+                        job.log("WARN", f"Chunk {chunk_idx+1} [{target_domain}]: scoped BACKOFF receiver={target_domain} sender_domain={sender_domain} retry#{rel_attempt} wait={int(wait_s)}s ({rtxt})")
 
-                    # Global pause (but responsive to pause/stop)
-                    if not _sleep_checked(wait_s):
-                        _stop_job("stop requested during backoff")
-                        return
+                    if rel_attempt > max_backoff_retries:
+                        with JOBS_LOCK:
+                            job.log("ERROR", f"Chunk {chunk_idx+1} [{target_domain}]: scoped relation exhausted retries sender_domain={sender_domain} ({rtxt})")
 
-                    with JOBS_LOCK:
-                        if job.status != "error":
-                            job.status = "running"
-                    # loop again (re-check)
+                    deferred_count += 1
+                    if deferred_count >= max(1, len(from_emails2)):
+                        provider_buckets[target_domain] = chunk + (provider_buckets.get(target_domain) or [])
+                        provider_next_retry_ts[target_domain] = max(float(provider_next_retry_ts.get(target_domain, 0.0) or 0.0), deferred_wait_until)
+                        with JOBS_LOCK:
+                            job.current_chunk = -1
+                            job.current_chunk_info = {}
+                            job.current_chunk_domains = {}
+                        break
+
                     continue
 
                 # allowed -> send
