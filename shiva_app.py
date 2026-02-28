@@ -3529,13 +3529,22 @@ This will remove it from Jobs history.`);
 
   function updateCard(card, j){
     const jobId = card.dataset.jobid;
+    const st = (j.status || '').toString();
+
+    const chunkStates = Array.isArray(j.chunk_states) ? j.chunk_states : [];
+    const latestChunkStatus = new Map();
+    for(const x of chunkStates){
+      const cidx = Number(x && x.chunk);
+      if(Number.isFinite(cidx)) latestChunkStatus.set(cidx, (x.status || '').toString().toLowerCase());
+    }
+    const allChunksBackoff = latestChunkStatus.size > 0 && Array.from(latestChunkStatus.values()).every(s => s === 'backoff');
+    const stShown = (st === 'running' && allChunksBackoff) ? 'backoff' : st;
 
     // Header pills
-    const st = (j.status || '').toString();
     const stEl = qk(card,'status');
     if(stEl){
-      stEl.className = statusPillClass(st);
-      stEl.textContent = `Status: ${st}`;
+      stEl.className = statusPillClass(stShown);
+      stEl.textContent = `Status: ${stShown}`;
     }
 
     const speedEl = qk(card,'speed');
@@ -3649,7 +3658,7 @@ This will remove it from Jobs history.`);
       : 'Active domains: —';
 
     // Backoff info (latest)
-    const cs = (j.chunk_states || []).slice().reverse();
+    const cs = chunkStates.slice().reverse();
     const lastBack = cs.find(x => (x.status || '') === 'backoff');
     let backLine = '—';
     if(lastBack){
@@ -5055,7 +5064,16 @@ PAGE_JOB = r"""
     document.getElementById("skipped").textContent = j.skipped;
     document.getElementById("invalid").textContent = j.invalid;
 
-    document.getElementById("statusPill").textContent = `Status: ${j.status}`;
+    const chunkStates = Array.isArray(j.chunk_states) ? j.chunk_states : [];
+    const latestChunkStatus = new Map();
+    for(const x of chunkStates){
+      const cidx = Number(x && x.chunk);
+      if(Number.isFinite(cidx)) latestChunkStatus.set(cidx, (x.status || '').toString().toLowerCase());
+    }
+    const allChunksBackoff = latestChunkStatus.size > 0 && Array.from(latestChunkStatus.values()).every(s => s === 'backoff');
+    const statusShown = (j.status === 'running' && allChunksBackoff) ? 'backoff' : j.status;
+
+    document.getElementById("statusPill").textContent = `Status: ${statusShown}`;
     document.getElementById("lastError").textContent = j.last_error ? ("Last error: " + j.last_error) : "";
 
     const denom = (j.total || 0);
@@ -5075,12 +5093,22 @@ PAGE_JOB = r"""
       return {dom, p, s, f, done2, pct: pct(done2, p)};
     }).sort((a,b)=>b.p-a.p).slice(0, 300);
 
+    const backoffDomains = new Set();
+    for(const x of chunkStates){
+      if((x && x.status) !== 'backoff') continue;
+      const rd = (x.receiver_domain || '').toString().trim().toLowerCase();
+      if(rd) backoffDomains.add(rd);
+    }
+    const singleDomainBackoff = rows.length === 1 && (rows[0].p > rows[0].done2) && backoffDomains.has((rows[0].dom || '').toString().trim().toLowerCase());
+
     const domBody = document.getElementById('domState');
     if(domBody){
       domBody.innerHTML = rows.map(x => {
         const bar = `<div class="smallBar"><div style="width:${x.pct}%"></div></div>`;
+        const showBackoff = singleDomainBackoff && ((x.dom || '').toString().trim().toLowerCase() === (rows[0].dom || '').toString().trim().toLowerCase());
+        const domLabel = showBackoff ? `${esc(x.dom)} <span class="no">(backoff)</span>` : esc(x.dom);
         return `<tr>`+
-          `<td>${esc(x.dom)}</td>`+
+          `<td>${domLabel}</td>`+
           `<td>${x.p}</td>`+
           `<td class="ok">${x.s}</td>`+
           `<td class="no">${x.f}</td>`+
@@ -5104,7 +5132,7 @@ PAGE_JOB = r"""
     }
 
     const chunkTbl = document.getElementById('chunkTbl');
-    const cs = (j.chunk_states || []).slice().reverse();
+    const cs = chunkStates.slice().reverse();
     if(chunkTbl){
       chunkTbl.innerHTML = cs.map(x => {
         const next = x.next_retry_ts ? new Date(Number(x.next_retry_ts)*1000).toLocaleTimeString() : '';
