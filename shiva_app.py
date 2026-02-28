@@ -1822,7 +1822,7 @@ PAGE_FORM = r"""
           </div>
 
           <div class="check" style="margin-top:10px">
-            <input type="checkbox" name="enable_backoff" checked>
+            <input type="checkbox" name="enable_backoff" {% if default_enable_backoff %}checked{% endif %}>
             <div>
               Enable backoff protection (spam/blacklist/PMTA policy). Turn this OFF to continue sending even when sender IP/domain is blacklisted.
             </div>
@@ -9026,6 +9026,8 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "Base backoff wait in seconds (exponential)."},
     {"key": "BACKOFF_MAX_S", "type": "float", "default": "1800", "group": "Backoff", "restart_required": False,
      "desc": "Maximum backoff wait (seconds)."},
+    {"key": "ENABLE_BACKOFF", "type": "bool", "default": "1", "group": "Backoff", "restart_required": False,
+     "desc": "Default state for send-form backoff checkbox (env: ENABLE_BACKOFF)."},
 
     # PMTA live/diag
     {"key": "PMTA_DIAG_ON_ERROR", "type": "bool", "default": "1", "group": "PMTA Diag", "restart_required": False,
@@ -9111,7 +9113,11 @@ def _cfg_get_raw_and_source(key: str) -> Tuple[Optional[str], str, Optional[str]
     ui = db_get_app_config(k)
     if ui is not None:
         return ui, "ui", ui, os.getenv(k)
+
     envv = os.getenv(k)
+    if envv is None and k == "ENABLE_BACKOFF":
+        # Backward-compatible alias for a common misspelling in deployments.
+        envv = os.getenv("ENABLE_BACCKOFF")
     if envv is not None:
         return envv, "env", ui, envv
     return None, "default", ui, envv
@@ -9313,7 +9319,12 @@ def campaign_open(campaign_id: str):
     c = db_get_campaign(bid, (campaign_id or "").strip())
     if not c:
         abort(404)
-    resp = make_response(render_template_string(PAGE_FORM, campaign_id=c["id"], campaign_name=c["name"]))
+    resp = make_response(render_template_string(
+        PAGE_FORM,
+        campaign_id=c["id"],
+        campaign_name=c["name"],
+        default_enable_backoff=cfg_get_bool("ENABLE_BACKOFF", True),
+    ))
     return attach_browser_cookie(resp, bid, is_new)
 
 
