@@ -564,6 +564,7 @@ def root():
             "files": "/api/v1/files?kind=acct",
             "pull_latest": "/api/v1/pull/latest?kind=acct",
             "job_outcomes": "/api/v1/job/outcomes?job_id=<job_id>",
+            "job_count": "/api/v1/job/count?job_id=<job_id>",
         },
     }
 
@@ -579,6 +580,35 @@ def get_job_outcomes(
     jid = str(job_id or "").strip().lower()
     if not jid:
         raise HTTPException(status_code=400, detail="Missing required query param: job_id")
+
+    summary = _calculate_job_outcomes(jid)
+    return {
+        "ok": True,
+        "job_id": jid,
+        "count": summary["total_unique"],
+        "linked_emails_count": summary["total_unique"],
+        "emails": summary["all_emails"],
+        "delivered": {
+            "count": len(summary["buckets"]["delivered"]),
+            "emails": summary["buckets"]["delivered"],
+        },
+        "deferred": {
+            "count": len(summary["buckets"]["deferred"]),
+            "emails": summary["buckets"]["deferred"],
+        },
+        "bounced": {
+            "count": len(summary["buckets"]["bounced"]),
+            "emails": summary["buckets"]["bounced"],
+        },
+        "complained": {
+            "count": len(summary["buckets"]["complained"]),
+            "emails": summary["buckets"]["complained"],
+        },
+    }
+
+
+def _calculate_job_outcomes(jid: str) -> Dict[str, Any]:
+    """Return unique recipient outcomes for one job id."""
 
     patterns = ALLOWED_KINDS.get("acct") or ["acct-*.csv"]
     by_recipient: Dict[str, str] = {}
@@ -639,14 +669,32 @@ def get_job_outcomes(
 
     total_unique = sum(len(v) for v in buckets.values())
     return {
+        "total_unique": total_unique,
+        "all_emails": sorted(by_recipient.keys()),
+        "buckets": buckets,
+    }
+
+
+@app.get("/api/v1/job/count")
+def get_job_count(
+    job_id: str = "",
+    _: None = Depends(require_token),
+):
+    """Return bridge-side unique recipient counts for one job id."""
+    jid = str(job_id or "").strip().lower()
+    if not jid:
+        raise HTTPException(status_code=400, detail="Missing required query param: job_id")
+
+    summary = _calculate_job_outcomes(jid)
+    buckets = summary["buckets"]
+    return {
         "ok": True,
         "job_id": jid,
-        "count": total_unique,
-        "emails": sorted(by_recipient.keys()),
-        "delivered": {"count": len(buckets["delivered"]), "emails": buckets["delivered"]},
-        "deferred": {"count": len(buckets["deferred"]), "emails": buckets["deferred"]},
-        "bounced": {"count": len(buckets["bounced"]), "emails": buckets["bounced"]},
-        "complained": {"count": len(buckets["complained"]), "emails": buckets["complained"]},
+        "linked_emails_count": summary["total_unique"],
+        "delivered_count": len(buckets["delivered"]),
+        "deferred_count": len(buckets["deferred"]),
+        "bounced_count": len(buckets["bounced"]),
+        "complained_count": len(buckets["complained"]),
     }
 
 @app.get("/api/v1/files")
