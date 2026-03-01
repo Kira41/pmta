@@ -118,7 +118,7 @@ def now_iso():
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
-def parse_multiline(text: str, *, dedupe_lower: bool = False) -> list[str]:
+def parse_multiline(text, dedupe_lower=False):
     """Split a textarea input by NEW LINE.
 
     - Removes empty lines.
@@ -126,8 +126,8 @@ def parse_multiline(text: str, *, dedupe_lower: bool = False) -> list[str]:
     """
     if not text:
         return []
-    out: list[str] = []
-    seen: set[str] = set()
+    out = []
+    seen = set()
     for line in text.splitlines():
         s = (line or "").strip()
         if not s:
