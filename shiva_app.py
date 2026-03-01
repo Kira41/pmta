@@ -2,6 +2,7 @@ import os
 import json
 import math
 import csv
+import hashlib
 import random
 import re
 import socket
@@ -681,6 +682,21 @@ def db_init() -> None:
                    )"""
             )
 
+            # Bridge-pulled filtered accounting lines (raw + classified)
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS accounting_filtered(
+                       id INTEGER PRIMARY KEY,
+                       job_id TEXT NOT NULL,
+                       outcome TEXT NOT NULL,
+                       type_letter TEXT NOT NULL,
+                       raw_line TEXT NOT NULL,
+                       line_hash TEXT NOT NULL UNIQUE,
+                       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                   )"""
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_accounting_filtered_job ON accounting_filtered(job_id, created_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_accounting_filtered_job_outcome ON accounting_filtered(job_id, outcome, created_at DESC)")
+
             conn.commit()
 
             # Optional: clear DB on startup (off by default)
@@ -691,6 +707,7 @@ def db_init() -> None:
                 conn.execute("DELETE FROM jobs")
                 conn.execute("DELETE FROM job_outcomes")
                 conn.execute("DELETE FROM job_recipients")
+                conn.execute("DELETE FROM accounting_filtered")
                 conn.commit()
         finally:
             conn.close()
@@ -947,6 +964,100 @@ def db_list_outcome_rcpts(job_id: str, status: str) -> List[str]:
             return out
         finally:
             conn.close()
+
+
+def db_insert_accounting_filtered(rows: List[dict]) -> Tuple[int, int]:
+    """Insert filtered accounting rows. Returns (inserted, ignored_duplicates)."""
+    if not rows:
+        return 0, 0
+
+    inserted = 0
+    ignored = 0
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            for row in rows:
+                jid = str(row.get("job_id") or "").strip().lower()
+                outcome = str(row.get("outcome") or "unknown").strip().lower() or "unknown"
+                typ = str(row.get("type_letter") or "?").strip().upper()[:16] or "?"
+                raw_line = str(row.get("raw_line") or "")
+                line_hash = str(row.get("line_hash") or "").strip().lower()
+                if not jid or not line_hash or not raw_line:
+                    continue
+
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO accounting_filtered(job_id, outcome, type_letter, raw_line, line_hash) VALUES(?,?,?,?,?)",
+                    (jid, outcome, typ, raw_line, line_hash),
+                )
+                if int(cur.rowcount or 0) > 0:
+                    inserted += 1
+                else:
+                    ignored += 1
+            conn.commit()
+        finally:
+            conn.close()
+    return inserted, ignored
+
+
+def db_list_accounting_filtered(job_id: str, *, outcome: str = "", limit: int = 200, offset: int = 0) -> List[dict]:
+    jid = (job_id or "").strip().lower()
+    if not jid:
+        return []
+    lim = max(1, min(2000, int(limit or 200)))
+    off = max(0, int(offset or 0))
+    out = (outcome or "").strip().lower()
+
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            if out:
+                rows = conn.execute(
+                    "SELECT id, job_id, outcome, type_letter, raw_line, line_hash, created_at "
+                    "FROM accounting_filtered WHERE job_id=? AND outcome=? "
+                    "ORDER BY id DESC LIMIT ? OFFSET ?",
+                    (jid, out, lim, off),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, job_id, outcome, type_letter, raw_line, line_hash, created_at "
+                    "FROM accounting_filtered WHERE job_id=? "
+                    "ORDER BY id DESC LIMIT ? OFFSET ?",
+                    (jid, lim, off),
+                ).fetchall()
+            return [
+                {
+                    "id": int(r[0]),
+                    "job_id": str(r[1] or ""),
+                    "outcome": str(r[2] or "unknown"),
+                    "type_letter": str(r[3] or "?"),
+                    "raw_line": str(r[4] or ""),
+                    "line_hash": str(r[5] or ""),
+                    "created_at": str(r[6] or ""),
+                }
+                for r in (rows or [])
+            ]
+        finally:
+            conn.close()
+
+
+def db_count_accounting_filtered(job_id: str) -> Dict[str, int]:
+    jid = (job_id or "").strip().lower()
+    base = {"delivered": 0, "bounced": 0, "deferred": 0, "complained": 0, "unknown": 0}
+    if not jid:
+        return base
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            rows = conn.execute(
+                "SELECT outcome, COUNT(*) FROM accounting_filtered WHERE job_id=? GROUP BY outcome",
+                (jid,),
+            ).fetchall()
+        finally:
+            conn.close()
+    for r in rows or []:
+        k = str(r[0] or "unknown").strip().lower() or "unknown"
+        base[k] = int(r[1] or 0)
+    return base
 
 
 def db_get_app_config(key: str) -> Optional[str]:
@@ -8264,6 +8375,156 @@ def _bridge_row_to_event(row: Any, *, job_id: str) -> Optional[dict]:
         ev["x-job-id"] = job_id
     return ev
 
+
+
+def _parse_pmta_acct_type_map_from_env() -> Dict[str, str]:
+    raw = (os.getenv("PMTA_ACCT_TYPE_MAP", "D:delivered,B:bounced,C:complained,T:deferred") or "").strip()
+    out: Dict[str, str] = {}
+    for token in [x.strip() for x in raw.split(",") if x.strip()]:
+        if ":" not in token:
+            continue
+        left, right = token.split(":", 1)
+        letter = (left or "").strip().upper()[:1]
+        outcome = (right or "").strip().lower()
+        if not letter:
+            continue
+        if outcome not in {"delivered", "bounced", "deferred", "complained", "unknown"}:
+            outcome = "unknown"
+        out[letter] = outcome
+
+    # Optional override when deployments use different deferred letters.
+    deferred_letters = (os.getenv("PMTA_ACCT_DEFERRED_LETTERS", "") or "").strip()
+    if deferred_letters:
+        for item in re.split(r"[,;\s]+", deferred_letters):
+            letter = (item or "").strip().upper()[:1]
+            if letter:
+                out[letter] = "deferred"
+
+    if not out:
+        out = {"D": "delivered", "B": "bounced", "C": "complained", "T": "deferred"}
+    return out
+
+
+def filter_accounting_lines(lines: List[str], *, job_id: str = "") -> dict:
+    """Filter + dedupe + classify raw bridge accounting lines.
+
+    - CSV parsing uses csv.reader (not raw split) to handle quoted commas.
+    - Dedupe is done via exact normalized-line hash and optional semantic key.
+    - Parse errors are kept with outcome=unknown.
+    """
+    type_map = _parse_pmta_acct_type_map_from_env()
+    counts: Dict[str, int] = {"delivered": 0, "bounced": 0, "deferred": 0, "complained": 0, "unknown": 0}
+
+    unique_hashes: Set[str] = set()
+    unique_semantic: Set[Tuple[str, str, str, str, str]] = set()
+    filtered: List[dict] = []
+    parse_errors = 0
+
+    for src in (lines or []):
+        raw_line = str(src or "")
+        normalized = raw_line.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not normalized:
+            continue
+
+        line_hash = hashlib.sha1(normalized.encode("utf-8", errors="replace")).hexdigest()
+        if line_hash in unique_hashes:
+            continue
+
+        type_letter = "?"
+        recipient = ""
+        message_id = ""
+        ts = ""
+
+        try:
+            fields = next(csv.reader([normalized]))
+            fields = [str(x or "").strip() for x in fields]
+            if fields:
+                type_letter = (fields[0] or "").strip().upper()[:1] or "?"
+            if len(fields) >= 2:
+                ts = fields[1]
+            if len(fields) >= 3:
+                recipient = fields[2].lower()
+            if len(fields) >= 4:
+                message_id = fields[3]
+
+            if recipient and message_id and ts and type_letter != "?":
+                sem_key = ((job_id or "").strip().lower(), type_letter, recipient, message_id, ts)
+                if sem_key in unique_semantic:
+                    continue
+                unique_semantic.add(sem_key)
+        except Exception as e:
+            parse_errors += 1
+            app.logger.error("filter_accounting_lines csv parse failed: %s", e)
+
+        outcome = type_map.get(type_letter, "unknown")
+        counts[outcome] = int(counts.get(outcome, 0)) + 1
+        unique_hashes.add(line_hash)
+        filtered.append({
+            "job_id": (job_id or "").strip().lower(),
+            "outcome": outcome,
+            "type_letter": type_letter,
+            "raw_line": normalized,
+            "line_hash": line_hash,
+        })
+
+    return {
+        "received_lines": len(lines or []),
+        "unique_lines": len(filtered),
+        "counts_by_outcome": counts,
+        "rows": filtered,
+        "parse_errors": parse_errors,
+        "type_map": type_map,
+    }
+
+
+def _resolve_bridge_pull_url() -> str:
+    url = (PMTA_BRIDGE_PULL_URL or "").strip()
+    if not url:
+        return ""
+    if url and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+        url = f"http://{url}"
+    if "/api/v1/pull/latest" not in url:
+        url = url.rstrip("/") + "/api/v1/pull/latest"
+    sep = "&" if "?" in url else "?"
+    req_url = (
+        f"{url}{sep}kind={quote_plus(PMTA_BRIDGE_PULL_KIND or 'acct')}"
+        f"&max_lines={max(1, int(PMTA_BRIDGE_PULL_MAX_LINES or 1))}"
+        f"&all={1 if PMTA_BRIDGE_PULL_ALL_FILES else 0}"
+    )
+    return req_url
+
+
+def _pull_bridge_lines_for_job(job_id: str) -> dict:
+    jid = (job_id or "").strip().lower()
+    if not jid:
+        return {"ok": False, "error": "missing_job_id"}
+    req_url = _resolve_bridge_pull_url()
+    if not req_url:
+        return {"ok": False, "error": "bridge_pull_url_not_configured"}
+
+    headers = {"Accept": "application/json", "X-Job-ID": jid}
+    if PMTA_BRIDGE_PULL_TOKEN:
+        headers["Authorization"] = f"Bearer {PMTA_BRIDGE_PULL_TOKEN}"
+
+    try:
+        req = Request(req_url, headers=headers, method="GET")
+        with urlopen(req, timeout=20) as resp:
+            raw = (resp.read() or b"{}").decode("utf-8", errors="replace")
+        obj = json.loads(raw)
+    except Exception as e:
+        return {"ok": False, "error": f"bridge_request_failed: {e}"}
+
+    bridge_rows = obj.get("lines") if isinstance(obj, dict) else None
+    if not isinstance(bridge_rows, list):
+        return {"ok": False, "error": "invalid_bridge_payload"}
+
+    max_lines = max(1, int(PMTA_BRIDGE_PULL_MAX_LINES or 1))
+    if len(bridge_rows) > max_lines:
+        bridge_rows = bridge_rows[:max_lines]
+
+    return {"ok": True, "job_id": jid, "lines": bridge_rows}
+
+
 def _poll_accounting_bridge_once() -> dict:
     url = (PMTA_BRIDGE_PULL_URL or "").strip()
     if not url:
@@ -10785,6 +11046,78 @@ def api_accounting_bridge_pull_once():
     if not PMTA_BRIDGE_PULL_URL:
         return jsonify({"ok": False, "error": "bridge pull URL is not configured"}), 400
     return jsonify(_poll_accounting_bridge_once())
+
+
+@app.post("/api/accounting/bridge/pull_filtered")
+def api_accounting_bridge_pull_filtered():
+    """Pull lines from bridge for a job-id, filter/dedupe/classify, and persist."""
+    payload = request.get_json(silent=True) if request.data else {}
+    payload = payload if isinstance(payload, dict) else {}
+    job_id = (
+        (request.headers.get("X-Job-ID") or "").strip()
+        or str(payload.get("job_id") or "").strip()
+        or str(request.args.get("job_id") or "").strip()
+    )
+    job_id = _normalize_job_id(job_id)
+    if not job_id:
+        return jsonify({"ok": False, "error": "missing_job_id (send X-Job-ID or job_id)"}), 400
+
+    pulled = _pull_bridge_lines_for_job(job_id)
+    if not bool(pulled.get("ok")):
+        return jsonify(pulled), 400
+
+    lines = pulled.get("lines") if isinstance(pulled.get("lines"), list) else []
+    filtered = filter_accounting_lines(lines, job_id=job_id)
+    inserted, ignored_db = db_insert_accounting_filtered(filtered.get("rows") or [])
+
+    unique_lines = int(filtered.get("unique_lines") or 0)
+    ignored_total = max(0, int(filtered.get("received_lines") or 0) - unique_lines) + int(ignored_db or 0)
+    app.logger.info(
+        "pull_filtered job_id=%s received=%s unique=%s inserted=%s ignored=%s parse_errors=%s counts=%s",
+        job_id,
+        filtered.get("received_lines"),
+        unique_lines,
+        inserted,
+        ignored_total,
+        filtered.get("parse_errors"),
+        filtered.get("counts_by_outcome"),
+    )
+
+    samples = (filtered.get("rows") or [])[:5]
+    return jsonify({
+        "ok": True,
+        "job_id": job_id,
+        "received_lines": int(filtered.get("received_lines") or 0),
+        "unique_lines": unique_lines,
+        "inserted": int(inserted),
+        "ignored_duplicates": int(ignored_total),
+        "counts_by_outcome": filtered.get("counts_by_outcome") or {},
+        "parse_errors": int(filtered.get("parse_errors") or 0),
+        "samples": samples,
+    })
+
+
+@app.get("/api/jobs/<job_id>/accounting_filtered")
+def api_job_accounting_filtered(job_id: str):
+    jid = _normalize_job_id(job_id)
+    outcome = (request.args.get("outcome") or "").strip().lower()
+    try:
+        limit = int((request.args.get("limit") or "200").strip())
+    except Exception:
+        limit = 200
+    try:
+        offset = int((request.args.get("offset") or "0").strip())
+    except Exception:
+        offset = 0
+
+    rows = db_list_accounting_filtered(jid, outcome=outcome, limit=limit, offset=offset)
+    return jsonify({"ok": True, "job_id": jid, "outcome": outcome or None, "limit": limit, "offset": offset, "rows": rows})
+
+
+@app.get("/api/jobs/<job_id>/accounting_filtered/counts")
+def api_job_accounting_filtered_counts(job_id: str):
+    jid = _normalize_job_id(job_id)
+    return jsonify({"ok": True, "job_id": jid, "counts_by_outcome": db_count_accounting_filtered(jid)})
 
 
 @app.post("/start")
