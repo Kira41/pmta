@@ -4204,21 +4204,10 @@ This will remove it from Jobs history.`);
       if(r.ok && j && j.ok && j.bridge){
         const b = j.bridge || {};
         console.log('[Bridge↔Shiva Debug]', {
-          connected: !!b.connected,
           last_ok: !!b.last_ok,
           last_error: b.last_error || '',
-          last_attempt_ts: b.last_attempt_ts || '',
-          last_success_ts: b.last_success_ts || '',
-          attempts: Number(b.attempts || 0),
-          success_count: Number(b.success_count || 0),
-          failure_count: Number(b.failure_count || 0),
-          req_url: b.last_req_url || b.pull_url_masked || '',
-          bridge_return_keys: Array.isArray(b.last_response_keys) ? b.last_response_keys : [],
-          bridge_return_count: Number(b.last_bridge_count || 0),
-          processed_by_shiva: Number(b.last_processed || 0),
-          accepted_by_shiva: Number(b.last_accepted || 0),
-          lines_sample: Array.isArray(b.last_lines_sample) ? b.last_lines_sample : [],
-          duration_ms: Number(b.last_duration_ms || 0),
+          job_id: b.job_id || '',
+          lines_sample: Array.isArray(b.lines_sample) ? b.lines_sample : [],
         });
       } else {
         console.warn('[Bridge↔Shiva Debug] bridge status failed', {http_status: r.status, payload: j});
@@ -7721,25 +7710,10 @@ except Exception:
 
 _BRIDGE_DEBUG_LOCK = threading.Lock()
 _BRIDGE_DEBUG_STATE: Dict[str, Any] = {
-    "last_attempt_ts": "",
-    "last_success_ts": "",
-    "last_error_ts": "",
     "last_ok": False,
-    "connected": False,
-    "attempts": 0,
-    "success_count": 0,
-    "failure_count": 0,
     "last_error": "",
-    "last_req_url": "",
-    "last_http_ok": False,
-    "last_http_status": None,
-    "last_duration_ms": 0,
-    "last_response_keys": [],
-    "last_bridge_count": 0,
-    "last_processed": 0,
-    "last_accepted": 0,
+    "last_job_id": "",
     "last_lines_sample": [],
-    "last_target": {},
 }
 
 _BRIDGE_POLLER_LOCK = threading.Lock()
@@ -8229,117 +8203,27 @@ def process_campaign_accounting_payload(payload: dict) -> dict:
 
 
 def _bridge_collect_pull_targets() -> List[Dict[str, str]]:
-    """Collect targeted pull scopes for bridge requests.
-
-    - job: events for one job (multiple recipients)
-    - campaign: events for one campaign
-    - message: optional one-email scope when message-id is available
-    """
-    mode = (PMTA_BRIDGE_PULL_TARGET_MODE or "auto").strip().lower()
-    if mode in {"", "off", "none"}:
-        mode = "all"
-
+    """Collect job-id targets for bridge requests (single supported accounting flow)."""
     targets: List[Dict[str, str]] = []
     with JOBS_LOCK:
         jobs = [j for j in JOBS.values() if not bool(j.deleted)]
-
-    def _add(kind: str, value: str):
-        vv = str(value or "").strip()
-        if not vv:
-            return
-        key = f"{kind}:{vv.lower()}"
-        if any(t.get("_k") == key for t in targets):
-            return
-        t = {"scope": kind}
-        if kind == "job":
-            t["x-job-id"] = vv
-        elif kind == "campaign":
-            t["x-campaign-id"] = vv
-        elif kind == "message":
-            t["message-id"] = vv
-        t["_k"] = key
-        targets.append(t)
 
     interesting = [j for j in jobs if (j.status or "") in {"running", "backoff", "paused", "queued"}]
     if not interesting:
         interesting = jobs
 
-    if mode in {"auto", "job"}:
-        for j in interesting:
-            _add("job", j.id)
-    if mode in {"auto", "campaign"}:
-        for j in interesting:
-            _add("campaign", j.campaign_id)
-
-    if mode == "all" or not targets:
-        return [{"scope": "all"}]
+    for job in interesting:
+        jid = str(job.id or "").strip().lower()
+        if not jid:
+            continue
+        if any(t.get("x-job-id") == jid for t in targets):
+            continue
+        targets.append({"scope": "job", "x-job-id": jid})
 
     lim = max(1, int(PMTA_BRIDGE_PULL_TARGET_LIMIT or 1))
     if len(targets) > lim:
         targets = targets[:lim]
-
-    for t in targets:
-        t.pop("_k", None)
     return targets
-
-
-def _sync_job_outcomes_from_bridge(job_id: str) -> Dict[str, Any]:
-    """Fetch aggregated recipients/outcomes for one job-id from bridge and apply to job counters."""
-    jid = str(job_id or "").strip().lower()
-    if not jid:
-        return {"ok": False, "error": "missing_job_id", "synced": 0}
-
-    with JOBS_LOCK:
-        job = JOBS.get(jid)
-    if not job:
-        return {"ok": False, "error": "job_not_found", "synced": 0}
-
-    base_url = (PMTA_BRIDGE_PULL_URL or "").strip()
-    if not base_url:
-        return {"ok": False, "error": "bridge_pull_url_not_configured", "synced": 0}
-
-    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", base_url):
-        base_url = f"http://{base_url}"
-
-    if "/api/v1/" in base_url:
-        base_url = base_url.split("/api/v1/", 1)[0]
-    req_url = f"{base_url.rstrip('/')}/api/v1/job/outcomes?job_id={quote_plus(jid)}"
-
-    headers = {"Accept": "application/json"}
-    if PMTA_BRIDGE_PULL_TOKEN:
-        headers["Authorization"] = f"Bearer {PMTA_BRIDGE_PULL_TOKEN}"
-
-    try:
-        req = Request(req_url, headers=headers, method="GET")
-        with urlopen(req, timeout=20) as resp:
-            raw = (resp.read() or b"{}").decode("utf-8", errors="replace")
-        payload = json.loads(raw)
-    except Exception as e:
-        return {"ok": False, "error": f"bridge_job_outcomes_failed: {e}", "synced": 0}
-
-    if not isinstance(payload, dict) or not payload.get("ok"):
-        return {"ok": False, "error": "invalid_bridge_job_outcomes_payload", "synced": 0}
-
-    synced = 0
-    with JOBS_LOCK:
-        target_job = JOBS.get(jid)
-        if not target_job:
-            return {"ok": False, "error": "job_not_found", "synced": 0}
-
-        for typ in ("delivered", "deferred", "bounced", "complained"):
-            block = payload.get(typ) or {}
-            emails = block.get("emails") if isinstance(block, dict) else []
-            if not isinstance(emails, list):
-                continue
-            for rcpt in emails:
-                e = str(rcpt or "").strip().lower()
-                if not e:
-                    continue
-                _apply_outcome_to_job(target_job, e, typ)
-                synced += 1
-        target_job.maybe_persist()
-
-    return {"ok": True, "synced": synced, "count": int(payload.get("count") or 0)}
 
 
 def _bridge_pick_target(targets: List[Dict[str, str]]) -> Dict[str, str]:
@@ -8352,18 +8236,10 @@ def _bridge_pick_target(targets: List[Dict[str, str]]) -> Dict[str, str]:
     return targets[idx]
 
 def _poll_accounting_bridge_once() -> dict:
-    t0 = time.time()
     url = (PMTA_BRIDGE_PULL_URL or "").strip()
     if not url:
-        _bridge_debug_update(
-            last_attempt_ts=now_iso(),
-            attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
-            last_ok=False,
-            connected=False,
-            last_error="bridge_pull_url_not_configured",
-            last_duration_ms=int((time.time() - t0) * 1000),
-        )
-        return {"ok": False, "error": "bridge_pull_url_not_configured", "processed": 0, "accepted": 0}
+        _bridge_debug_update(last_ok=False, last_error="bridge_pull_url_not_configured", last_lines_sample=[])
+        return {"ok": False, "error": "bridge_pull_url_not_configured", "processed": 0}
 
     # Accept a bare host:port and default to HTTP to avoid urlopen failures
     # like "unknown url type: 194.116.172.135".
@@ -8383,119 +8259,56 @@ def _poll_accounting_bridge_once() -> dict:
     )
 
     target = _bridge_pick_target(_bridge_collect_pull_targets())
-    sync_res = {}
-    if isinstance(target, dict) and target.get("x-job-id"):
-        sync_res = _sync_job_outcomes_from_bridge(str(target.get("x-job-id")))
-    _bridge_debug_update(last_req_url=req_url, last_target=target, last_job_sync=sync_res)
+    job_id = str((target or {}).get("x-job-id") or "").strip().lower()
+    if not job_id:
+        _bridge_debug_update(last_ok=False, last_error="no_target_job_id", last_lines_sample=[])
+        return {"ok": False, "error": "no_target_job_id", "processed": 0}
 
     headers = {"Accept": "application/json"}
     if PMTA_BRIDGE_PULL_TOKEN:
         headers["Authorization"] = f"Bearer {PMTA_BRIDGE_PULL_TOKEN}"
-    if isinstance(target, dict):
-        if target.get("x-job-id"):
-            headers["X-Job-ID"] = str(target.get("x-job-id"))
-        if target.get("x-campaign-id"):
-            headers["X-Campaign-ID"] = str(target.get("x-campaign-id"))
-        if target.get("message-id"):
-            headers["Message-ID"] = str(target.get("message-id"))
+    headers["X-Job-ID"] = job_id
 
     try:
         req = Request(req_url, headers=headers, method="GET")
         with urlopen(req, timeout=20) as resp:
-            code = getattr(resp, "status", None)
             raw = (resp.read() or b"{}").decode("utf-8", errors="replace")
-        _bridge_debug_update(last_http_ok=True, last_http_status=code)
     except Exception as e:
-        _bridge_debug_update(
-            last_attempt_ts=now_iso(),
-            attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
-            last_ok=False,
-            connected=False,
-            failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + 1,
-            last_error_ts=now_iso(),
-            last_error=f"bridge_request_failed: {e}",
-            last_http_ok=False,
-            last_duration_ms=int((time.time() - t0) * 1000),
-        )
-        return {"ok": False, "error": f"bridge_request_failed: {e}", "processed": 0, "accepted": 0}
+        _bridge_debug_update(last_ok=False, last_error=f"bridge_request_failed: {e}", last_job_id=job_id, last_lines_sample=[])
+        return {"ok": False, "error": f"bridge_request_failed: {e}", "processed": 0}
 
     try:
         obj = json.loads(raw)
     except Exception:
-        _bridge_debug_update(
-            last_attempt_ts=now_iso(),
-            attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
-            last_ok=False,
-            connected=False,
-            failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + 1,
-            last_error_ts=now_iso(),
-            last_error="invalid_bridge_json",
-            last_duration_ms=int((time.time() - t0) * 1000),
-        )
-        return {"ok": False, "error": "invalid_bridge_json", "processed": 0, "accepted": 0}
+        _bridge_debug_update(last_ok=False, last_error="invalid_bridge_json", last_job_id=job_id, last_lines_sample=[])
+        return {"ok": False, "error": "invalid_bridge_json", "processed": 0}
 
-    lines = obj.get("lines") if isinstance(obj, dict) else None
-
-    # Some bridges return structured rows instead of raw accounting lines,
-    # for example: {"results":[{"email":"a@b.com","status":"failed"}, ...]}
-    # We support both forms.
-    bridge_rows: List[Any] = []
-    if isinstance(lines, list):
-        bridge_rows = list(lines)
-    elif isinstance(obj, dict):
-        for key in ("outcomes", "results", "messages", "items", "rows", "data"):
-            v = obj.get(key)
-            if isinstance(v, list):
-                bridge_rows = v
-                break
-
+    bridge_rows = obj.get("lines") if isinstance(obj, dict) else None
     if not isinstance(bridge_rows, list):
-        _bridge_debug_update(
-            last_attempt_ts=now_iso(),
-            attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
-            last_ok=False,
-            connected=False,
-            failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + 1,
-            last_error_ts=now_iso(),
-            last_error="invalid_bridge_payload",
-            last_response_keys=list(obj.keys()) if isinstance(obj, dict) else [],
-            last_duration_ms=int((time.time() - t0) * 1000),
-        )
-        return {"ok": False, "error": "invalid_bridge_payload", "processed": 0, "accepted": 0}
+        _bridge_debug_update(last_ok=False, last_error="invalid_bridge_payload", last_job_id=job_id, last_lines_sample=[])
+        return {"ok": False, "error": "invalid_bridge_payload", "processed": 0}
 
     processed = 0
-    accepted = 0
     for row in bridge_rows:
-        ev: Optional[dict] = None
-        if isinstance(row, dict):
-            ev = row
-        else:
-            s = str(row or "").strip()
-            if not s:
-                continue
-            ev = _parse_accounting_line(s, path="bridge")
+        ev: Optional[dict] = row if isinstance(row, dict) else None
         if not ev:
             continue
-        res = process_pmta_accounting_event(ev)
+        res = process_pmta_accounting_event({
+            "type": ev.get("type"),
+            "email": ev.get("email"),
+            "x-job-id": ev.get("job_id") or job_id,
+        })
         processed += 1
-        accepted += 1 if res.get("ok") else 0
+        if not res.get("ok"):
+            continue
 
     _bridge_debug_update(
-        last_attempt_ts=now_iso(),
-        last_success_ts=now_iso(),
-        attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
-        success_count=int(_BRIDGE_DEBUG_STATE.get("success_count", 0)) + 1,
         last_ok=True,
-        connected=True,
         last_error="",
-        last_bridge_count=len(bridge_rows),
-        last_processed=processed,
-        last_accepted=accepted,
-        last_response_keys=list(obj.keys()) if isinstance(obj, dict) else [],
-        last_lines_sample=[str(x)[:220] for x in bridge_rows[:3]],
-        last_duration_ms=int((time.time() - t0) * 1000),
+        last_job_id=job_id,
+        last_lines_sample=[dict(x) for x in bridge_rows],
     )
-    return {"ok": True, "processed": processed, "accepted": accepted, "count": len(bridge_rows)}
+    return {"ok": True, "processed": processed, "count": len(bridge_rows), "job_id": job_id}
 
 
 def _accounting_bridge_poller_thread():
@@ -10898,20 +10711,14 @@ def api_preflight():
 
 @app.get("/api/accounting/bridge/status")
 def api_accounting_bridge_status():
-    """Expose latest bridge polling diagnostics for browser console debugging."""
+    """Expose only the active bridge accounting fields used by UI/debug."""
     with _BRIDGE_DEBUG_LOCK:
-        state = dict(_BRIDGE_DEBUG_STATE)
-    state["pull_enabled"] = bool(PMTA_BRIDGE_PULL_ENABLED)
-    state["pull_interval_s"] = float(PMTA_BRIDGE_PULL_S or 0)
-    state["pull_max_lines"] = int(PMTA_BRIDGE_PULL_MAX_LINES or 0)
-    state["pull_kind"] = (PMTA_BRIDGE_PULL_KIND or "").strip()
-    state["pull_all_files"] = bool(PMTA_BRIDGE_PULL_ALL_FILES)
-    state["pull_url"] = (PMTA_BRIDGE_PULL_URL or "").strip()
-    state["pull_url_configured"] = bool(state["pull_url"])
-    if state["pull_url"]:
-        state["pull_url_masked"] = state["pull_url"].split("?", 1)[0]
-    else:
-        state["pull_url_masked"] = ""
+        state = {
+            "last_ok": bool(_BRIDGE_DEBUG_STATE.get("last_ok")),
+            "last_error": str(_BRIDGE_DEBUG_STATE.get("last_error") or ""),
+            "job_id": str(_BRIDGE_DEBUG_STATE.get("last_job_id") or ""),
+            "lines_sample": list(_BRIDGE_DEBUG_STATE.get("last_lines_sample") or []),
+        }
     return jsonify({"ok": True, "bridge": state})
 
 
