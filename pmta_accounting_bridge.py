@@ -85,6 +85,24 @@ def _extract_job_id_from_text(text: str) -> str:
     return ""
 
 
+def _normalize_job_id(value: Any) -> str:
+    """Normalize job id to the canonical 12-hex format used by Shiva/PMTA message IDs."""
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    if re.fullmatch(r"[a-f0-9]{12}", raw):
+        return raw
+
+    from_text = _extract_job_id_from_text(raw)
+    if from_text:
+        return from_text
+
+    m = re.search(r"\b([a-f0-9]{12})\b", raw)
+    if m:
+        return str(m.group(1) or "").strip().lower()
+    return raw
+
+
 def _normalize_outcome_type(v: Any) -> str:
     s = str(v or "").strip().lower()
     if not s:
@@ -127,7 +145,7 @@ def _event_value(ev: Dict[str, Any], *names: str) -> str:
 
 def _event_job_id(ev: Dict[str, Any]) -> str:
     jid = _event_value(ev, "header_x-job-id", "x-job-id", "job-id", "job_id", "jobid")
-    jid = str(jid or "").strip().lower()
+    jid = _normalize_job_id(jid)
     if jid:
         return jid
     msgid = _event_value(ev, "header_message-id", "message-id", "message_id", "msgid", "messageid")
@@ -577,7 +595,7 @@ def get_job_outcomes(
     _: None = Depends(require_token),
 ):
     """Scrape all accounting CSV files and return recipients grouped by outcome for one job id."""
-    jid = str(job_id or "").strip().lower()
+    jid = _normalize_job_id(job_id)
     if not jid:
         raise HTTPException(status_code=400, detail="Missing required query param: job_id")
 
@@ -681,7 +699,7 @@ def get_job_count(
     _: None = Depends(require_token),
 ):
     """Return bridge-side unique recipient counts for one job id."""
-    jid = str(job_id or "").strip().lower()
+    jid = _normalize_job_id(job_id)
     if not jid:
         raise HTTPException(status_code=400, detail="Missing required query param: job_id")
 

@@ -7774,6 +7774,24 @@ def _extract_job_id_from_text(text: str) -> str:
     return ""
 
 
+def _normalize_job_id(value: Any) -> str:
+    """Normalize job id to canonical 12-hex id used across send, accounting, and APIs."""
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    if re.fullmatch(r"[a-f0-9]{12}", raw):
+        return raw
+
+    from_text = _extract_job_id_from_text(raw)
+    if from_text:
+        return from_text
+
+    m = re.search(r"\b([a-f0-9]{12})\b", raw)
+    if m:
+        return str(m.group(1) or "").strip().lower()
+    return raw
+
+
 def _normalize_outcome_type(v: Any) -> str:
     s = ("" if v is None else str(v)).strip().lower()
     if not s:
@@ -8121,7 +8139,7 @@ def process_pmta_accounting_event(ev: dict) -> dict:
     )
     rcpt = str(rcpt or "").strip()
 
-    job_id = _event_value(ev, "x-job-id", "job-id", "job_id", "jobid").lower()
+    job_id = _normalize_job_id(_event_value(ev, "x-job-id", "job-id", "job_id", "jobid"))
     campaign_id = _event_value(ev, "x-campaign-id", "campaign-id", "campaign_id", "cid")
 
     if not job_id:
@@ -8133,16 +8151,18 @@ def process_pmta_accounting_event(ev: dict) -> dict:
                 if "message-id" in kk:
                     msgid = v
                     break
-        job_id = _extract_job_id_from_text(str(msgid or ""))
+        job_id = _normalize_job_id(msgid)
 
     if not job_id:
-        job_id = _extract_job_id_from_text(str(ev.get("raw") or ""))
+        job_id = _normalize_job_id(ev.get("raw") or "")
 
     if not rcpt or typ not in {"delivered", "bounced", "deferred", "complained"}:
         return {"ok": False, "reason": "missing_fields", "job_id": job_id, "campaign_id": campaign_id, "rcpt": rcpt, "type": typ}
 
     with JOBS_LOCK:
         job = JOBS.get(job_id) if job_id else None
+        if job_id and not job:
+            return {"ok": False, "reason": "job_not_found", "job_id": job_id, "campaign_id": campaign_id, "rcpt": rcpt}
         if not job and campaign_id:
             job = _find_job_by_campaign(campaign_id)
         if not job and rcpt:
