@@ -2,10 +2,11 @@
 import os
 import fnmatch
 import json
+import csv
 import threading
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -51,6 +52,20 @@ ALLOWED_KINDS = {
 
 _TAIL_STATE_LOCK = threading.Lock()
 _TAIL_STATE: Dict[str, int] = {}
+_CSV_HEADER_STATE_LOCK = threading.Lock()
+_CSV_HEADER_STATE: Dict[str, List[str]] = {}
+
+ACCOUNTING_HEADER_CANDIDATES = [
+    "x-job-id",
+    "x-campaign-id",
+    "job-id",
+    "campaign-id",
+    "job_id",
+    "campaign_id",
+    "msgid",
+    "message-id",
+    "message_id",
+]
 
 
 def require_token(request: Request):
@@ -201,6 +216,150 @@ def _read_new_lines(path: Path, max_lines: int) -> Dict[str, Any]:
     }
 
 
+def _parse_accounting_line(line: str, *, source_file: str = "") -> Optional[Dict[str, Any]]:
+    """Parse accounting line into dict (best-effort).
+
+    Supports JSON lines and CSV files with/without header rows.
+    """
+    s = (line or "").strip()
+    if not s:
+        return None
+
+    if s.startswith("{") and s.endswith("}"):
+        try:
+            obj = json.loads(s)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            return None
+
+    delim = ","
+    if "\t" in s and s.count("\t") >= s.count(","):
+        delim = "\t"
+    elif ";" in s and s.count(";") > s.count(","):
+        delim = ";"
+
+    try:
+        fields = next(csv.reader([s], delimiter=delim))
+        fields = [x.strip() for x in fields]
+    except Exception:
+        return None
+
+    if fields and any(x.lower() in {"type", "event", "rcpt", "recipient", "msgid", "message-id", "message_id"} for x in fields):
+        with _CSV_HEADER_STATE_LOCK:
+            _CSV_HEADER_STATE[source_file or ""] = [x.strip().lower() for x in fields]
+        return None
+
+    ev: Dict[str, Any] = {"raw": s}
+    with _CSV_HEADER_STATE_LOCK:
+        hdr = _CSV_HEADER_STATE.get(source_file or "") or []
+
+    if hdr and len(hdr) == len(fields):
+        for k, v in zip(hdr, fields):
+            if k:
+                ev[k] = v
+        return ev
+
+    if fields:
+        ev["type"] = fields[0]
+    if len(fields) >= 9:
+        ev["mailfrom"] = fields[3]
+        ev["rcpt"] = fields[4]
+        ev["status"] = fields[6]
+        ev["dsnStatus"] = fields[7]
+        ev["dsnDiag"] = fields[8]
+    return ev
+
+
+def _event_header_value(ev: Dict[str, Any]) -> Tuple[str, str]:
+    normalized = {}
+    for k, v in (ev or {}).items():
+        kk = str(k or "").strip().lower()
+        vv = str(v or "").strip()
+        if kk and vv:
+            normalized[kk] = vv
+            normalized[kk.replace("_", "-")] = vv
+
+    for key in ACCOUNTING_HEADER_CANDIDATES:
+        v = normalized.get(key)
+        if v:
+            return key.replace("_", "-"), v
+
+    return "unknown", ""
+
+
+def _group_accounting_events(lines: List[str], *, source_file: str) -> Dict[str, Any]:
+    events: List[Dict[str, Any]] = []
+    groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    for line in lines:
+        ev = _parse_accounting_line(line, source_file=source_file)
+        if not ev:
+            continue
+        events.append(ev)
+
+        header_key, header_value = _event_header_value(ev)
+        grp_key = (header_key, header_value)
+        if grp_key not in groups:
+            groups[grp_key] = {
+                "header_key": header_key,
+                "header_value": header_value,
+                "count": 0,
+                "emails": [],
+                "events": [],
+            }
+
+        recipient = str(
+            ev.get("rcpt")
+            or ev.get("recipient")
+            or ev.get("email")
+            or ev.get("to")
+            or ""
+        ).strip()
+        if recipient and recipient not in groups[grp_key]["emails"]:
+            groups[grp_key]["emails"].append(recipient)
+
+        groups[grp_key]["events"].append(ev)
+        groups[grp_key]["count"] = int(groups[grp_key]["count"] or 0) + 1
+
+    batches = sorted(
+        groups.values(),
+        key=lambda g: (g.get("header_key") != "unknown", int(g.get("count") or 0)),
+        reverse=True,
+    )
+
+    return {
+        "events": events,
+        "batches": batches,
+    }
+
+
+def _merge_batches(batches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for batch in batches:
+        key = (str(batch.get("header_key") or "unknown"), str(batch.get("header_value") or ""))
+        if key not in merged:
+            merged[key] = {
+                "header_key": key[0],
+                "header_value": key[1],
+                "count": 0,
+                "emails": [],
+                "events": [],
+            }
+        dst = merged[key]
+        dst["count"] = int(dst.get("count") or 0) + int(batch.get("count") or 0)
+        for email in batch.get("emails") or []:
+            if email and email not in dst["emails"]:
+                dst["emails"].append(email)
+        dst["events"].extend(batch.get("events") or [])
+
+    return sorted(
+        merged.values(),
+        key=lambda g: (g.get("header_key") != "unknown", int(g.get("count") or 0)),
+        reverse=True,
+    )
+
+
 @app.get("/health")
 def health():
     return {
@@ -262,6 +421,7 @@ def pull_latest_accounting(
     request: Request,
     kind: str = "acct",
     max_lines: int = DEFAULT_PUSH_MAX_LINES,
+    group_by_header: int = 1,
     _: None = Depends(require_token),
 ):
     """Return newly appended accounting lines so Shiva can pull them periodically."""
@@ -274,6 +434,7 @@ def pull_latest_accounting(
     if not read_all:
         latest = _find_latest_file(patterns)
         chunk = _read_new_lines(latest, max_lines)
+        grouped = _group_accounting_events(chunk["lines"], source_file=latest.name) if group_by_header else {"events": [], "batches": []}
         return {
             "ok": True,
             "kind": kind,
@@ -283,13 +444,16 @@ def pull_latest_accounting(
             "to_offset": chunk["to_offset"],
             "has_more": chunk["has_more"],
             "count": chunk["count"],
-            "lines": chunk["lines"],
+            "lines": grouped["events"] if group_by_header else chunk["lines"],
+            "batches": grouped["batches"],
         }
 
     files = _find_matching_files(patterns)
     safe_max = max(1, int(max_lines or 1))
     lines: List[str] = []
     touched: List[str] = []
+    all_events: List[Dict[str, Any]] = []
+    all_batches: List[Dict[str, Any]] = []
     for fp in files:
         if len(lines) >= safe_max:
             break
@@ -298,6 +462,12 @@ def pull_latest_accounting(
         if chunk.get("count"):
             touched.append(fp.name)
             lines.extend(chunk.get("lines") or [])
+            if group_by_header:
+                grouped = _group_accounting_events(chunk.get("lines") or [], source_file=fp.name)
+                all_events.extend(grouped["events"])
+                all_batches.extend(grouped["batches"])
+
+    merged_batches = _merge_batches(all_batches) if group_by_header else []
 
     return {
         "ok": True,
@@ -305,8 +475,9 @@ def pull_latest_accounting(
         "mode": "all",
         "files_seen": len(files),
         "files_touched": touched,
-        "count": len(lines),
-        "lines": lines,
+        "count": len(all_events) if group_by_header else len(lines),
+        "lines": all_events if group_by_header else lines,
+        "batches": merged_batches,
         "has_more": False,
     }
 
