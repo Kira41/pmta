@@ -113,8 +113,9 @@ EMAIL_FIND_RE = re.compile(
 )
 
 
-def now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+def now_iso():
+    """Return UTC time in ISO-8601 format (seconds precision) with Z suffix."""
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
 def parse_multiline(text: str, *, dedupe_lower: bool = False) -> list[str]:
