@@ -49,3 +49,8 @@ curl "http://localhost:5000/api/accounting/job_2026_001/counts"
 ```bash
 curl "http://localhost:5000/api/accounting/job_2026_001/events?outcome=delivered&limit=200&offset=0"
 ```
+
+## Runtime requirement
+
+- Run Shiva with Python 3.9+ (`python3 shiva.py`).
+- Using `python shiva.py` may invoke Python 2.x on some servers and fail with syntax errors.

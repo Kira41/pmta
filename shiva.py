@@ -84,8 +84,8 @@ if dns is not None:
         DNS_RESOLVER = None
 
 # MX/A cache to avoid repeated DNS queries
-_MX_CACHE: dict[str, dict] = {}
-_MX_CACHE_EXPIRES_AT: dict[str, float] = {}
+_MX_CACHE: Dict[str, Dict[str, Any]] = {}
+_MX_CACHE_EXPIRES_AT: Dict[str, float] = {}
 MX_CACHE_TTL_OK = 3600.0
 MX_CACHE_TTL_SOFT_FAIL = 120.0
 
