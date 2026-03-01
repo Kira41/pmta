@@ -328,12 +328,7 @@ class SendJob:
     bounced: int = 0
     deferred: int = 0
     complained: int = 0
-    # Per-minute series for simple trends (each item: {t_min, delivered, bounced, deferred, complained})
-    outcome_series: List[dict] = field(default_factory=list)
     accounting_last_ts: str = ""
-    # Accounting error rollups (response classes from accounting rows)
-    accounting_error_counts: Dict[str, int] = field(default_factory=dict)
-    accounting_last_errors: List[dict] = field(default_factory=list)  # {ts, email, type, kind, detail}
 
     # Spam score gate (computed before sending)
     spam_threshold: float = 4.0
@@ -639,40 +634,6 @@ def db_init() -> None:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_campaign ON jobs(campaign_id)")
 
-            # Per-recipient outcomes (from PMTA accounting)
-            conn.execute(
-                """CREATE TABLE IF NOT EXISTS job_outcomes(
-                       job_id TEXT NOT NULL,
-                       rcpt TEXT NOT NULL,
-                       status TEXT NOT NULL,
-                       updated_at TEXT NOT NULL,
-                       PRIMARY KEY(job_id, rcpt)
-                   )"""
-            )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_job_outcomes_job ON job_outcomes(job_id)")
-
-            # Per-job recipient registry (helps map accounting rows with missing job/campaign ids)
-            conn.execute(
-                """CREATE TABLE IF NOT EXISTS job_recipients(
-                       job_id TEXT NOT NULL,
-                       campaign_id TEXT NOT NULL,
-                       rcpt TEXT NOT NULL,
-                       first_seen_at TEXT NOT NULL,
-                       last_seen_at TEXT NOT NULL,
-                       PRIMARY KEY(job_id, rcpt)
-                   )"""
-            )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_job_recipients_rcpt ON job_recipients(rcpt, last_seen_at)")
-
-            # File offsets for PMTA accounting tailing
-            conn.execute(
-                """CREATE TABLE IF NOT EXISTS pmta_offsets(
-                       path TEXT PRIMARY KEY,
-                       offset INTEGER NOT NULL,
-                       updated_at TEXT NOT NULL
-                   )"""
-            )
-
             # App-wide config overrides (UI-managed)
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS app_config(
@@ -682,9 +643,9 @@ def db_init() -> None:
                    )"""
             )
 
-            # Bridge-pulled filtered accounting lines (raw + classified)
+            # Bridge-pulled accounting events (raw + classified)
             conn.execute(
-                """CREATE TABLE IF NOT EXISTS accounting_filtered(
+                """CREATE TABLE IF NOT EXISTS accounting_events(
                        id INTEGER PRIMARY KEY,
                        job_id TEXT NOT NULL,
                        outcome TEXT NOT NULL,
@@ -694,8 +655,8 @@ def db_init() -> None:
                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                    )"""
             )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_accounting_filtered_job ON accounting_filtered(job_id, created_at DESC)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_accounting_filtered_job_outcome ON accounting_filtered(job_id, outcome, created_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_accounting_events_job ON accounting_events(job_id, created_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_accounting_events_job_outcome ON accounting_events(job_id, outcome, created_at DESC)")
 
             conn.commit()
 
@@ -705,9 +666,7 @@ def db_init() -> None:
                 conn.execute("DELETE FROM campaigns")
                 conn.execute("DELETE FROM form_state")
                 conn.execute("DELETE FROM jobs")
-                conn.execute("DELETE FROM job_outcomes")
-                conn.execute("DELETE FROM job_recipients")
-                conn.execute("DELETE FROM accounting_filtered")
+                conn.execute("DELETE FROM accounting_events")
                 conn.commit()
         finally:
             conn.close()
@@ -794,8 +753,6 @@ def db_clear_all() -> None:
             conn.execute("DELETE FROM campaigns")
             conn.execute("DELETE FROM form_state")
             conn.execute("DELETE FROM jobs")
-            conn.execute("DELETE FROM job_outcomes")
-            conn.execute("DELETE FROM job_recipients")
             conn.commit()
         finally:
             conn.close()
@@ -849,10 +806,7 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "bounced": int(job.bounced or 0),
         "deferred": int(job.deferred or 0),
         "complained": int(job.complained or 0),
-        "outcome_series": (job.outcome_series or [])[-180:],
         "accounting_last_ts": job.accounting_last_ts or "",
-        "accounting_error_counts": job.accounting_error_counts or {},
-        "accounting_last_errors": (job.accounting_last_errors or [])[-50:],
         "spam_threshold": float(job.spam_threshold or 4.0),
         "spam_score": job.spam_score,
         "spam_detail": (job.spam_detail or "")[:2000],
@@ -902,72 +856,11 @@ def db_delete_job(job_id: str) -> None:
 
 
 # =========================
-# Outcomes DB helpers (PMTA accounting)
+# Accounting events DB helpers (PMTA bridge lines)
 # =========================
 
-def db_get_outcome(job_id: str, rcpt: str) -> Optional[str]:
-    jid = (job_id or "").strip()
-    r = (rcpt or "").strip().lower()
-    if not jid or not r:
-        return None
-    with DB_LOCK:
-        conn = _db_conn()
-        try:
-            row = conn.execute(
-                "SELECT status FROM job_outcomes WHERE job_id=? AND rcpt=?",
-                (jid, r),
-            ).fetchone()
-            return str(row[0]) if row and row[0] else None
-        finally:
-            conn.close()
-
-
-def db_set_outcome(job_id: str, rcpt: str, status: str) -> None:
-    jid = (job_id or "").strip()
-    r = (rcpt or "").strip().lower()
-    st = (status or "").strip().lower()
-    if not jid or not r or not st:
-        return
-    with DB_LOCK:
-        conn = _db_conn()
-        try:
-            conn.execute(
-                "INSERT INTO job_outcomes(job_id, rcpt, status, updated_at) VALUES(?,?,?,?) "
-                "ON CONFLICT(job_id, rcpt) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at",
-                (jid, r, st, now_iso()),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def db_list_outcome_rcpts(job_id: str, status: str) -> List[str]:
-    jid = (job_id or "").strip()
-    st = (status or "").strip().lower()
-    if not jid or not st:
-        return []
-    with DB_LOCK:
-        conn = _db_conn()
-        try:
-            rows = conn.execute(
-                "SELECT rcpt FROM job_outcomes WHERE job_id=? AND status=? ORDER BY updated_at DESC",
-                (jid, st),
-            ).fetchall()
-            out: List[str] = []
-            seen: Set[str] = set()
-            for r in rows or []:
-                em = str(r[0] or "").strip().lower()
-                if not em or em in seen:
-                    continue
-                seen.add(em)
-                out.append(em)
-            return out
-        finally:
-            conn.close()
-
-
-def db_insert_accounting_filtered(rows: List[dict]) -> Tuple[int, int]:
-    """Insert filtered accounting rows. Returns (inserted, ignored_duplicates)."""
+def db_insert_accounting_events(rows: List[dict]) -> Tuple[int, int]:
+    """Insert accounting event rows. Returns (inserted, ignored_duplicates)."""
     if not rows:
         return 0, 0
 
@@ -986,7 +879,7 @@ def db_insert_accounting_filtered(rows: List[dict]) -> Tuple[int, int]:
                     continue
 
                 cur = conn.execute(
-                    "INSERT OR IGNORE INTO accounting_filtered(job_id, outcome, type_letter, raw_line, line_hash) VALUES(?,?,?,?,?)",
+                    "INSERT OR IGNORE INTO accounting_events(job_id, outcome, type_letter, raw_line, line_hash) VALUES(?,?,?,?,?)",
                     (jid, outcome, typ, raw_line, line_hash),
                 )
                 if int(cur.rowcount or 0) > 0:
@@ -999,7 +892,7 @@ def db_insert_accounting_filtered(rows: List[dict]) -> Tuple[int, int]:
     return inserted, ignored
 
 
-def db_list_accounting_filtered(job_id: str, *, outcome: str = "", limit: int = 200, offset: int = 0) -> List[dict]:
+def db_list_accounting_events(job_id: str, *, outcome: str = "", limit: int = 200, offset: int = 0) -> List[dict]:
     jid = (job_id or "").strip().lower()
     if not jid:
         return []
@@ -1013,14 +906,14 @@ def db_list_accounting_filtered(job_id: str, *, outcome: str = "", limit: int = 
             if out:
                 rows = conn.execute(
                     "SELECT id, job_id, outcome, type_letter, raw_line, line_hash, created_at "
-                    "FROM accounting_filtered WHERE job_id=? AND outcome=? "
+                    "FROM accounting_events WHERE job_id=? AND outcome=? "
                     "ORDER BY id DESC LIMIT ? OFFSET ?",
                     (jid, out, lim, off),
                 ).fetchall()
             else:
                 rows = conn.execute(
                     "SELECT id, job_id, outcome, type_letter, raw_line, line_hash, created_at "
-                    "FROM accounting_filtered WHERE job_id=? "
+                    "FROM accounting_events WHERE job_id=? "
                     "ORDER BY id DESC LIMIT ? OFFSET ?",
                     (jid, lim, off),
                 ).fetchall()
@@ -1040,7 +933,7 @@ def db_list_accounting_filtered(job_id: str, *, outcome: str = "", limit: int = 
             conn.close()
 
 
-def db_count_accounting_filtered(job_id: str) -> Dict[str, int]:
+def db_count_accounting_events(job_id: str) -> Dict[str, int]:
     jid = (job_id or "").strip().lower()
     base = {"delivered": 0, "bounced": 0, "deferred": 0, "complained": 0, "unknown": 0}
     if not jid:
@@ -1049,7 +942,7 @@ def db_count_accounting_filtered(job_id: str) -> Dict[str, int]:
         conn = _db_conn()
         try:
             rows = conn.execute(
-                "SELECT outcome, COUNT(*) FROM accounting_filtered WHERE job_id=? GROUP BY outcome",
+                "SELECT outcome, COUNT(*) FROM accounting_events WHERE job_id=? GROUP BY outcome",
                 (jid,),
             ).fetchall()
         finally:
@@ -1203,10 +1096,7 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job.bounced = int(s.get("bounced") or 0)
         job.deferred = int(s.get("deferred") or 0)
         job.complained = int(s.get("complained") or 0)
-        job.outcome_series = list(s.get("outcome_series") or [])
         job.accounting_last_ts = str(s.get("accounting_last_ts") or "")
-        job.accounting_error_counts = dict(s.get("accounting_error_counts") or {})
-        job.accounting_last_errors = list(s.get("accounting_last_errors") or [])
 
         job.spam_threshold = float(s.get("spam_threshold") or 4.0)
         job.spam_score = s.get("spam_score")
@@ -3653,7 +3543,7 @@ This will remove it from Jobs history.`);
   }
 
   function renderErrorTypes(card, j){
-    const ec = j.accounting_error_counts || {};
+    const ec = {};
     const entries = Object.entries(ec).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0));
     const el = qk(card,'errorTypes');
     if(!el){ return; }
@@ -3664,7 +3554,7 @@ This will remove it from Jobs history.`);
       blocked: '5XX blocked'
     };
 
-    const rawErrors = Array.isArray(j.accounting_last_errors) ? j.accounting_last_errors : [];
+    const rawErrors = [];
     const onlyErrors = rawErrors.filter(x => (x && x.kind !== 'accepted'));
 
     function errorSignature(detail){
@@ -4121,7 +4011,7 @@ This will remove it from Jobs history.`);
       }).join('');
     }
     if(trEl){
-      const s = Array.isArray(j.outcome_series) ? j.outcome_series : [];
+      const s = [];
       const tail = s.slice(-20);
       const delV = tail.map(x=>Number(x.delivered||0));
       const bncV = tail.map(x=>Number(x.bounced||0));
@@ -4309,23 +4199,7 @@ This will remove it from Jobs history.`);
   }
 
   async function bridgeDebugTick(){
-    try{
-      const r = await fetch('/api/accounting/bridge/status');
-      const j = await r.json().catch(()=>({}));
-      if(r.ok && j && j.ok && j.bridge){
-        const b = j.bridge || {};
-        console.log('[Bridge↔Shiva Debug]', {
-          last_ok: !!b.last_ok,
-          last_error: b.last_error || '',
-          job_id: b.job_id || '',
-          mails_matched_job_id: Array.isArray(b.mails_matched_job_id) ? b.mails_matched_job_id : [],
-        });
-      } else {
-        console.warn('[Bridge↔Shiva Debug] bridge status failed', {http_status: r.status, payload: j});
-      }
-    }catch(e){
-      console.error('[Bridge↔Shiva Debug] bridge status exception', e);
-    }
+    return;
   }
 
   let jobsDigestSignature = '';
@@ -6229,57 +6103,6 @@ def resolve_sender_domain_ips(domain: str) -> List[str]:
     return out
 
 
-def db_mark_job_recipient(job_id: str, campaign_id: str, rcpt: str) -> None:
-    jid = (job_id or "").strip().lower()
-    cid = (campaign_id or "").strip()
-    em = (rcpt or "").strip().lower()
-    if not jid or not em:
-        return
-    ts = now_iso()
-    with DB_LOCK:
-        conn = _db_conn()
-        try:
-            try:
-                conn.execute(
-                    "INSERT INTO job_recipients(job_id, campaign_id, rcpt, first_seen_at, last_seen_at) VALUES(?,?,?,?,?) "
-                    "ON CONFLICT(job_id, rcpt) DO UPDATE SET campaign_id=excluded.campaign_id, last_seen_at=excluded.last_seen_at",
-                    (jid, cid, em, ts, ts),
-                )
-            except sqlite3.OperationalError as e:
-                # Backward-compat for older SQLite builds that don't support UPSERT.
-                if "near \"ON\"" not in str(e):
-                    raise
-                cur = conn.execute(
-                    "UPDATE job_recipients SET campaign_id=?, last_seen_at=? WHERE job_id=? AND rcpt=?",
-                    (cid, ts, jid, em),
-                )
-                if cur.rowcount == 0:
-                    conn.execute(
-                        "INSERT INTO job_recipients(job_id, campaign_id, rcpt, first_seen_at, last_seen_at) VALUES(?,?,?,?,?)",
-                        (jid, cid, em, ts, ts),
-                    )
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def db_find_job_ids_by_recipient(rcpt: str, limit: int = 8) -> List[str]:
-    em = (rcpt or "").strip().lower()
-    if not em:
-        return []
-    lim = max(1, min(int(limit or 1), 50))
-    with DB_LOCK:
-        conn = _db_conn()
-        try:
-            rows = conn.execute(
-                "SELECT job_id FROM job_recipients WHERE rcpt=? ORDER BY last_seen_at DESC LIMIT ?",
-                (em, lim),
-            ).fetchall()
-            return [str(r[0]).strip().lower() for r in (rows or []) if r and str(r[0]).strip()]
-        except Exception:
-            return []
-        finally:
-            conn.close()
 
 
 # =========================
@@ -7813,35 +7636,6 @@ except Exception:
     PMTA_BRIDGE_PULL_MAX_LINES = 2000
 PMTA_BRIDGE_PULL_KIND = (os.getenv("PMTA_BRIDGE_PULL_KIND", "acct") or "acct").strip().lower()
 PMTA_BRIDGE_PULL_ALL_FILES = (os.getenv("PMTA_BRIDGE_PULL_ALL_FILES", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
-PMTA_BRIDGE_PULL_TARGET_MODE = (os.getenv("PMTA_BRIDGE_PULL_TARGET_MODE", "auto") or "auto").strip().lower()  # auto|job|campaign|all
-try:
-    PMTA_BRIDGE_PULL_TARGET_LIMIT = int((os.getenv("PMTA_BRIDGE_PULL_TARGET_LIMIT", "12") or "12").strip())
-except Exception:
-    PMTA_BRIDGE_PULL_TARGET_LIMIT = 12
-
-_BRIDGE_DEBUG_LOCK = threading.Lock()
-_BRIDGE_DEBUG_STATE: Dict[str, Any] = {
-    "last_ok": False,
-    "last_error": "",
-    "last_job_id": "",
-    "last_mails_matched_job_id": [],
-}
-
-_BRIDGE_POLLER_LOCK = threading.Lock()
-_BRIDGE_POLLER_STARTED = False
-
-_BRIDGE_TARGET_CURSOR_LOCK = threading.Lock()
-_BRIDGE_TARGET_CURSOR = 0
-
-
-def _bridge_debug_update(**kwargs: Any) -> None:
-    with _BRIDGE_DEBUG_LOCK:
-        _BRIDGE_DEBUG_STATE.update(kwargs)
-
-_PMTA_ACC_HEADERS: Dict[str, List[str]] = {}
-
-# Extract job id from Message-ID we generate:
-#   <uuid.<job_id>.<campaign_id>.c<chunk>.w<worker>@local>
 _JOBID_RE_1 = re.compile(r"[.][a-f0-9]{8,64}[.]([a-f0-9]{12})[.]([a-f0-9]{8,64}|none)[.]c[0-9]+[.]w[0-9]+@local", re.IGNORECASE)
 _JOBID_RE_2 = re.compile(r"[.][a-f0-9]{8,64}[.]([a-f0-9]{12})[.]c[0-9]+[.]w[0-9]+@local", re.IGNORECASE)
 
@@ -7860,7 +7654,6 @@ def _extract_job_id_from_text(text: str) -> str:
 
 
 def _normalize_job_id(value: Any) -> str:
-    """Normalize job id to canonical 12-hex id used across send, accounting, and APIs."""
     raw = str(value or "").strip().lower()
     if not raw:
         return ""
@@ -7875,506 +7668,6 @@ def _normalize_job_id(value: Any) -> str:
     if m:
         return str(m.group(1) or "").strip().lower()
     return raw
-
-
-def _normalize_outcome_type(v: Any) -> str:
-    s = ("" if v is None else str(v)).strip().lower()
-    if not s:
-        return ""
-    s = re.sub(r"\s+", " ", s)
-    # PMTA accounting often uses a 1-letter type.
-    if s in {"d", "delivered", "delivery", "success", "accepted", "ok", "sent"}:
-        return "delivered"
-    if s in {"b", "bounce", "bounced", "hardbounce", "softbounce", "failed", "failure", "reject", "rejected", "error"}:
-        return "bounced"
-    if s in {"t", "defer", "deferred", "deferral", "transient"}:
-        return "deferred"
-    if s in {"c", "complaint", "complained", "fbl"}:
-        return "complained"
-
-    # PMTA accounting CSV often stores status words in longer values,
-    # e.g. dsnStatus="2.0.0 (success)" or dsnAction="relayed".
-    if any(x in s for x in ("success", "2.0.0", "relayed", "delivered", "accepted", "250 ")):
-        return "delivered"
-    if any(x in s for x in ("bounce", "bounced", "failed", "failure", "reject", "5.", " 550", " 551", " 552", " 553", " 554")):
-        return "bounced"
-    if any(x in s for x in ("defer", "deferred", "transient", "4.", " 421", " 450", " 451", " 452")):
-        return "deferred"
-    if any(x in s for x in ("complaint", "fbl", "abuse")):
-        return "complained"
-    return s
-
-
-def _event_value(ev: dict, *names: str) -> str:
-    if not isinstance(ev, dict):
-        return ""
-    aliases = {n.strip().lower().replace("_", "-") for n in names if n and n.strip()}
-    if not aliases:
-        return ""
-
-    for k, v in ev.items():
-        kk = str(k or "").strip().lower().replace("_", "-")
-        if kk in aliases and str(v or "").strip():
-            return str(v).strip()
-
-    for k, v in ev.items():
-        kk = str(k or "").strip().lower().replace("_", "-")
-        if any(a in kk for a in aliases) and str(v or "").strip():
-            return str(v).strip()
-    return ""
-
-
-def _find_job_by_campaign(campaign_id: str) -> Optional[SendJob]:
-    cid = (campaign_id or "").strip()
-    if not cid:
-        return None
-
-    candidates = [j for j in JOBS.values() if (j.campaign_id or "").strip() == cid and not bool(j.deleted)]
-    if not candidates:
-        return None
-
-    running = [j for j in candidates if (j.status or "") in {"running", "backoff", "paused"}]
-    pool = running or candidates
-
-    def _sort_key(j: SendJob) -> Tuple[str, str]:
-        return (str(j.updated_at or ""), str(j.created_at or ""))
-
-    pool.sort(key=_sort_key, reverse=True)
-    return pool[0]
-
-
-def _find_job_by_recipient(rcpt: str) -> Optional[SendJob]:
-    em = (rcpt or "").strip().lower()
-    if not em:
-        return None
-
-    # 1) Prefer persisted recipient->job mapping (most reliable when ids are absent in PMTA CSV).
-    for jid in db_find_job_ids_by_recipient(em, limit=12):
-        job = JOBS.get(jid)
-        if job and not bool(job.deleted):
-            return job
-
-    # 2) Fallback to in-memory recent send results if DB has no hit.
-    candidates: List[SendJob] = []
-    for job in JOBS.values():
-        if bool(job.deleted):
-            continue
-        rr = job.recent_results or []
-        if any(str(it.get("email") or "").strip().lower() == em for it in rr[-250:]):
-            candidates.append(job)
-
-    if not candidates:
-        return None
-
-    running = [j for j in candidates if (j.status or "") in {"running", "backoff", "paused"}]
-    pool = running or candidates
-    pool.sort(key=lambda j: (str(j.updated_at or ""), str(j.created_at or "")), reverse=True)
-    return pool[0]
-
-
-def _parse_accounting_line(line: str, *, path: str = "") -> Optional[dict]:
-    """Parse one accounting line.
-
-    Supports:
-    - NDJSON: one JSON object per line
-    - CSV (with or without header)
-
-    Output is best-effort.
-    """
-    s = (line or "").strip()
-    if not s:
-        return None
-
-    # NDJSON
-    if s.startswith("{") and s.endswith("}"):
-        try:
-            ev = json.loads(s)
-            if isinstance(ev, dict):
-                return ev
-        except Exception:
-            return None
-
-    # CSV
-    delim = ","
-    if "\t" in s and s.count("\t") >= s.count(","):
-        delim = "\t"
-    elif ";" in s and s.count(";") > s.count(","):
-        delim = ";"
-
-    try:
-        fields = next(csv.reader([s], delimiter=delim))
-        fields = [x.strip() for x in fields]
-    except Exception:
-        return None
-
-    # Header detection
-    if fields and any(x.lower() in {"type", "event", "rcpt", "recipient", "msgid", "message-id", "message_id"} for x in fields):
-        _PMTA_ACC_HEADERS[path or ""] = [x.strip().lower() for x in fields]
-        return None
-
-    hdr = _PMTA_ACC_HEADERS.get(path or "") or []
-    ev: Dict[str, Any] = {"raw": s}
-
-    if hdr and len(hdr) == len(fields):
-        for k, v in zip(hdr, fields):
-            if k:
-                ev[k] = v
-        return ev
-
-    # Heuristic fallback
-    if fields:
-        ev["type"] = fields[0]
-
-    # Common PMTA acct CSV fallback mapping (no header).
-    # Example:
-    # b,<time>,<time>,mailfrom,rcpt,,failed,5.1.1 (...),"smtp;550 ...",...
-    if len(fields) >= 9:
-        ev["mailfrom"] = fields[3]
-        ev["rcpt"] = fields[4]
-        ev["status"] = fields[6]
-        ev["dsnStatus"] = fields[7]
-        ev["dsnDiag"] = fields[8]
-
-    # Recipient fallback: prefer 2nd email-looking token (mailfrom is usually first).
-    em_pos = [(i, (f or "").strip()) for i, f in enumerate(fields) if EMAIL_RE.match((f or "").strip())]
-    if em_pos:
-        if len(em_pos) >= 2:
-            ev["rcpt"] = em_pos[1][1]
-        elif "rcpt" not in ev:
-            ev["rcpt"] = em_pos[0][1]
-
-    for f in fields:
-        if "@local" in f or "<" in f:
-            ev["msgid"] = f
-            break
-
-    return ev
-
-
-def _normalize_accounting_event(ev: dict) -> dict:
-    """Normalize common PMTA/accounting header fields to stable aliases."""
-    if not isinstance(ev, dict):
-        return {}
-    out = dict(ev)
-    for k, v in list(ev.items()):
-        kk = str(k or "").strip().lower().replace("_", "-")
-        if not kk:
-            continue
-        vv = str(v or "").strip()
-        if not vv:
-            continue
-        if "x-job-id" in kk and not out.get("x-job-id"):
-            out["x-job-id"] = vv
-        if "x-campaign-id" in kk and not out.get("x-campaign-id"):
-            out["x-campaign-id"] = vv
-        if "message-id" in kk and not out.get("message-id"):
-            out["message-id"] = vv
-    return out
-
-
-def _push_outcome_bucket(job: SendJob, kind: str):
-    try:
-        now_min = int(time.time() // 60)
-        if job.outcome_series and int(job.outcome_series[-1].get("t_min") or 0) == now_min:
-            b = job.outcome_series[-1]
-        else:
-            b = {"t_min": now_min, "delivered": 0, "bounced": 0, "deferred": 0, "complained": 0}
-            job.outcome_series.append(b)
-            if len(job.outcome_series) > 180:
-                job.outcome_series = job.outcome_series[-140:]
-        if kind in b:
-            b[kind] = int(b.get(kind) or 0) + 1
-    except Exception:
-        pass
-
-
-def _apply_outcome_to_job(job: SendJob, rcpt: str, kind: str) -> None:
-    """Update job counters in a 'unique per recipient' way using SQLite job_outcomes."""
-    r = (rcpt or "").strip().lower()
-    k = (kind or "").strip().lower()
-    if not r or k not in {"delivered", "bounced", "deferred", "complained"}:
-        return
-
-    prev = db_get_outcome(job.id, r)
-
-    # Don't downgrade finals to deferred
-    if prev in {"delivered", "bounced", "complained"} and k == "deferred":
-        return
-
-    if prev == k:
-        _push_outcome_bucket(job, k)
-        job.accounting_last_ts = now_iso()
-        return
-
-    def dec(st: str):
-        if st == "delivered":
-            job.delivered = max(0, int(job.delivered or 0) - 1)
-        elif st == "bounced":
-            job.bounced = max(0, int(job.bounced or 0) - 1)
-        elif st == "deferred":
-            job.deferred = max(0, int(job.deferred or 0) - 1)
-        elif st == "complained":
-            job.complained = max(0, int(job.complained or 0) - 1)
-
-    def inc(st: str):
-        if st == "delivered":
-            job.delivered = int(job.delivered or 0) + 1
-        elif st == "bounced":
-            job.bounced = int(job.bounced or 0) + 1
-        elif st == "deferred":
-            job.deferred = int(job.deferred or 0) + 1
-        elif st == "complained":
-            job.complained = int(job.complained or 0) + 1
-
-    if prev:
-        dec(prev)
-    inc(k)
-
-    db_set_outcome(job.id, r, k)
-    _push_outcome_bucket(job, k)
-    job.accounting_last_ts = now_iso()
-
-
-def _classify_accounting_response(ev: dict, typ: str) -> Tuple[str, str]:
-    """Return (kind, full_error_text) using accounting response data.
-
-    kind is one of: accepted, temporary_error, blocked.
-    """
-    bits = [
-        _event_value(ev, "response", "smtp-response", "smtp_response"),
-        _event_value(ev, "dsnStatus", "dsn_status", "enhanced-status", "enhanced_status"),
-        _event_value(ev, "dsnDiag", "dsn_diag", "diag", "diagnostic", "smtp-diagnostic"),
-        _event_value(ev, "status", "result", "state"),
-    ]
-    parts = [str(x).strip() for x in bits if str(x or "").strip()]
-    full = " | ".join(parts)
-
-    probe = " ".join(parts).lower()
-    code_match = re.search(r"\b([245])[0-9]{2}\b", probe)
-    if not code_match:
-        code_match = re.search(r"\b([245])\.[0-9]\.[0-9]\b", probe)
-
-    if code_match:
-        lead = code_match.group(1)
-        if lead == "2":
-            return "accepted", full
-        if lead == "4":
-            return "temporary_error", full
-        if lead == "5":
-            return "blocked", full
-
-    # Fallback from normalized outcome when code is missing.
-    t = (typ or "").strip().lower()
-    if t == "delivered":
-        return "accepted", full
-    if t == "deferred":
-        return "temporary_error", full
-    if t in {"bounced", "complained"}:
-        return "blocked", full
-    return "temporary_error", full
-
-
-def _record_accounting_error(job: SendJob, rcpt: str, typ: str, ev: dict) -> None:
-    kind, detail = _classify_accounting_response(ev, typ)
-    job.accounting_error_counts[kind] = int(job.accounting_error_counts.get(kind, 0) or 0) + 1
-    entry = {
-        "ts": now_iso(),
-        "email": (rcpt or "").strip(),
-        "type": typ,
-        "kind": kind,
-        "detail": detail,
-    }
-    job.accounting_last_errors.append(entry)
-    if len(job.accounting_last_errors) > 80:
-        job.accounting_last_errors = job.accounting_last_errors[-40:]
-
-
-def process_pmta_accounting_event(ev: dict) -> dict:
-    """Process one accounting event dict. Returns small result info."""
-    if not isinstance(ev, dict):
-        return {"ok": False, "reason": "not_dict"}
-    ev = _normalize_accounting_event(ev)
-
-    typ = _normalize_outcome_type(
-        ev.get("type")
-        or ev.get("event")
-        or ev.get("kind")
-        or ev.get("record")
-        or ev.get("status")
-        or ev.get("result")
-        or ev.get("state")
-    )
-    if typ not in {"delivered", "bounced", "deferred", "complained"}:
-        typ = _normalize_outcome_type(
-            ev.get("dsnAction")
-            or ev.get("dsn_action")
-            or ev.get("dsnStatus")
-            or ev.get("dsn_status")
-            or ev.get("dsnDiag")
-            or ev.get("dsn_diag")
-        )
-
-    rcpt = (
-        ev.get("rcpt")
-        or ev.get("recipient")
-        or ev.get("email")
-        or ev.get("to")
-        or ev.get("rcpt_to")
-        or ""
-    )
-    rcpt = str(rcpt or "").strip()
-
-    job_id = _normalize_job_id(_event_value(ev, "x-job-id", "job-id", "job_id", "jobid"))
-    campaign_id = _event_value(ev, "x-campaign-id", "campaign-id", "campaign_id", "cid")
-
-    if not job_id:
-        msgid = _event_value(ev, "msgid", "message-id", "message_id", "messageid", "header_message-id", "header_message_id")
-        if not msgid:
-            # Pick any field that looks like a Message-ID header (different acct-file schemas)
-            for k, v in (ev or {}).items():
-                kk = str(k or "").lower().replace("_", "-")
-                if "message-id" in kk:
-                    msgid = v
-                    break
-        job_id = _normalize_job_id(msgid)
-
-    if not job_id:
-        job_id = _normalize_job_id(ev.get("raw") or "")
-
-    if not rcpt or typ not in {"delivered", "bounced", "deferred", "complained"}:
-        return {"ok": False, "reason": "missing_fields", "job_id": job_id, "campaign_id": campaign_id, "rcpt": rcpt, "type": typ}
-
-    with JOBS_LOCK:
-        job = JOBS.get(job_id) if job_id else None
-        if job_id and not job:
-            return {"ok": False, "reason": "job_not_found", "job_id": job_id, "campaign_id": campaign_id, "rcpt": rcpt}
-        if not job and campaign_id:
-            job = _find_job_by_campaign(campaign_id)
-        if not job and rcpt:
-            job = _find_job_by_recipient(rcpt)
-        if not job:
-            return {"ok": False, "reason": "job_not_found", "job_id": job_id, "campaign_id": campaign_id, "rcpt": rcpt}
-
-        _apply_outcome_to_job(job, rcpt, typ)
-        _record_accounting_error(job, rcpt, typ, ev)
-        job.maybe_persist()
-
-    return {"ok": True, "job_id": job.id, "campaign_id": job.campaign_id, "type": typ, "rcpt": rcpt}
-
-
-def process_campaign_accounting_payload(payload: dict) -> dict:
-    """Process middleware payload grouped by campaign_id.
-
-    Expected shape:
-      {
-        "campaign_id": "...",
-        "outcomes": [
-          {"recipient": "a@b.com", "status": "bounced", "job_id": "..."},
-          ...
-        ]
-      }
-    """
-    if not isinstance(payload, dict):
-        return {"ok": False, "error": "invalid_payload", "processed": 0, "accepted": 0}
-
-    campaign_id = str(payload.get("campaign_id") or "").strip()
-    outcomes = payload.get("outcomes")
-    if not campaign_id:
-        return {"ok": False, "error": "missing_campaign_id", "processed": 0, "accepted": 0}
-    if not isinstance(outcomes, list):
-        return {"ok": False, "error": "missing_outcomes", "processed": 0, "accepted": 0}
-
-    processed = 0
-    accepted = 0
-    with JOBS_LOCK:
-        fallback_job = _find_job_by_campaign(campaign_id)
-        for item in outcomes:
-            if not isinstance(item, dict):
-                continue
-            processed += 1
-            rcpt = str(item.get("recipient") or item.get("rcpt") or item.get("email") or "").strip()
-            typ = _normalize_outcome_type(item.get("status") or item.get("type") or item.get("event"))
-            if not rcpt or typ not in {"delivered", "bounced", "deferred", "complained"}:
-                continue
-
-            jid = str(item.get("job_id") or item.get("jobId") or "").strip().lower()
-            job = JOBS.get(jid) if jid else None
-            if not job or (job.campaign_id or "") != campaign_id:
-                job = fallback_job
-            if not job:
-                continue
-
-            _apply_outcome_to_job(job, rcpt, typ)
-            _record_accounting_error(job, rcpt, typ, item)
-            job.maybe_persist()
-            accepted += 1
-
-    return {"ok": True, "campaign_id": campaign_id, "processed": processed, "accepted": accepted}
-
-
-
-def _bridge_collect_pull_targets() -> List[Dict[str, str]]:
-    """Collect job-id targets for bridge requests (single supported accounting flow)."""
-    targets: List[Dict[str, str]] = []
-    with JOBS_LOCK:
-        jobs = [j for j in JOBS.values() if not bool(j.deleted)]
-
-    interesting = [j for j in jobs if (j.status or "") in {"running", "backoff", "paused", "queued"}]
-    if not interesting:
-        interesting = jobs
-
-    for job in interesting:
-        jid = str(job.id or "").strip().lower()
-        if not jid:
-            continue
-        if any(t.get("x-job-id") == jid for t in targets):
-            continue
-        targets.append({"scope": "job", "x-job-id": jid})
-
-    lim = max(1, int(PMTA_BRIDGE_PULL_TARGET_LIMIT or 1))
-    if len(targets) > lim:
-        targets = targets[:lim]
-    return targets
-
-
-def _bridge_pick_target(targets: List[Dict[str, str]]) -> Dict[str, str]:
-    if not targets:
-        return {"scope": "all"}
-    global _BRIDGE_TARGET_CURSOR
-    with _BRIDGE_TARGET_CURSOR_LOCK:
-        idx = int(_BRIDGE_TARGET_CURSOR or 0) % len(targets)
-        _BRIDGE_TARGET_CURSOR = idx + 1
-    return targets[idx]
-
-
-def _bridge_row_to_event(row: Any, *, job_id: str) -> Optional[dict]:
-    """Convert one bridge line/object into a normalized accounting event dict.
-
-    Bridge pull payload usually returns raw accounting lines in `lines`.
-    We parse CSV/JSON with existing accounting parser, then enforce type from first
-    comma-separated token as requested (D/B/T/...).
-    """
-    ev: Optional[dict] = None
-
-    if isinstance(row, dict):
-        ev = dict(row)
-    else:
-        line = str(row or "").strip()
-        if not line:
-            return None
-        ev = _parse_accounting_line(line, path="bridge_pull") or {"raw": line}
-
-        # Required behavior: split by comma and use first segment to determine type.
-        first = line.split(",", 1)[0].strip().lower()
-        if first:
-            ev["type"] = first
-
-    ev = _normalize_accounting_event(ev or {})
-    if job_id and not _normalize_job_id(_event_value(ev, "x-job-id", "job-id", "job_id", "jobid")):
-        # Keep job context even when row lacks explicit job-id fields.
-        ev["x-job-id"] = job_id
-    return ev
-
 
 
 def _parse_pmta_acct_type_map_from_env() -> Dict[str, str]:
@@ -8392,37 +7685,23 @@ def _parse_pmta_acct_type_map_from_env() -> Dict[str, str]:
             outcome = "unknown"
         out[letter] = outcome
 
-    # Optional override when deployments use different deferred letters.
-    deferred_letters = (os.getenv("PMTA_ACCT_DEFERRED_LETTERS", "") or "").strip()
-    if deferred_letters:
-        for item in re.split(r"[,;\s]+", deferred_letters):
-            letter = (item or "").strip().upper()[:1]
-            if letter:
-                out[letter] = "deferred"
-
     if not out:
         out = {"D": "delivered", "B": "bounced", "C": "complained", "T": "deferred"}
     return out
 
 
 def filter_accounting_lines(lines: List[str], *, job_id: str = "") -> dict:
-    """Filter + dedupe + classify raw bridge accounting lines.
-
-    - CSV parsing uses csv.reader (not raw split) to handle quoted commas.
-    - Dedupe is done via exact normalized-line hash and optional semantic key.
-    - Parse errors are kept with outcome=unknown.
-    """
+    """Filter + dedupe + classify raw bridge accounting lines."""
     type_map = _parse_pmta_acct_type_map_from_env()
     counts: Dict[str, int] = {"delivered": 0, "bounced": 0, "deferred": 0, "complained": 0, "unknown": 0}
 
     unique_hashes: Set[str] = set()
-    unique_semantic: Set[Tuple[str, str, str, str, str]] = set()
     filtered: List[dict] = []
     parse_errors = 0
 
     for src in (lines or []):
         raw_line = str(src or "")
-        normalized = raw_line.replace("\r\n", "\n").replace("\r", "\n").strip()
+        normalized = raw_line.strip().replace("\r\n", "\n")
         if not normalized:
             continue
 
@@ -8431,30 +7710,14 @@ def filter_accounting_lines(lines: List[str], *, job_id: str = "") -> dict:
             continue
 
         type_letter = "?"
-        recipient = ""
-        message_id = ""
-        ts = ""
-
         try:
             fields = next(csv.reader([normalized]))
             fields = [str(x or "").strip() for x in fields]
             if fields:
                 type_letter = (fields[0] or "").strip().upper()[:1] or "?"
-            if len(fields) >= 2:
-                ts = fields[1]
-            if len(fields) >= 3:
-                recipient = fields[2].lower()
-            if len(fields) >= 4:
-                message_id = fields[3]
-
-            if recipient and message_id and ts and type_letter != "?":
-                sem_key = ((job_id or "").strip().lower(), type_letter, recipient, message_id, ts)
-                if sem_key in unique_semantic:
-                    continue
-                unique_semantic.add(sem_key)
         except Exception as e:
             parse_errors += 1
-            app.logger.error("filter_accounting_lines csv parse failed: %s", e)
+            app.logger.error("filter_accounting_lines csv parse failed: %s | sample=%r", e, normalized[:240])
 
         outcome = type_map.get(type_letter, "unknown")
         counts[outcome] = int(counts.get(outcome, 0)) + 1
@@ -8486,16 +7749,15 @@ def _resolve_bridge_pull_url() -> str:
     if "/api/v1/pull/latest" not in url:
         url = url.rstrip("/") + "/api/v1/pull/latest"
     sep = "&" if "?" in url else "?"
-    req_url = (
+    return (
         f"{url}{sep}kind={quote_plus(PMTA_BRIDGE_PULL_KIND or 'acct')}"
         f"&max_lines={max(1, int(PMTA_BRIDGE_PULL_MAX_LINES or 1))}"
         f"&all={1 if PMTA_BRIDGE_PULL_ALL_FILES else 0}"
     )
-    return req_url
 
 
 def _pull_bridge_lines_for_job(job_id: str) -> dict:
-    jid = (job_id or "").strip().lower()
+    jid = _normalize_job_id(job_id)
     if not jid:
         return {"ok": False, "error": "missing_job_id"}
     req_url = _resolve_bridge_pull_url()
@@ -8512,6 +7774,7 @@ def _pull_bridge_lines_for_job(job_id: str) -> dict:
             raw = (resp.read() or b"{}").decode("utf-8", errors="replace")
         obj = json.loads(raw)
     except Exception as e:
+        app.logger.exception("bridge pull failed for job_id=%s", jid)
         return {"ok": False, "error": f"bridge_request_failed: {e}"}
 
     bridge_rows = obj.get("lines") if isinstance(obj, dict) else None
@@ -8523,135 +7786,6 @@ def _pull_bridge_lines_for_job(job_id: str) -> dict:
         bridge_rows = bridge_rows[:max_lines]
 
     return {"ok": True, "job_id": jid, "lines": bridge_rows}
-
-
-def _poll_accounting_bridge_once() -> dict:
-    url = (PMTA_BRIDGE_PULL_URL or "").strip()
-    if not url:
-        _bridge_debug_update(last_ok=False, last_error="bridge_pull_url_not_configured", last_mails_matched_job_id=[])
-        return {"ok": False, "error": "bridge_pull_url_not_configured", "processed": 0}
-
-    # Accept a bare host:port and default to HTTP to avoid urlopen failures
-    # like "unknown url type: 194.116.172.135".
-    if url and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
-        url = f"http://{url}"
-
-    # Allow passing a base bridge URL (e.g. http://host:8090) and normalize it
-    # to the pull endpoint expected by this poller.
-    if "/api/v1/pull/latest" not in url:
-        url = url.rstrip("/") + "/api/v1/pull/latest"
-
-    sep = "&" if "?" in url else "?"
-    req_url = (
-        f"{url}{sep}kind={quote_plus(PMTA_BRIDGE_PULL_KIND or 'acct')}"
-        f"&max_lines={max(1, int(PMTA_BRIDGE_PULL_MAX_LINES or 1))}"
-        f"&all={1 if PMTA_BRIDGE_PULL_ALL_FILES else 0}"
-    )
-
-    target = _bridge_pick_target(_bridge_collect_pull_targets())
-    job_id = str((target or {}).get("x-job-id") or "").strip().lower()
-    if not job_id:
-        _bridge_debug_update(last_ok=False, last_error="no_target_job_id", last_mails_matched_job_id=[])
-        return {"ok": False, "error": "no_target_job_id", "processed": 0}
-
-    headers = {"Accept": "application/json"}
-    if PMTA_BRIDGE_PULL_TOKEN:
-        headers["Authorization"] = f"Bearer {PMTA_BRIDGE_PULL_TOKEN}"
-    headers["X-Job-ID"] = job_id
-
-    try:
-        req = Request(req_url, headers=headers, method="GET")
-        with urlopen(req, timeout=20) as resp:
-            raw = (resp.read() or b"{}").decode("utf-8", errors="replace")
-    except Exception as e:
-        _bridge_debug_update(last_ok=False, last_error=f"bridge_request_failed: {e}", last_job_id=job_id, last_mails_matched_job_id=[])
-        return {"ok": False, "error": f"bridge_request_failed: {e}", "processed": 0}
-
-    try:
-        obj = json.loads(raw)
-    except Exception:
-        _bridge_debug_update(last_ok=False, last_error="invalid_bridge_json", last_job_id=job_id, last_mails_matched_job_id=[])
-        return {"ok": False, "error": "invalid_bridge_json", "processed": 0}
-
-    bridge_rows = obj.get("lines") if isinstance(obj, dict) else None
-    if not isinstance(bridge_rows, list):
-        _bridge_debug_update(last_ok=False, last_error="invalid_bridge_payload", last_job_id=job_id, last_mails_matched_job_id=[])
-        return {"ok": False, "error": "invalid_bridge_payload", "processed": 0}
-
-    processed = len(bridge_rows)
-    accepted = 0
-    rejected = 0
-    reasons: Dict[str, int] = {}
-
-    with JOBS_LOCK:
-        if job_id not in JOBS:
-            _bridge_debug_update(last_ok=False, last_error="job_not_found", last_job_id=job_id, last_mails_matched_job_id=[])
-            return {"ok": False, "error": "job_not_found", "processed": 0, "count": processed, "job_id": job_id}
-
-    # Parse each matching bridge row and update full Jobs accounting sections
-    # (Delivered/Bounced/Deferred/Complained + Quality and Errors).
-    for row in bridge_rows:
-        ev = _bridge_row_to_event(row, job_id=job_id)
-        if not ev:
-            rejected += 1
-            reasons["empty_row"] = int(reasons.get("empty_row", 0)) + 1
-            continue
-
-        res = process_pmta_accounting_event(ev)
-        if bool(res.get("ok")):
-            accepted += 1
-            continue
-
-        rejected += 1
-        rs = str(res.get("reason") or "rejected")
-        reasons[rs] = int(reasons.get(rs, 0)) + 1
-
-    with JOBS_LOCK:
-        job = JOBS.get(job_id)
-        if job:
-            job.accounting_last_ts = now_iso()
-            job.maybe_persist()
-
-    _bridge_debug_update(
-        last_ok=True,
-        last_error="",
-        last_job_id=job_id,
-        last_mails_matched_job_id=[],
-    )
-    return {
-        "ok": True,
-        "processed": processed,
-        "accepted": accepted,
-        "rejected": rejected,
-        "reasons": reasons,
-        "count": accepted,
-        "job_id": job_id,
-    }
-
-
-def _accounting_bridge_poller_thread():
-    while True:
-        try:
-            _poll_accounting_bridge_once()
-        except Exception:
-            pass
-        time.sleep(max(1.0, float(PMTA_BRIDGE_PULL_S or 5.0)))
-
-
-def start_accounting_bridge_poller_if_needed():
-    global _BRIDGE_POLLER_STARTED
-    if not PMTA_BRIDGE_PULL_ENABLED:
-        return
-    with _BRIDGE_POLLER_LOCK:
-        if _BRIDGE_POLLER_STARTED:
-            return
-        t = threading.Thread(target=_accounting_bridge_poller_thread, daemon=True)
-        t.start()
-        _BRIDGE_POLLER_STARTED = True
-
-
-# Start PMTA accounting bridge poller if configured.
-start_accounting_bridge_poller_if_needed()
 
 
 # =========================
@@ -9059,7 +8193,6 @@ def smtp_send_job(
                     if not _wait_ready():
                         return
 
-                    db_mark_job_recipient(job_id, job.campaign_id or "", rcpt)
 
                     msg = EmailMessage()
                     msg["From"] = formataddr((from_name, from_email))
@@ -9991,9 +9124,6 @@ def reload_runtime_config() -> dict:
         PMTA_BRIDGE_PULL_KIND = (cfg_get_str("PMTA_BRIDGE_PULL_KIND", PMTA_BRIDGE_PULL_KIND) or "acct").strip().lower()
         PMTA_BRIDGE_PULL_ALL_FILES = bool(cfg_get_bool("PMTA_BRIDGE_PULL_ALL_FILES", bool(PMTA_BRIDGE_PULL_ALL_FILES)))
 
-        # If bridge pull gets enabled/configured from UI after startup, ensure poller thread is running.
-        start_accounting_bridge_poller_if_needed()
-
         return {"ok": True, "ts": now_iso()}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -10162,10 +9292,7 @@ def job_api(job_id: str):
                 "bounced": job.bounced,
                 "deferred": job.deferred,
                 "complained": job.complained,
-                "outcome_series": (job.outcome_series or [])[-60:],
                 "accounting_last_ts": job.accounting_last_ts,
-                "accounting_error_counts": job.accounting_error_counts,
-                "accounting_last_errors": (job.accounting_last_errors or [])[-20:],
                 "spam_threshold": job.spam_threshold,
                 "spam_score": job.spam_score,
                 "spam_detail": job.spam_detail,
@@ -10261,453 +9388,6 @@ def api_job_extract_shiva_sent(job_id: str):
     resp.headers["Content-Type"] = "text/plain; charset=utf-8"
     resp.headers["Content-Disposition"] = f'attachment; filename="{job_id}-shiva-sent.txt"'
     return resp
-
-
-@app.get("/api/job/<job_id>/extract/pmta-delivered")
-def api_job_extract_pmta_delivered(job_id: str):
-    with JOBS_LOCK:
-        job = JOBS.get(job_id)
-        if (not job) or getattr(job, 'deleted', False):
-            return jsonify({"error": "not found"}), 404
-
-    out = db_list_outcome_rcpts(job_id, "delivered")
-    body = ("\n".join(out) + ("\n" if out else "")).encode("utf-8")
-    resp = make_response(body)
-    resp.headers["Content-Type"] = "text/plain; charset=utf-8"
-    resp.headers["Content-Disposition"] = f'attachment; filename="{job_id}-pmta-delivered.txt"'
-    return resp
-
-
-@app.post("/api/job/<job_id>/delete")
-def api_job_delete(job_id: str):
-    """Delete a job from history.
-
-    - If job is running/backoff/paused, we request stop.
-    - Removes from in-memory JOBS and from SQLite jobs table.
-    """
-    jid = (job_id or "").strip()
-    if not jid:
-        return jsonify({"ok": False, "error": "missing job id"}), 400
-
-    with JOBS_LOCK:
-        job = JOBS.get(jid)
-        if job:
-            # request stop if active
-            if job.status in {"queued", "running", "backoff", "paused"}:
-                job.stop_requested = True
-                job.paused = False
-                job.stop_reason = job.stop_reason or "deleted by user"
-                job.status = "stopped"
-                job.log("WARN", "Job deleted by user")
-            job.deleted = True
-            try:
-                del JOBS[jid]
-            except Exception:
-                pass
-
-    # remove from DB
-    try:
-        db_delete_job(jid)
-    except Exception:
-        pass
-
-    return jsonify({"ok": True})
-
-
-@app.get("/api/form")
-def api_form_get():
-    # Legacy endpoint (kept). Prefer campaign endpoints.
-    bid, is_new = get_or_create_browser_id()
-    data = db_get_form(bid)
-    resp = jsonify({"ok": True, "data": data})
-    return attach_browser_cookie(resp, bid, is_new)
-
-
-@app.post("/api/form")
-def api_form_save():
-    # Legacy endpoint (kept). Prefer campaign endpoints.
-    bid, is_new = get_or_create_browser_id()
-    payload = request.get_json(silent=True) or {}
-    data = payload.get("data") if isinstance(payload, dict) else {}
-    if not isinstance(data, dict):
-        data = {}
-    db_save_form(bid, data)
-    resp = jsonify({"ok": True})
-    return attach_browser_cookie(resp, bid, is_new)
-
-
-@app.post("/api/form/clear")
-def api_form_clear():
-    # Legacy endpoint (kept). Prefer campaign endpoints.
-    bid, is_new = get_or_create_browser_id()
-    payload = request.get_json(silent=True) or {}
-    scope = str(payload.get("scope") or "mine").strip().lower()
-    if scope == "all":
-        db_clear_all()
-    else:
-        db_clear_form(bid)
-    resp = jsonify({"ok": True, "scope": scope})
-    return attach_browser_cookie(resp, bid, is_new)
-
-
-# -------------------------
-# Campaign APIs (used by the form UI)
-# -------------------------
-@app.get("/api/campaign/<campaign_id>/form")
-def api_campaign_form_get(campaign_id: str):
-    bid, is_new = get_or_create_browser_id()
-    cid = (campaign_id or "").strip()
-    c = db_get_campaign(bid, cid)
-    if not c:
-        resp = jsonify({"ok": False, "error": "campaign not found"})
-        return attach_browser_cookie(resp, bid, is_new), 404
-
-    data = db_get_campaign_form(bid, cid)
-    resp = jsonify({"ok": True, "campaign": {"id": c["id"], "name": c["name"]}, "data": data})
-    return attach_browser_cookie(resp, bid, is_new)
-
-
-@app.post("/api/campaign/<campaign_id>/form")
-def api_campaign_form_save(campaign_id: str):
-    bid, is_new = get_or_create_browser_id()
-    cid = (campaign_id or "").strip()
-    payload = request.get_json(silent=True) or {}
-    data = payload.get("data") if isinstance(payload, dict) else {}
-    if not isinstance(data, dict):
-        data = {}
-
-    ok = db_save_campaign_form(bid, cid, data)
-    if not ok:
-        resp = jsonify({"ok": False, "error": "campaign not found"})
-        return attach_browser_cookie(resp, bid, is_new), 404
-
-    resp = jsonify({"ok": True})
-    return attach_browser_cookie(resp, bid, is_new)
-
-
-@app.post("/api/campaign/<campaign_id>/clear")
-def api_campaign_form_clear(campaign_id: str):
-    bid, is_new = get_or_create_browser_id()
-    cid = (campaign_id or "").strip()
-    ok = db_clear_campaign_form(bid, cid)
-    if not ok:
-        resp = jsonify({"ok": False, "error": "campaign not found"})
-        return attach_browser_cookie(resp, bid, is_new), 404
-    resp = jsonify({"ok": True})
-    return attach_browser_cookie(resp, bid, is_new)
-
-
-@app.get("/api/campaign/<campaign_id>/domains_stats")
-def api_campaign_domains_stats(campaign_id: str):
-    """Compute domains stats for this campaign (reads recipients from SQLite).
-
-    Shows planned distribution: how many emails will be sent to each *recipient domain*.
-    """
-    bid, is_new = get_or_create_browser_id()
-    cid = (campaign_id or "").strip()
-    c = db_get_campaign(bid, cid)
-    if not c:
-        resp = jsonify({"ok": False, "error": "campaign not found"})
-        return attach_browser_cookie(resp, bid, is_new), 404
-
-    form = db_get_campaign_form(bid, cid)
-    rec_text = str((form or {}).get("recipients") or "")
-    safe_text = str((form or {}).get("maillist_safe") or "")
-
-    def compute(text: str) -> dict:
-        emails = parse_recipients(text)
-        valid_syntax, invalid_syntax = filter_valid_emails(emails)
-        valid_mx, invalid_mx, filter_report = pre_send_recipient_filter(valid_syntax, smtp_probe=True)
-
-        invalid_all = list(invalid_syntax) + list(invalid_mx)
-
-        # Count domains (recipient domains)
-        counts: Dict[str, int] = {}
-        for e in valid_mx:
-            d = _extract_domain_from_email(e)
-            if not d:
-                continue
-            counts[d] = counts.get(d, 0) + 1
-
-        domains_sorted = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-
-        # Limit expensive checks to top N domains
-        MAX_CHECKS = 200
-        out_items: List[dict] = []
-
-        for idx, (dom, cnt) in enumerate(domains_sorted):
-            route = filter_report.get("domains", {}).get(dom) or domain_mail_route(dom)
-            mx_status = route.get("status", "unknown")
-            mx_hosts = route.get("mx_hosts", [])
-
-            mail_ips: List[str] = []
-            any_listed = False
-
-            if idx < MAX_CHECKS:
-                mail_ips = resolve_sender_domain_ips(dom)
-                dbl = check_domain_dnsbl(dom)
-                if dbl:
-                    any_listed = True
-                for ip in mail_ips:
-                    if check_ip_dnsbl(ip):
-                        any_listed = True
-                        break
-
-            out_items.append(
-                {
-                    "domain": dom,
-                    "count": cnt,
-                    "mx_status": mx_status,
-                    "mx_hosts": mx_hosts,
-                    "mail_ips": mail_ips,
-                    "any_listed": any_listed,
-                }
-            )
-
-        return {
-            "total_emails": len(emails),
-            "invalid_emails": len(invalid_all),
-            "unique_domains": len(counts),
-            "domains": out_items,
-            "filter": filter_report,
-        }
-
-    resp = jsonify({"ok": True, "campaign": {"id": c["id"], "name": c["name"]}, "recipients": compute(rec_text), "safe": compute(safe_text)})
-    return attach_browser_cookie(resp, bid, is_new)
-
-
-@app.get("/api/campaign/<campaign_id>/active_job")
-def api_campaign_active_job(campaign_id: str):
-    """Return the latest active job for this campaign (queued/running/backoff/paused).
-
-    Used by the campaign Domains card to show LIVE per-domain progress.
-    """
-    bid, is_new = get_or_create_browser_id()
-    cid = (campaign_id or "").strip()
-    c = db_get_campaign(bid, cid)
-    if not c:
-        resp = jsonify({"ok": False, "error": "campaign not found"})
-        return attach_browser_cookie(resp, bid, is_new), 404
-
-    with JOBS_LOCK:
-        active = [
-            j for j in JOBS.values()
-            if (not getattr(j, 'deleted', False))
-            and (j.campaign_id or "") == cid
-            and (j.status in {"queued", "running", "backoff", "paused"})
-        ]
-        active.sort(key=lambda x: x.created_at, reverse=True)
-        job = active[0] if active else None
-
-    if not job:
-        resp = jsonify({"ok": False, "error": "no active job"})
-        return attach_browser_cookie(resp, bid, is_new)
-
-    resp = jsonify(
-        {
-            "ok": True,
-            "job": {
-                "id": job.id,
-                "created_at": job.created_at,
-                "status": job.status,
-                "total": job.total,
-                "sent": job.sent,
-                "failed": job.failed,
-                "skipped": job.skipped,
-                "invalid": job.invalid,
-                "chunks_total": job.chunks_total,
-                "chunks_done": job.chunks_done,
-                "current_chunk": job.current_chunk,
-                "domain_plan": job.domain_plan,
-                "domain_sent": job.domain_sent,
-                "domain_failed": job.domain_failed,
-            },
-        }
-    )
-    return attach_browser_cookie(resp, bid, is_new)
-
-
-@app.get("/api/campaign/<campaign_id>/latest_job")
-def api_campaign_latest_job(campaign_id: str):
-    """Return the latest job for this campaign (any status).
-
-    Used by the Campaign page to confirm starting a new job.
-    """
-    bid, is_new = get_or_create_browser_id()
-    cid = (campaign_id or "").strip()
-    c = db_get_campaign(bid, cid)
-    if not c:
-        resp = jsonify({"ok": False, "error": "campaign not found"})
-        return attach_browser_cookie(resp, bid, is_new), 404
-
-    with JOBS_LOCK:
-        items = [
-            j for j in JOBS.values()
-            if (not getattr(j, 'deleted', False)) and (j.campaign_id or "") == cid
-        ]
-        items.sort(key=lambda x: x.created_at, reverse=True)
-        job = items[0] if items else None
-
-    if not job:
-        resp = jsonify({"ok": False, "error": "no jobs"})
-        return attach_browser_cookie(resp, bid, is_new), 404
-
-    resp = jsonify(
-        {
-            "ok": True,
-            "job": {
-                "id": job.id,
-                "created_at": job.created_at,
-                "status": job.status,
-                "total": job.total,
-                "sent": job.sent,
-                "failed": job.failed,
-                "skipped": job.skipped,
-                "invalid": job.invalid,
-            },
-        }
-    )
-    return attach_browser_cookie(resp, bid, is_new)
-
-
-@app.get("/api/jobs_digest")
-def api_jobs_digest():
-    """Small jobs digest used by Jobs page auto-refresh (new send detection)."""
-    cid = (request.args.get("c") or "").strip()
-    with JOBS_LOCK:
-        items = [j for j in JOBS.values() if not getattr(j, 'deleted', False)]
-        if cid:
-            items = [j for j in items if (j.campaign_id or "") == cid]
-        items.sort(key=lambda x: x.created_at, reverse=True)
-        payload = [
-            {
-                "id": j.id,
-                "campaign_id": j.campaign_id,
-                "created_at": j.created_at,
-                "status": j.status,
-            }
-            for j in items
-        ]
-    return jsonify({"ok": True, "jobs": payload})
-
-
-# -------------------------
-# App Config APIs
-# -------------------------
-@app.get("/api/config")
-def api_config_get():
-    items = config_items()
-    saved = 0
-    try:
-        saved = len(db_list_app_config() or {})
-    except Exception:
-        saved = 0
-    return jsonify({"ok": True, "items": items, "saved_overrides": saved})
-
-
-@app.get("/api/version")
-def api_version():
-    # Quick sanity check endpoint (helps verify you are running the latest file)
-    return jsonify({
-        "ok": True,
-        "version": APP_VERSION,
-        "schema_keys": [str(it.get("key") or "") for it in (APP_CONFIG_SCHEMA or [])],
-    })
-
-
-def _cfg_validate_and_canon(key: str, value: Any) -> Tuple[bool, str, str]:
-    """Return (ok, canon_value_str, error)."""
-    meta = APP_CONFIG_INDEX.get(key)
-    if not meta:
-        return False, "", "unknown key"
-
-    typ = str(meta.get("type") or "str").strip().lower()
-    v = "" if value is None else str(value)
-
-    if typ == "bool":
-        vv = v.strip().lower()
-        if vv in {"1", "true", "yes", "on", "y"}:
-            return True, "1", ""
-        if vv in {"0", "false", "no", "off", "n"}:
-            return True, "0", ""
-        return False, "", "invalid bool (use 1/0, true/false, yes/no)"
-
-    if typ == "int":
-        try:
-            return True, str(int(v.strip() or "0")), ""
-        except Exception:
-            return False, "", "invalid int"
-
-    if typ == "float":
-        try:
-            return True, str(float(v.strip() or "0")), ""
-        except Exception:
-            return False, "", "invalid float"
-
-    # str
-    if len(v) > 20000:
-        v = v[:20000]
-    return True, v, ""
-
-
-@app.post("/api/config/set")
-def api_config_set():
-    data = request.get_json(silent=True) or {}
-
-    # bulk
-    if isinstance(data, dict) and isinstance(data.get("items"), dict):
-        items = data.get("items") or {}
-        saved = 0
-        errors: Dict[str, str] = {}
-        for k, v in items.items():
-            key = str(k or "").strip()
-            ok, canon, err = _cfg_validate_and_canon(key, v)
-            if not ok:
-                errors[key] = err
-                continue
-            ok_save, save_err = db_set_app_config(key, canon)
-            if ok_save:
-                saved += 1
-            else:
-                errors[key] = save_err or "failed to save"
-        try:
-            reload_runtime_config()
-        except Exception:
-            pass
-        return jsonify({"ok": (len(errors) == 0), "saved": saved, "errors": errors})
-
-    key = str(data.get("key") or "").strip()
-    val = data.get("value")
-    ok, canon, err = _cfg_validate_and_canon(key, val)
-    if not ok:
-        return jsonify({"ok": False, "error": err}), 400
-
-    ok_save, save_err = db_set_app_config(key, canon)
-    if not ok_save:
-        return jsonify({"ok": False, "error": (save_err or "failed to save")}), 500
-
-    try:
-        reload_runtime_config()
-    except Exception:
-        pass
-
-    return jsonify({"ok": True, "key": key, "value": canon})
-
-
-@app.post("/api/config/reset")
-def api_config_reset():
-    data = request.get_json(silent=True) or {}
-    key = str(data.get("key") or "").strip()
-    if not key:
-        return jsonify({"ok": False, "error": "missing key"}), 400
-
-    db_delete_app_config(key)
-    try:
-        reload_runtime_config()
-    except Exception:
-        pass
-
-    return jsonify({"ok": True, "key": key})
 
 
 @app.get("/api/pmta_probe")
@@ -11027,40 +9707,18 @@ def api_preflight():
     )
 
 
-@app.get("/api/accounting/bridge/status")
-def api_accounting_bridge_status():
-    """Expose only the active bridge accounting fields used by UI/debug."""
-    with _BRIDGE_DEBUG_LOCK:
-        state = {
-            "last_ok": bool(_BRIDGE_DEBUG_STATE.get("last_ok")),
-            "last_error": str(_BRIDGE_DEBUG_STATE.get("last_error") or ""),
-            "job_id": str(_BRIDGE_DEBUG_STATE.get("last_job_id") or ""),
-            "mails_matched_job_id": list(_BRIDGE_DEBUG_STATE.get("last_mails_matched_job_id") or []),
-        }
-    return jsonify({"ok": True, "bridge": state})
-
-
-@app.post("/api/accounting/bridge/pull")
-def api_accounting_bridge_pull_once():
-    """Manual pull from bridge endpoint (same processing path as periodic poller)."""
-    if not PMTA_BRIDGE_PULL_URL:
-        return jsonify({"ok": False, "error": "bridge pull URL is not configured"}), 400
-    return jsonify(_poll_accounting_bridge_once())
-
-
-@app.post("/api/accounting/bridge/pull_filtered")
-def api_accounting_bridge_pull_filtered():
+@app.post("/api/accounting/pull")
+def api_accounting_pull():
     """Pull lines from bridge for a job-id, filter/dedupe/classify, and persist."""
     payload = request.get_json(silent=True) if request.data else {}
     payload = payload if isinstance(payload, dict) else {}
     job_id = (
-        (request.headers.get("X-Job-ID") or "").strip()
-        or str(payload.get("job_id") or "").strip()
+        str(payload.get("job_id") or "").strip()
         or str(request.args.get("job_id") or "").strip()
     )
     job_id = _normalize_job_id(job_id)
     if not job_id:
-        return jsonify({"ok": False, "error": "missing_job_id (send X-Job-ID or job_id)"}), 400
+        return jsonify({"ok": False, "error": "missing_job_id (send job_id in JSON body or query param)"}), 400
 
     pulled = _pull_bridge_lines_for_job(job_id)
     if not bool(pulled.get("ok")):
@@ -11068,12 +9726,14 @@ def api_accounting_bridge_pull_filtered():
 
     lines = pulled.get("lines") if isinstance(pulled.get("lines"), list) else []
     filtered = filter_accounting_lines(lines, job_id=job_id)
-    inserted, ignored_db = db_insert_accounting_filtered(filtered.get("rows") or [])
+    inserted, ignored_db = db_insert_accounting_events(filtered.get("rows") or [])
 
     unique_lines = int(filtered.get("unique_lines") or 0)
-    ignored_total = max(0, int(filtered.get("received_lines") or 0) - unique_lines) + int(ignored_db or 0)
+    ignored_input_duplicates = max(0, int(filtered.get("received_lines") or 0) - unique_lines)
+    ignored_total = ignored_input_duplicates + int(ignored_db or 0)
+
     app.logger.info(
-        "pull_filtered job_id=%s received=%s unique=%s inserted=%s ignored=%s parse_errors=%s counts=%s",
+        "accounting_pull job_id=%s received=%s unique=%s inserted=%s ignored=%s parse_errors=%s counts=%s",
         job_id,
         filtered.get("received_lines"),
         unique_lines,
@@ -11083,7 +9743,6 @@ def api_accounting_bridge_pull_filtered():
         filtered.get("counts_by_outcome"),
     )
 
-    samples = (filtered.get("rows") or [])[:5]
     return jsonify({
         "ok": True,
         "job_id": job_id,
@@ -11092,13 +9751,17 @@ def api_accounting_bridge_pull_filtered():
         "inserted": int(inserted),
         "ignored_duplicates": int(ignored_total),
         "counts_by_outcome": filtered.get("counts_by_outcome") or {},
-        "parse_errors": int(filtered.get("parse_errors") or 0),
-        "samples": samples,
     })
 
 
-@app.get("/api/jobs/<job_id>/accounting_filtered")
-def api_job_accounting_filtered(job_id: str):
+@app.get("/api/accounting/<job_id>/counts")
+def api_accounting_counts(job_id: str):
+    jid = _normalize_job_id(job_id)
+    return jsonify({"ok": True, "job_id": jid, "counts_by_outcome": db_count_accounting_events(jid)})
+
+
+@app.get("/api/accounting/<job_id>/events")
+def api_accounting_events(job_id: str):
     jid = _normalize_job_id(job_id)
     outcome = (request.args.get("outcome") or "").strip().lower()
     try:
@@ -11110,14 +9773,8 @@ def api_job_accounting_filtered(job_id: str):
     except Exception:
         offset = 0
 
-    rows = db_list_accounting_filtered(jid, outcome=outcome, limit=limit, offset=offset)
+    rows = db_list_accounting_events(jid, outcome=outcome, limit=limit, offset=offset)
     return jsonify({"ok": True, "job_id": jid, "outcome": outcome or None, "limit": limit, "offset": offset, "rows": rows})
-
-
-@app.get("/api/jobs/<job_id>/accounting_filtered/counts")
-def api_job_accounting_filtered_counts(job_id: str):
-    jid = _normalize_job_id(job_id)
-    return jsonify({"ok": True, "job_id": jid, "counts_by_outcome": db_count_accounting_filtered(jid)})
 
 
 @app.post("/start")
