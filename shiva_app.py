@@ -924,6 +924,31 @@ def db_set_outcome(job_id: str, rcpt: str, status: str) -> None:
             conn.close()
 
 
+def db_list_outcome_rcpts(job_id: str, status: str) -> List[str]:
+    jid = (job_id or "").strip()
+    st = (status or "").strip().lower()
+    if not jid or not st:
+        return []
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            rows = conn.execute(
+                "SELECT rcpt FROM job_outcomes WHERE job_id=? AND status=? ORDER BY updated_at DESC",
+                (jid, st),
+            ).fetchall()
+            out: List[str] = []
+            seen: Set[str] = set()
+            for r in rows or []:
+                em = str(r[0] or "").strip().lower()
+                if not em or em in seen:
+                    continue
+                seen.add(em)
+                out.append(em)
+            return out
+        finally:
+            conn.close()
+
+
 def db_get_app_config(key: str) -> Optional[str]:
     k = (key or "").strip()
     if not k:
@@ -5093,7 +5118,13 @@ PAGE_JOB = r"""
     </div>
 
     <div class="card">
-      <h3 style="margin:0 0 10px">Recent Results</h3>
+      <div class="row" style="margin-bottom:8px; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap">
+        <h3 style="margin:0">Recent Results</h3>
+        <div class="row" style="gap:8px; align-items:center; flex-wrap:wrap">
+          <button class="btn" id="extractShivaSentBtn" type="button">Extract mail sent by Shiva</button>
+          <button class="btn" id="extractPmtaDeliveredBtn" type="button">Extract mail sent by PowerMTA</button>
+        </div>
+      </div>
       <div class="row" style="margin-bottom:8px; align-items:center; gap:8px">
         <button class="navBtn" id="resultsPrevBtn" type="button">← Prev</button>
         <button class="navBtn" id="resultsNextBtn" type="button">Next →</button>
@@ -5281,6 +5312,20 @@ PAGE_JOB = r"""
       if(resultsPage >= resultsTotalPages) return;
       resultsPage += 1;
       await tick();
+    });
+  }
+
+  const extractShivaSentBtn = document.getElementById('extractShivaSentBtn');
+  if(extractShivaSentBtn){
+    extractShivaSentBtn.addEventListener('click', () => {
+      window.location.href = `/api/job/${jobId}/extract/shiva-sent`;
+    });
+  }
+
+  const extractPmtaDeliveredBtn = document.getElementById('extractPmtaDeliveredBtn');
+  if(extractPmtaDeliveredBtn){
+    extractPmtaDeliveredBtn.addEventListener('click', () => {
+      window.location.href = `/api/job/${jobId}/extract/pmta-delivered`;
     });
   }
 
@@ -9772,6 +9817,47 @@ def api_job_control(job_id: str):
             return jsonify({"ok": True, "status": job.status, "stop_requested": True})
 
     return jsonify({"ok": False, "error": "invalid action"}), 400
+
+
+@app.get("/api/job/<job_id>/extract/shiva-sent")
+def api_job_extract_shiva_sent(job_id: str):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if (not job) or getattr(job, 'deleted', False):
+            return jsonify({"error": "not found"}), 404
+        rows = list(job.recent_results or [])
+
+    out: List[str] = []
+    seen: Set[str] = set()
+    for rr in rows:
+        if not bool(rr.get("ok")):
+            continue
+        email = str(rr.get("email") or "").strip().lower()
+        if not EMAIL_RE.fullmatch(email) or email in seen:
+            continue
+        seen.add(email)
+        out.append(email)
+
+    body = ("\n".join(out) + ("\n" if out else "")).encode("utf-8")
+    resp = make_response(body)
+    resp.headers["Content-Type"] = "text/plain; charset=utf-8"
+    resp.headers["Content-Disposition"] = f'attachment; filename="{job_id}-shiva-sent.txt"'
+    return resp
+
+
+@app.get("/api/job/<job_id>/extract/pmta-delivered")
+def api_job_extract_pmta_delivered(job_id: str):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if (not job) or getattr(job, 'deleted', False):
+            return jsonify({"error": "not found"}), 404
+
+    out = db_list_outcome_rcpts(job_id, "delivered")
+    body = ("\n".join(out) + ("\n" if out else "")).encode("utf-8")
+    resp = make_response(body)
+    resp.headers["Content-Type"] = "text/plain; charset=utf-8"
+    resp.headers["Content-Disposition"] = f'attachment; filename="{job_id}-pmta-delivered.txt"'
+    return resp
 
 
 @app.post("/api/job/<job_id>/delete")
