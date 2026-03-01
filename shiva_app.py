@@ -1689,6 +1689,21 @@ PAGE_FORM = r"""
 
     .smallBar{height:8px; border-radius:999px; background:rgba(255,255,255,.10); border:1px solid rgba(255,255,255,.12); overflow:hidden}
     .smallBar > div{height:100%; width:0%; background: rgba(53,228,154,.55);}
+    .extractBtn{
+      border:1px solid rgba(122,167,255,.45);
+      background: linear-gradient(135deg, rgba(122,167,255,.32), rgba(53,228,154,.18));
+      color:#fff;
+      font-weight:800;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.16), 0 8px 20px rgba(7,12,28,.35);
+      transition: transform .12s ease, filter .12s ease, box-shadow .12s ease;
+    }
+    .extractBtn:hover{
+      filter:brightness(1.08);
+      transform: translateY(-1px);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.2), 0 10px 24px rgba(7,12,28,.4);
+    }
+    .extractBtn:active{transform: translateY(0)}
+    .extractBtn:disabled{opacity:.65; cursor:not-allowed; transform:none; filter:none; box-shadow:none;}
 
     /* Top navigation (Back to Campaign) */
     .nav{display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:8px 0 14px;}
@@ -2596,6 +2611,8 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
 
       try{
         await saveFormNow();
+        // Keep Domains stats in sync with freshly pasted/edited recipients before starting a new send.
+        refreshDomainsStats();
 
         // If campaign already has jobs (stopped/running/etc), confirm with the user.
         let latest = null;
@@ -2851,6 +2868,14 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
     }
   }
 
+  let _domAutoRefreshTimer = null;
+  function scheduleDomainsAutoRefresh(delayMs = 550){
+    if(_domAutoRefreshTimer) clearTimeout(_domAutoRefreshTimer);
+    _domAutoRefreshTimer = setTimeout(() => {
+      refreshDomainsStats();
+    }, Math.max(150, Number(delayMs || 0)));
+  }
+
   async function refreshDomainsLive(){
     const liveEl = document.getElementById('domLive');
     try{
@@ -2883,6 +2908,19 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
   if(domBtn){ domBtn.addEventListener('click', refreshDomainsStats); }
   const domQ = document.getElementById('domQ');
   if(domQ){ domQ.addEventListener('input', renderDomainsTables); }
+
+  const recipientsEl = q('recipients');
+  const safeListEl = q('maillist_safe');
+  const recipientsFileEl = q('recipients_file');
+  [recipientsEl, safeListEl].forEach((el) => {
+    if(!el) return;
+    el.addEventListener('input', () => scheduleDomainsAutoRefresh(650));
+    el.addEventListener('paste', () => scheduleDomainsAutoRefresh(450));
+    el.addEventListener('change', () => scheduleDomainsAutoRefresh(350));
+  });
+  if(recipientsFileEl){
+    recipientsFileEl.addEventListener('change', () => scheduleDomainsAutoRefresh(350));
+  }
 
   // auto-load planned stats once, then live poll will keep progress updated
   refreshDomainsStats();
@@ -4144,11 +4182,17 @@ This will remove it from Jobs history.`);
     });
   }
 
-  const cards = Array.from(document.querySelectorAll('.job[data-jobid]'));
+  let cards = Array.from(document.querySelectorAll('.job[data-jobid]'));
   cards.forEach(bindControls);
 
+  function refreshCardsCollection(){
+    cards = Array.from(document.querySelectorAll('.job[data-jobid]'));
+    return cards;
+  }
+
   async function tickAll(){
-    for(const c of cards){
+    const currentCards = refreshCardsCollection();
+    for(const c of currentCards){
       await tickCard(c);
     }
   }
@@ -4184,12 +4228,40 @@ This will remove it from Jobs history.`);
     }
   }
 
-  document.getElementById('btnRefreshAll')?.addEventListener('click', tickAll);
+  let jobsDigestSignature = '';
+  const campaignId = new URLSearchParams(location.search).get('c') || '';
+
+  async function refreshJobsDigest(){
+    try{
+      const qp = campaignId ? `?c=${encodeURIComponent(campaignId)}` : '';
+      const r = await fetch(`/api/jobs_digest${qp}`);
+      const j = await r.json().catch(()=>({}));
+      if(!r.ok || !j || !j.ok || !Array.isArray(j.jobs)) return;
+
+      const ids = j.jobs.map(x => (x && x.id ? x.id : '')).filter(Boolean);
+      const sig = ids.join('|');
+      if(!jobsDigestSignature){
+        jobsDigestSignature = sig;
+        return;
+      }
+      if(sig !== jobsDigestSignature){
+        jobsDigestSignature = sig;
+        location.reload();
+      }
+    }catch(e){ /* ignore */ }
+  }
+
+  document.getElementById('btnRefreshAll')?.addEventListener('click', async () => {
+    await tickAll();
+    await refreshJobsDigest();
+  });
 
   tickAll();
   bridgeDebugTick();
+  refreshJobsDigest();
   setInterval(tickAll, 1200);
   setInterval(bridgeDebugTick, 5000);
+  setInterval(refreshJobsDigest, 1500);
 </script>
 </body>
 </html>
@@ -5039,6 +5111,21 @@ PAGE_JOB = r"""
 
     .smallBar{height:8px; border-radius:999px; background:rgba(255,255,255,.10); border:1px solid rgba(255,255,255,.12); overflow:hidden}
     .smallBar > div{height:100%; width:0%; background: rgba(53,228,154,.55);}
+    .extractBtn{
+      border:1px solid rgba(122,167,255,.45);
+      background: linear-gradient(135deg, rgba(122,167,255,.32), rgba(53,228,154,.18));
+      color:#fff;
+      font-weight:800;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.16), 0 8px 20px rgba(7,12,28,.35);
+      transition: transform .12s ease, filter .12s ease, box-shadow .12s ease;
+    }
+    .extractBtn:hover{
+      filter:brightness(1.08);
+      transform: translateY(-1px);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.2), 0 10px 24px rgba(7,12,28,.4);
+    }
+    .extractBtn:active{transform: translateY(0)}
+    .extractBtn:disabled{opacity:.65; cursor:not-allowed; transform:none; filter:none; box-shadow:none;}
   </style>
 </head>
 <body>
@@ -5121,8 +5208,8 @@ PAGE_JOB = r"""
       <div class="row" style="margin-bottom:8px; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap">
         <h3 style="margin:0">Recent Results</h3>
         <div class="row" style="gap:8px; align-items:center; flex-wrap:wrap">
-          <button class="btn" id="extractShivaSentBtn" type="button">Extract mail sent by Shiva</button>
-          <button class="btn" id="extractPmtaDeliveredBtn" type="button">Extract mail sent by PowerMTA</button>
+          <button class="btn extractBtn" id="extractShivaSentBtn" type="button">Extract mail sent by Shiva</button>
+          <button class="btn extractBtn" id="extractPmtaDeliveredBtn" type="button">Extract mail sent by PowerMTA</button>
         </div>
       </div>
       <div class="row" style="margin-bottom:8px; align-items:center; gap:8px">
@@ -10150,6 +10237,27 @@ def api_campaign_latest_job(campaign_id: str):
         }
     )
     return attach_browser_cookie(resp, bid, is_new)
+
+
+@app.get("/api/jobs_digest")
+def api_jobs_digest():
+    """Small jobs digest used by Jobs page auto-refresh (new send detection)."""
+    cid = (request.args.get("c") or "").strip()
+    with JOBS_LOCK:
+        items = [j for j in JOBS.values() if not getattr(j, 'deleted', False)]
+        if cid:
+            items = [j for j in items if (j.campaign_id or "") == cid]
+        items.sort(key=lambda x: x.created_at, reverse=True)
+        payload = [
+            {
+                "id": j.id,
+                "campaign_id": j.campaign_id,
+                "created_at": j.created_at,
+                "status": j.status,
+            }
+            for j in items
+        ]
+    return jsonify({"ok": True, "jobs": payload})
 
 
 # -------------------------
