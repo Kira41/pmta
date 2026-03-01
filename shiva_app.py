@@ -4207,7 +4207,7 @@ This will remove it from Jobs history.`);
           last_ok: !!b.last_ok,
           last_error: b.last_error || '',
           job_id: b.job_id || '',
-          lines_sample: Array.isArray(b.lines_sample) ? b.lines_sample : [],
+          mails_matched_job_id: Array.isArray(b.mails_matched_job_id) ? b.mails_matched_job_id : [],
         });
       } else {
         console.warn('[Bridge↔Shiva Debug] bridge status failed', {http_status: r.status, payload: j});
@@ -7713,7 +7713,7 @@ _BRIDGE_DEBUG_STATE: Dict[str, Any] = {
     "last_ok": False,
     "last_error": "",
     "last_job_id": "",
-    "last_lines_sample": [],
+    "last_mails_matched_job_id": [],
 }
 
 _BRIDGE_POLLER_LOCK = threading.Lock()
@@ -8238,7 +8238,7 @@ def _bridge_pick_target(targets: List[Dict[str, str]]) -> Dict[str, str]:
 def _poll_accounting_bridge_once() -> dict:
     url = (PMTA_BRIDGE_PULL_URL or "").strip()
     if not url:
-        _bridge_debug_update(last_ok=False, last_error="bridge_pull_url_not_configured", last_lines_sample=[])
+        _bridge_debug_update(last_ok=False, last_error="bridge_pull_url_not_configured", last_mails_matched_job_id=[])
         return {"ok": False, "error": "bridge_pull_url_not_configured", "processed": 0}
 
     # Accept a bare host:port and default to HTTP to avoid urlopen failures
@@ -8261,7 +8261,7 @@ def _poll_accounting_bridge_once() -> dict:
     target = _bridge_pick_target(_bridge_collect_pull_targets())
     job_id = str((target or {}).get("x-job-id") or "").strip().lower()
     if not job_id:
-        _bridge_debug_update(last_ok=False, last_error="no_target_job_id", last_lines_sample=[])
+        _bridge_debug_update(last_ok=False, last_error="no_target_job_id", last_mails_matched_job_id=[])
         return {"ok": False, "error": "no_target_job_id", "processed": 0}
 
     headers = {"Accept": "application/json"}
@@ -8274,19 +8274,23 @@ def _poll_accounting_bridge_once() -> dict:
         with urlopen(req, timeout=20) as resp:
             raw = (resp.read() or b"{}").decode("utf-8", errors="replace")
     except Exception as e:
-        _bridge_debug_update(last_ok=False, last_error=f"bridge_request_failed: {e}", last_job_id=job_id, last_lines_sample=[])
+        _bridge_debug_update(last_ok=False, last_error=f"bridge_request_failed: {e}", last_job_id=job_id, last_mails_matched_job_id=[])
         return {"ok": False, "error": f"bridge_request_failed: {e}", "processed": 0}
 
     try:
         obj = json.loads(raw)
     except Exception:
-        _bridge_debug_update(last_ok=False, last_error="invalid_bridge_json", last_job_id=job_id, last_lines_sample=[])
+        _bridge_debug_update(last_ok=False, last_error="invalid_bridge_json", last_job_id=job_id, last_mails_matched_job_id=[])
         return {"ok": False, "error": "invalid_bridge_json", "processed": 0}
 
     bridge_rows = obj.get("lines") if isinstance(obj, dict) else None
     if not isinstance(bridge_rows, list):
-        _bridge_debug_update(last_ok=False, last_error="invalid_bridge_payload", last_job_id=job_id, last_lines_sample=[])
+        _bridge_debug_update(last_ok=False, last_error="invalid_bridge_payload", last_job_id=job_id, last_mails_matched_job_id=[])
         return {"ok": False, "error": "invalid_bridge_payload", "processed": 0}
+
+    matched_emails = obj.get("mails_matched_job_id") if isinstance(obj, dict) else None
+    if not isinstance(matched_emails, list):
+        matched_emails = []
 
     processed = 0
     for row in bridge_rows:
@@ -8306,7 +8310,7 @@ def _poll_accounting_bridge_once() -> dict:
         last_ok=True,
         last_error="",
         last_job_id=job_id,
-        last_lines_sample=[dict(x) for x in bridge_rows],
+        last_mails_matched_job_id=[str(x or "").strip().lower() for x in matched_emails if str(x or "").strip()],
     )
     return {"ok": True, "processed": processed, "count": len(bridge_rows), "job_id": job_id}
 
@@ -10717,7 +10721,7 @@ def api_accounting_bridge_status():
             "last_ok": bool(_BRIDGE_DEBUG_STATE.get("last_ok")),
             "last_error": str(_BRIDGE_DEBUG_STATE.get("last_error") or ""),
             "job_id": str(_BRIDGE_DEBUG_STATE.get("last_job_id") or ""),
-            "lines_sample": list(_BRIDGE_DEBUG_STATE.get("last_lines_sample") or []),
+            "mails_matched_job_id": list(_BRIDGE_DEBUG_STATE.get("last_mails_matched_job_id") or []),
         }
     return jsonify({"ok": True, "bridge": state})
 

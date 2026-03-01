@@ -155,6 +155,12 @@ def _event_job_id(ev: Dict[str, Any]) -> str:
     return _extract_job_id_from_text(str(ev.get("raw") or ""))
 
 
+def _event_explicit_job_id(ev: Dict[str, Any]) -> str:
+    """Return only explicit job-id fields from accounting rows (no message-id inference)."""
+    jid = _event_value(ev, "header_x-job-id", "x-job-id", "job-id", "job_id", "jobid")
+    return _normalize_job_id(jid)
+
+
 def _walk_accounting_events(patterns: List[str]):
     files = _find_matching_files(patterns)
     for fp in files:
@@ -773,8 +779,11 @@ def pull_latest_accounting(
 
     patterns = ALLOWED_KINDS.get("acct") or ["acct-*.csv"]
     rows: List[Dict[str, str]] = []
+    matched_emails: List[str] = []
     for ev in _walk_accounting_events(patterns):
-        ev_jid = _event_job_id(ev)
+        # Use explicit accounting job-id only.
+        # This avoids matching older rows by message-id-derived ids.
+        ev_jid = _event_explicit_job_id(ev)
         if ev_jid != jid:
             continue
 
@@ -814,12 +823,16 @@ def pull_latest_accounting(
             continue
 
         rows.append({"type": out_type, "email": email, "job_id": jid})
+        matched_emails.append(email)
+
+    unique_matched_emails = sorted(set(matched_emails))
 
     return {
         "ok": True,
         "job_id": jid,
         "count": len(rows),
         "lines": rows,
+        "mails_matched_job_id": unique_matched_emails,
     }
 
 
