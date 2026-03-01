@@ -3388,12 +3388,12 @@ This will remove it from Jobs history.`);
     const pmtaOk = !!pmtaDom.ok;
     const pmtaMap = pmtaDom.domains || {};
     const chunkStates = Array.isArray(j.chunk_states) ? j.chunk_states : [];
-    const backoffDomains = new Set();
+    const domainStateMap = new Map();
     for(const x of chunkStates){
-      const st = (x && x.status ? x.status : '').toString().trim().toLowerCase();
-      if(st !== 'backoff') continue;
       const rd = (x && x.receiver_domain ? x.receiver_domain : '').toString().trim().toLowerCase();
-      if(rd) backoffDomains.add(rd);
+      if(!rd) continue;
+      const st = (x && x.status ? x.status : '').toString().trim().toLowerCase();
+      domainStateMap.set(rd, st);
     }
 
     const entries = Object.entries(plan).map(([dom, p]) => {
@@ -3417,7 +3417,8 @@ This will remove it from Jobs history.`);
       elLine.innerHTML = entries.map(x => {
         const flag = x.active ? ' 🔥' : '';
         const domKey = (x.dom || '').toString().trim().toLowerCase();
-        const backoffFlag = backoffDomains.has(domKey) ? ' <span class="no">(backoff)</span>' : '';
+        const isBackoffActive = domainStateMap.get(domKey) === 'backoff' && x.done < x.pp;
+        const backoffFlag = isBackoffActive ? ' <span class="no">(backoff)</span>' : '';
         const pm = pmtaMap[x.dom] || {};
         const q = (pm && pm.queued !== undefined && pm.queued !== null) ? pm.queued : '—';
         const d = (pm && pm.deferred !== undefined && pm.deferred !== null) ? pm.deferred : '—';
@@ -3430,7 +3431,8 @@ This will remove it from Jobs history.`);
     if(elBars){
       elBars.innerHTML = entries.map(x => {
         const domKey = (x.dom || '').toString().trim().toLowerCase();
-        const backoffFlag = backoffDomains.has(domKey) ? ' <span class="no">(backoff)</span>' : '';
+        const isBackoffActive = domainStateMap.get(domKey) === 'backoff' && x.done < x.pp;
+        const backoffFlag = isBackoffActive ? ' <span class="no">(backoff)</span>' : '';
         const bar = `<div class="smallBar"><div style="width:${x.pct}%"></div></div>`;
         return `<div style="margin-top:10px">`+
           `<div class="mini"><b>${esc(x.dom)}</b>${backoffFlag} · ${x.done}/${x.pp} (${x.pct}%)${x.active ? ' · active' : ''}</div>`+
@@ -5105,18 +5107,19 @@ PAGE_JOB = r"""
       return {dom, p, s, f, done2, pct: pct(done2, p)};
     }).sort((a,b)=>b.p-a.p).slice(0, 300);
 
-    const backoffDomains = new Set();
+    const domainStateMap = new Map();
     for(const x of chunkStates){
-      const st = (x && x.status ? x.status : '').toString().trim().toLowerCase();
-      if(st !== 'backoff') continue;
       const rd = (x.receiver_domain || '').toString().trim().toLowerCase();
-      if(rd) backoffDomains.add(rd);
+      if(!rd) continue;
+      const st = (x && x.status ? x.status : '').toString().trim().toLowerCase();
+      domainStateMap.set(rd, st);
     }
     const domBody = document.getElementById('domState');
     if(domBody){
       domBody.innerHTML = rows.map(x => {
         const bar = `<div class="smallBar"><div style="width:${x.pct}%"></div></div>`;
-        const showBackoff = backoffDomains.has((x.dom || '').toString().trim().toLowerCase());
+        const domKey = (x.dom || '').toString().trim().toLowerCase();
+        const showBackoff = domainStateMap.get(domKey) === 'backoff' && x.done2 < x.p;
         const domLabel = showBackoff ? `${esc(x.dom)} <span class="no">(backoff)</span>` : esc(x.dom);
         return `<tr>`+
           `<td>${domLabel}</td>`+
@@ -9080,6 +9083,7 @@ def smtp_send_job(
                         "attempt": attempt,
                         "next_retry_ts": 0,
                         "reason": "",
+                        "receiver_domain": target_domain,
                     })
                     job.log("INFO", f"Chunk {chunk_idx+1} [{target_domain}]: sending size={len(chunk)} sender={fe} workers={workers2}")
 
@@ -9122,6 +9126,7 @@ def smtp_send_job(
                         "attempt": attempt,
                         "next_retry_ts": 0,
                         "reason": "",
+                        "receiver_domain": target_domain,
                     })
                 if from_emails2:
                     provider_sender_cursor[target_domain] = (sender_cursor_base + 1) % max(1, len(from_emails2))
