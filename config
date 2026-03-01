@@ -2,10 +2,10 @@
 # PowerMTA config - STRICT 1:1 DOMAIN -> IP (MAIL FROM routing)
 #
 # REQUIRED 1:1 mapping (ONLY send each domain using its linked IP):
-#   mediapaypro.cloud -> 194.116.172.135   (HELO/PTR: mail.mediapaypro.cloud)
-#   mediapaypro.info  -> 194.116.172.136   (HELO/PTR: s2.mediapaypro.info)
-#   mediapaypro.live  -> 194.116.172.137   (HELO/PTR: s3.mediapaypro.live)
-#   mediapaypro.vip   -> 194.116.172.138   (HELO/PTR: s4.mediapaypro.vip)
+#   llavedecobre.com -> 194.116.172.135   (HELO/PTR: mail.llavedecobre.com)
+#   brasaf-sa.com  -> 194.116.172.136   (HELO/PTR: mail.brasaf-sa.com)
+#   vilabeerrestaurante.com.br  -> 194.116.172.137   (HELO/PTR: mail.vilabeerrestaurante.com.br)
+#   golddrive-in.com.br   -> 194.116.172.138   (HELO/PTR: mail.golddrive-in.com.br)
 #   mediapaypro.work  -> 194.116.172.139   (HELO/PTR: s5.mediapaypro.work)
 #
 # IMPORTANT:
@@ -39,6 +39,11 @@ spool /var/spool/pmta
 ############################################################################
 <acct-file /var/log/pmta/acct.csv>
     max-size 50M
+    records d,b,t
+    # Include app trace headers in CSV so Shiva can match outcomes reliably.
+    record-fields d *,header_X-Job-ID,header_X-Campaign-ID,header_Message-Id
+    record-fields b *,header_X-Job-ID,header_X-Campaign-ID,header_Message-Id
+    record-fields t *,header_X-Job-ID,header_X-Campaign-ID,header_Message-Id
 </acct-file>
 
 <acct-file /var/log/pmta/diag.csv>
@@ -60,24 +65,24 @@ http-access 0.0.0.0/0 monitor
 ############################################################################
 # STRICT ROUTING: MAIL FROM domain -> specific virtual-mta
 # NOTE: This routes by ENVELOPE FROM (MAIL FROM). Your sending app must use
-#       envelope-from @mediapaypro.* accordingly.
+#       envelope-from should match one of the domains below.
 ############################################################################
 <pattern-list mpp-mailfrom-routing>
-    # mediapaypro.cloud -> pmta-mpp-cloud (194.116.172.135)
-    mail-from /@mediapaypro\.cloud$/        virtual-mta=pmta-mpp-cloud
-    mail-from /@mail\.mediapaypro\.cloud$/  virtual-mta=pmta-mpp-cloud
+    # llavedecobre.com -> pmta-mpp-llavedecobre (194.116.172.135)
+    mail-from /@llavedecobre\.com$/        virtual-mta=pmta-mpp-llavedecobre
+    mail-from /@mail\.llavedecobre\.com$/  virtual-mta=pmta-mpp-llavedecobre
 
-    # mediapaypro.info -> pmta-mpp-info (194.116.172.136)
-    mail-from /@mediapaypro\.info$/         virtual-mta=pmta-mpp-info
-    mail-from /@s2\.mediapaypro\.info$/     virtual-mta=pmta-mpp-info
+    # brasaf-sa.com -> pmta-mpp-brasaf (194.116.172.136)
+    mail-from /@brasaf-sa\.com$/        virtual-mta=pmta-mpp-brasaf
+    mail-from /@mail\.brasaf-sa\.com$/   virtual-mta=pmta-mpp-brasaf
 
-    # mediapaypro.live -> pmta-mpp-live (194.116.172.137)
-    mail-from /@mediapaypro\.live$/         virtual-mta=pmta-mpp-live
-    mail-from /@s3\.mediapaypro\.live$/     virtual-mta=pmta-mpp-live
+    # vilabeerrestaurante.com.br -> pmta-mpp-vilabeerrestaurante (194.116.172.137)
+    mail-from /@vilabeerrestaurante.com\.br$/         virtual-mta=pmta-mpp-vilabeerrestaurante
+    mail-from /@mail\.vilabeerrestaurante.com\.br$/     virtual-mta=pmta-mpp-vilabeerrestaurante
 
-    # mediapaypro.vip -> pmta-mpp-vip (194.116.172.138)
-    mail-from /@mediapaypro\.vip$/          virtual-mta=pmta-mpp-vip
-    mail-from /@s4\.mediapaypro\.vip$/      virtual-mta=pmta-mpp-vip
+    # golddrive-in.com.br -> pmta-mpp-golddrive (194.116.172.138)
+    mail-from /@golddrive-in.com\.br$/          virtual-mta=pmta-mpp-golddrive
+    mail-from /@mail\.golddrive-in.com\.br$/      virtual-mta=pmta-mpp-golddrive
 
     # mediapaypro.work -> pmta-mpp-work (194.116.172.139)
     mail-from /@mediapaypro\.work$/         virtual-mta=pmta-mpp-work
@@ -136,28 +141,28 @@ http-access 0.0.0.0/0 monitor
 # VIRTUAL MTAS (1:1) + DKIM per domain
 ############################################################################
 
-# mediapaypro.cloud -> 194.116.172.135
-<virtual-mta pmta-mpp-cloud>
-    smtp-source-host 194.116.172.135 mail.mediapaypro.cloud
-    domain-key dkim,mediapaypro.cloud,/root/mediapaypro.cloud/dkim.pem
+# llavedecobre.com -> 194.116.172.135
+<virtual-mta pmta-mpp-llavedecobre>
+    smtp-source-host 194.116.172.135 mail.llavedecobre.com
+    domain-key dkim,llavedecobre.com,/root/llavedecobre.com/dkim.pem
 </virtual-mta>
 
-# mediapaypro.info -> 194.116.172.136
-<virtual-mta pmta-mpp-info>
-    smtp-source-host 194.116.172.136 s2.mediapaypro.info
-    domain-key dkim,mediapaypro.info,/root/mediapaypro.info/dkim.pem
+# brasaf-sa.com -> 194.116.172.136
+<virtual-mta pmta-mpp-brasaf>
+    smtp-source-host 194.116.172.136 mail.brasaf-sa.com
+    domain-key dkim,brasaf-sa.com,/root/brasaf-sa.com/dkim.pem
 </virtual-mta>
 
-# mediapaypro.live -> 194.116.172.137
-<virtual-mta pmta-mpp-live>
-    smtp-source-host 194.116.172.137 s3.mediapaypro.live
-    domain-key dkim,mediapaypro.live,/root/mediapaypro.live/dkim.pem
+# vilabeerrestaurante.com.br -> 194.116.172.137
+<virtual-mta pmta-mpp-vilabeerrestaurante>
+    smtp-source-host 194.116.172.137 mail.vilabeerrestaurante.com.br
+    domain-key dkim,vilabeerrestaurante.com.br,/root/vilabeerrestaurante.com.br/dkim.pem
 </virtual-mta>
 
-# mediapaypro.vip -> 194.116.172.138
-<virtual-mta pmta-mpp-vip>
-    smtp-source-host 194.116.172.138 s4.mediapaypro.vip
-    domain-key dkim,mediapaypro.vip,/root/mediapaypro.vip/dkim.pem
+# golddrive-in.com.br -> 194.116.172.138
+<virtual-mta pmta-mpp-golddrive>
+    smtp-source-host 194.116.172.138 mail.golddrive-in.com.br
+    domain-key dkim,golddrive-in.com.br,/root/golddrive-in.com.br/dkim.pem
 </virtual-mta>
 
 # mediapaypro.work -> 194.116.172.139
