@@ -6581,6 +6581,7 @@ except Exception:
 # Uses PMTA monitor base derived from SMTP host: http://<smtp_host>:8080
 PMTA_QUEUE_BACKOFF = (os.getenv("PMTA_QUEUE_BACKOFF", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
 PMTA_QUEUE_REQUIRED = (os.getenv("PMTA_QUEUE_REQUIRED", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+SHIVA_DISABLE_BACKOFF = (os.getenv("SHIVA_DISABLE_BACKOFF", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
 
 try:
     PMTA_LIVE_POLL_S = float((os.getenv("PMTA_LIVE_POLL_S", "3") or "3").strip())
@@ -8778,7 +8779,26 @@ def smtp_send_job(
                     except Exception:
                         pmta_sig = {"enabled": True, "ok": False, "blocked": False, "slow": None, "reason": "pmta policy error"}
 
-                blocked = (sc is not None and sc > job.spam_threshold) or bl_listed or bool(pmta_reason)
+                spam_blocked = (sc is not None and sc > job.spam_threshold)
+                blacklist_blocked = bool(bl_listed)
+                pmta_blocked = bool(pmta_reason)
+                blocked_reasons = []
+                if spam_blocked:
+                    blocked_reasons.append(f"spam_score={sc:.2f}>{job.spam_threshold:.1f}")
+                if blacklist_blocked:
+                    blocked_reasons.append(f"blacklist={bl_detail}")
+                if pmta_blocked:
+                    blocked_reasons.append(f"pmta={pmta_reason}")
+
+                blocked = spam_blocked or blacklist_blocked or pmta_blocked
+
+                if blocked and SHIVA_DISABLE_BACKOFF:
+                    with JOBS_LOCK:
+                        job.log(
+                            "WARN",
+                            f"Chunk {chunk_idx+1} [{target_domain}]: backoff bypassed (SHIVA_DISABLE_BACKOFF=1) ({' '.join(blocked_reasons)})",
+                        )
+                    blocked = False
 
                 with JOBS_LOCK:
                     job.current_chunk = chunk_idx
@@ -8796,14 +8816,7 @@ def smtp_send_job(
 
                 if blocked:
                     attempt += 1
-                    reason = []
-                    if sc is not None and sc > job.spam_threshold:
-                        reason.append(f"spam_score={sc:.2f}>{job.spam_threshold:.1f}")
-                    if bl_detail:
-                        reason.append(f"blacklist={bl_detail}")
-                    if pmta_reason:
-                        reason.append(f"pmta={pmta_reason}")
-                    rtxt = " ".join(reason) or "blocked"
+                    rtxt = " ".join(blocked_reasons) or "blocked"
 
                     if attempt > max_backoff_retries:
                         with JOBS_LOCK:
