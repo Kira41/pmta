@@ -500,7 +500,11 @@ def _event_matches_filter(ev: Dict[str, Any], filters: Dict[str, str]) -> bool:
 
     if job_id:
         vals = _values_for("x-job-id", "job-id", "jobid")
-        if job_id not in vals:
+        normalized_vals = {_normalize_job_id(v) for v in vals if v}
+        derived_jid = _event_job_id(ev)
+        if derived_jid:
+            normalized_vals.add(derived_jid)
+        if job_id not in normalized_vals:
             return False
 
     if campaign_id:
