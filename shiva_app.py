@@ -3387,6 +3387,14 @@ This will remove it from Jobs history.`);
     const pmtaDom = j.pmta_domains || {};
     const pmtaOk = !!pmtaDom.ok;
     const pmtaMap = pmtaDom.domains || {};
+    const chunkStates = Array.isArray(j.chunk_states) ? j.chunk_states : [];
+    const backoffDomains = new Set();
+    for(const x of chunkStates){
+      const st = (x && x.status ? x.status : '').toString().trim().toLowerCase();
+      if(st !== 'backoff') continue;
+      const rd = (x && x.receiver_domain ? x.receiver_domain : '').toString().trim().toLowerCase();
+      if(rd) backoffDomains.add(rd);
+    }
 
     const entries = Object.entries(plan).map(([dom, p]) => {
       const pp = Number(p||0);
@@ -3408,20 +3416,24 @@ This will remove it from Jobs history.`);
     if(elLine){
       elLine.innerHTML = entries.map(x => {
         const flag = x.active ? ' 🔥' : '';
+        const domKey = (x.dom || '').toString().trim().toLowerCase();
+        const backoffFlag = backoffDomains.has(domKey) ? ' <span class="no">(backoff)</span>' : '';
         const pm = pmtaMap[x.dom] || {};
         const q = (pm && pm.queued !== undefined && pm.queued !== null) ? pm.queued : '—';
         const d = (pm && pm.deferred !== undefined && pm.deferred !== null) ? pm.deferred : '—';
         const a = (pm && pm.active !== undefined && pm.active !== null) ? pm.active : '—';
         const pmInfo = (pmtaOk && (x.dom in pmtaMap)) ? ` · pmta(q=${q} def=${d} act=${a})` : '';
-        return `${esc(x.dom)}: <span class="ok">${x.ss}</span>/<b>${x.pp}</b> (fail <span class="no">${x.ff}</span>)${flag}${pmInfo}`;
+        return `${esc(x.dom)}${backoffFlag}: <span class="ok">${x.ss}</span>/<b>${x.pp}</b> (fail <span class="no">${x.ff}</span>)${flag}${pmInfo}`;
       }).join('<br>');
     }
 
     if(elBars){
       elBars.innerHTML = entries.map(x => {
+        const domKey = (x.dom || '').toString().trim().toLowerCase();
+        const backoffFlag = backoffDomains.has(domKey) ? ' <span class="no">(backoff)</span>' : '';
         const bar = `<div class="smallBar"><div style="width:${x.pct}%"></div></div>`;
         return `<div style="margin-top:10px">`+
-          `<div class="mini"><b>${esc(x.dom)}</b> · ${x.done}/${x.pp} (${x.pct}%)${x.active ? ' · active' : ''}</div>`+
+          `<div class="mini"><b>${esc(x.dom)}</b>${backoffFlag} · ${x.done}/${x.pp} (${x.pct}%)${x.active ? ' · active' : ''}</div>`+
           `${bar}`+
         `</div>`;
       }).join('');
@@ -5095,17 +5107,16 @@ PAGE_JOB = r"""
 
     const backoffDomains = new Set();
     for(const x of chunkStates){
-      if((x && x.status) !== 'backoff') continue;
+      const st = (x && x.status ? x.status : '').toString().trim().toLowerCase();
+      if(st !== 'backoff') continue;
       const rd = (x.receiver_domain || '').toString().trim().toLowerCase();
       if(rd) backoffDomains.add(rd);
     }
-    const singleDomainBackoff = rows.length === 1 && (rows[0].p > rows[0].done2) && backoffDomains.has((rows[0].dom || '').toString().trim().toLowerCase());
-
     const domBody = document.getElementById('domState');
     if(domBody){
       domBody.innerHTML = rows.map(x => {
         const bar = `<div class="smallBar"><div style="width:${x.pct}%"></div></div>`;
-        const showBackoff = singleDomainBackoff && ((x.dom || '').toString().trim().toLowerCase() === (rows[0].dom || '').toString().trim().toLowerCase());
+        const showBackoff = backoffDomains.has((x.dom || '').toString().trim().toLowerCase());
         const domLabel = showBackoff ? `${esc(x.dom)} <span class="no">(backoff)</span>` : esc(x.dom);
         return `<tr>`+
           `<td>${domLabel}</td>`+
