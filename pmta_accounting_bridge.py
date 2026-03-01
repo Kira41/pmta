@@ -384,31 +384,32 @@ def _event_matches_filter(ev: Dict[str, Any], filters: Dict[str, str]) -> bool:
     campaign_id = _normalize_match_value(filters.get("campaign_id"))
     message_id = _normalize_match_value(filters.get("message_id"))
 
+    def _values_for(*needles: str) -> List[str]:
+        vals: List[str] = []
+        seen: set = set()
+        for k, v in normalized.items():
+            kk = str(k or "")
+            vv = _normalize_match_value(v)
+            if not vv:
+                continue
+            if kk in needles or any(n in kk for n in needles):
+                if vv not in seen:
+                    seen.add(vv)
+                    vals.append(vv)
+        return vals
+
     if job_id:
-        vals = [
-            normalized.get("x-job-id", ""),
-            normalized.get("job-id", ""),
-            normalized.get("jobid", ""),
-        ]
+        vals = _values_for("x-job-id", "job-id", "jobid")
         if job_id not in vals:
             return False
 
     if campaign_id:
-        vals = [
-            normalized.get("x-campaign-id", ""),
-            normalized.get("campaign-id", ""),
-            normalized.get("cid", ""),
-        ]
+        vals = _values_for("x-campaign-id", "campaign-id", "cid")
         if campaign_id not in vals:
             return False
 
     if message_id:
-        vals = [
-            normalized.get("message-id", ""),
-            normalized.get("msgid", ""),
-            normalized.get("messageid", ""),
-            normalized.get("header-message-id", ""),
-        ]
+        vals = _values_for("message-id", "msgid", "messageid", "header-message-id")
         if message_id not in vals:
             return False
 
