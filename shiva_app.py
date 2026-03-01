@@ -3176,11 +3176,11 @@ PAGE_JOBS = r"""
             <div class="titleRow">
               <div style="font-weight:900">Job <code>{{j.id}}</code></div>
               <div class="pill" data-k="status">{{j.status}}</div>
-              <div class="pill" data-k="speed">0 epm</div>
-              <div class="pill" data-k="eta">ETA —</div>
+              <div class="pill" data-k="speed">0 epm <span class="tip" data-tip="Estimated send speed in emails per minute, based on recent throughput.">ⓘ</span></div>
+              <div class="pill" data-k="eta">ETA — <span class="tip" data-tip="Estimated time remaining for this job using the current send rate.">ⓘ</span></div>
             </div>
             <div class="mini">Created: <span class="muted">{{j.created_at}}</span></div>
-            <div class="mini" data-k="alerts">—</div>
+            <div class="mini" data-k="alerts">Alerts: — <span class="tip" data-tip="Live warning summary for backoff, abandoned chunks, high fail ratio, or near-threshold spam.">ⓘ</span></div>
           </div>
 
           <div class="nav" style="margin-top:0">
@@ -3778,16 +3778,23 @@ This will remove it from Jobs history.`);
       return `<span class="${cls}">${esc(label)}</span>`;
     }
 
-    function _box(title, tagTone, tagLabel, inner){
+    function _titleWithTip(label, tipText){
+      const safeLabel = esc(label || '');
+      if(!tipText) return safeLabel;
+      return `${safeLabel} <span class="tip" data-tip="${esc(tipText)}">ⓘ</span>`;
+    }
+
+    function _box(titleHtml, tagTone, tagLabel, inner){
       return `<div class="pmtaBox">`+
-        `<div class="pmtaTitle"><span>${esc(title)}</span>${tagLabel ? _tagHtml(tagTone, tagLabel) : ''}</div>`+
+        `<div class="pmtaTitle"><span>${titleHtml}</span>${tagLabel ? _tagHtml(tagTone, tagLabel) : ''}</div>`+
         (inner || '')+
       `</div>`;
     }
 
-    function _kv(k, v, tone, big){
+    function _kv(k, v, tone, big, tipText){
       const cls = 'pmtaVal' + (tone ? (' ' + tone) : '') + (big ? ' pmtaBig' : '');
-      return `<div class="pmtaRow"><span class="pmtaKey">${esc(k)}</span><span class="${cls}">${esc(String(v))}</span></div>`;
+      const kHtml = _titleWithTip(k, tipText);
+      return `<div class="pmtaRow"><span class="pmtaKey">${kHtml}</span><span class="${cls}">${esc(String(v))}</span></div>`;
     }
 
     function _renderPmtaPanel(pm, pr){
@@ -3848,13 +3855,13 @@ This will remove it from Jobs history.`);
 
       const html = `
         <div class="pmtaGrid">
-          ${_box('Spool', toneSp, 'rcpt', _kv('RCPT', spR, toneSp, true) + _kv('MSG', spM, toneSp, false))}
-          ${_box('Queue', toneQ, 'rcpt', _kv('RCPT', qR, toneQ, true) + _kv('MSG', qM, toneQ, false))}
-          ${_box('Connections', toneC, '', _kv('SMTP In', conIn, toneC, true) + _kv('SMTP Out', conOut, toneC, true) + _kv('Total', con, toneC, false))}
-          ${_box('Last minute', toneMin, '', _kv('In', minIn, toneMin, true) + _kv('Out', minOut, toneMin, true) + `<div class="pmtaSub">traffic recipients / minute</div>`)}
-          ${_box('Last hour', toneHr, '', _kv('In', hrIn, toneHr, true) + _kv('Out', hrOut, toneHr, true) + `<div class="pmtaSub">traffic recipients / hour</div>`)}
-          ${_box('Top queues', (topTxt === '—' ? 'good' : 'warn'), '', `<div class="pmtaSub">${esc(topTxt)}</div>`)}
-          ${_box('Time', 'good', '', `<div class="pmtaSub">${esc(ts || '—')}</div>`)}
+          ${_box(_titleWithTip('Spool', 'Current PMTA spool backlog snapshot.'), toneSp, 'rcpt', _kv('RCPT', spR, toneSp, true, 'Recipient count currently in spool.') + _kv('MSG', spM, toneSp, false))}
+          ${_box(_titleWithTip('Queue', 'Current PMTA queue backlog snapshot.'), toneQ, 'rcpt', _kv('RCPT', qR, toneQ, true, 'Recipient count currently in PMTA queue.') + _kv('MSG', qM, toneQ, false))}
+          ${_box(_titleWithTip('Connections', 'Live PMTA SMTP connection usage.'), toneC, '', _kv('SMTP In', conIn, toneC, true) + _kv('SMTP Out', conOut, toneC, true) + _kv('Total', con, toneC, false))}
+          ${_box(_titleWithTip('Last minute', 'Traffic recipients seen by PMTA in the last minute.'), toneMin, '', _kv('In', minIn, toneMin, true) + _kv('Out', minOut, toneMin, true) + `<div class="pmtaSub">traffic recipients / minute</div>`)}
+          ${_box(_titleWithTip('Last hour', 'Traffic recipients seen by PMTA in the last hour.'), toneHr, '', _kv('In', hrIn, toneHr, true) + _kv('Out', hrOut, toneHr, true) + `<div class="pmtaSub">traffic recipients / hour</div>`)}
+          ${_box(_titleWithTip('Top queues', 'Largest PMTA queues by recipient load and recent defer/error context.'), (topTxt === '—' ? 'good' : 'warn'), '', `<div class="pmtaSub">${esc(topTxt)}</div>`)}
+          ${_box(_titleWithTip('Time', 'Timestamp of the PMTA live snapshot.'), 'good', '', `<div class="pmtaSub">${esc(ts || '—')}</div>`)}
         </div>
       `;
       return html;
@@ -3948,14 +3955,14 @@ This will remove it from Jobs history.`);
       const cmpV = tail.map(x=>Number(x.complained||0));
       if(tail.length){
         trEl.innerHTML = [
-          `<span class="trendHead">Trend</span>`,
+          `<span class="trendHead">Trend <span class="tip" data-tip="Mini sparkline trend for delivered, bounced, deferred, and complained outcomes.">ⓘ</span></span>`,
           `<span class="trendSeg del"><span class="lbl">DEL</span><span class="spark">${esc(spark(delV))}</span></span>`,
           `<span class="trendSeg bnc"><span class="lbl">BNC</span><span class="spark">${esc(spark(bncV))}</span></span>`,
           `<span class="trendSeg def"><span class="lbl">DEF</span><span class="spark">${esc(spark(defV))}</span></span>`,
           `<span class="trendSeg cmp"><span class="lbl">CMP</span><span class="spark">${esc(spark(cmpV))}</span></span>`
         ].join(' ');
       } else {
-        trEl.textContent = 'Trend · —';
+        trEl.innerHTML = `Trend <span class="tip" data-tip="Mini sparkline trend for delivered, bounced, deferred, and complained outcomes.">ⓘ</span> · —`;
       }
     }
 
@@ -3979,7 +3986,10 @@ This will remove it from Jobs history.`);
     if(done >= 20 && failRatio >= 0.1) alerts.push('⚠ high fail rate');
     if(nearSpam) alerts.push('⚠ spam near limit');
 
-    alertsEl.textContent = alerts.length ? ('Alerts: ' + alerts.join(' · ')) : 'Alerts: —';
+    const alertsTip = '<span class="tip" data-tip="Live warning summary for backoff, abandoned chunks, high fail ratio, or near-threshold spam.">ⓘ</span>';
+    alertsEl.innerHTML = alerts.length
+      ? ('Alerts: ' + esc(alerts.join(' · ')) + ' ' + alertsTip)
+      : ('Alerts: — ' + alertsTip);
 
     // Notifications
     const pm = j.pmta_live || null;
