@@ -4408,6 +4408,15 @@ PAGE_CONFIG = r"""
     .toast.good{ border-color: rgba(53,228,154,.35); }
     .toast.bad{ border-color: rgba(255,94,115,.35); }
     .toast.warn{ border-color: rgba(255,193,77,.35); }
+
+    /* Accordion */
+    .acc-list{display:flex; flex-direction:column; gap:10px}
+    .acc-item{border:1px solid rgba(255,255,255,.12); border-radius:14px; background:rgba(0,0,0,.14); overflow:hidden}
+    .acc-item summary{list-style:none; cursor:pointer; padding:12px 14px; display:flex; align-items:center; justify-content:space-between; gap:12px; font-weight:800}
+    .acc-item summary::-webkit-details-marker{display:none}
+    .acc-item summary .meta{font-size:12px; color:var(--muted); font-weight:600}
+    .acc-item[open] summary{border-bottom:1px solid rgba(255,255,255,.09)}
+    .acc-body{padding:8px 12px 12px}
   </style>
 </head>
 <body>
@@ -4446,20 +4455,9 @@ PAGE_CONFIG = r"""
     </div>
 
     <div class="card" style="overflow-x:auto; overflow-y:visible">
-      <table>
-        <thead>
-          <tr>
-            <th style="min-width:310px">Key</th>
-            <th style="min-width:260px">Value</th>
-            <th style="min-width:190px">Info</th>
-            <th style="min-width:320px">Default / ENV / UI</th>
-            <th style="min-width:160px">Actions</th>
-          </tr>
-        </thead>
-        <tbody id="tb">
-          <tr><td colspan="5" class="mini">Loading…</td></tr>
-        </tbody>
-      </table>
+      <div id="groups" class="acc-list">
+        <div class="mini">Loading…</div>
+      </div>
     </div>
   </div>
 
@@ -4493,10 +4491,10 @@ PAGE_CONFIG = r"""
   }
 
   function render(){
-    const tb = document.getElementById('tb');
+    const groupsWrap = document.getElementById('groups');
     const q = (document.getElementById('q')?.value || '').trim().toLowerCase();
 
-    const rows = [];
+    const grouped = new Map();
     for(const it of ITEMS){
       const key = it.key;
       const group = (it.group || 'Other');
@@ -4539,12 +4537,11 @@ PAGE_CONFIG = r"""
         }
       }
 
-      rows.push(`<tr data-key="${esc(key)}">`+
+      const row = `<tr data-key="${esc(key)}">`+
         `<td>`+
           `<div><code>${esc(key)}</code>`+
             `<span class="tip" data-tip="${esc(desc)}">ⓘ</span>`+
           `</div>`+
-          `<div class="mini">Group: <b>${esc(group)}</b></div>`+
         `</td>`+
         `<td>${inp}<div class="mini" style="margin-top:6px">${restart ? 'Changes need restart to fully apply.' : 'Applies immediately (live reload).'} </div></td>`+
         `<td>`+
@@ -4560,13 +4557,41 @@ PAGE_CONFIG = r"""
           `<button class="btn" type="button" data-act="save" data-k="${esc(key)}">Save</button>`+
           ` <button class="btn danger" type="button" data-act="reset" data-k="${esc(key)}">Reset</button>`+
         `</td>`+
-      `</tr>`);
+      `</tr>`;
+
+      if(!grouped.has(group)) grouped.set(group, []);
+      grouped.get(group).push({key, row});
     }
 
-    tb.innerHTML = rows.join('') || `<tr><td colspan="5" class="mini">No matches.</td></tr>`;
+    const sections = [];
+    const groups = Array.from(grouped.entries()).sort((a,b)=>a[0].localeCompare(b[0]));
+    for(const [groupName, rows] of groups){
+      rows.sort((a,b)=>a.key.localeCompare(b.key));
+      sections.push(
+        `<details class="acc-item" open>`+
+          `<summary><span>${esc(groupName)}</span><span class="meta">${rows.length} option(s)</span></summary>`+
+          `<div class="acc-body">`+
+            `<table>`+
+              `<thead>`+
+                `<tr>`+
+                  `<th style="min-width:310px">Key</th>`+
+                  `<th style="min-width:260px">Value</th>`+
+                  `<th style="min-width:190px">Info</th>`+
+                  `<th style="min-width:320px">Default / ENV / UI</th>`+
+                  `<th style="min-width:160px">Actions</th>`+
+                `</tr>`+
+              `</thead>`+
+              `<tbody>${rows.map(r => r.row).join('')}</tbody>`+
+            `</table>`+
+          `</div>`+
+        `</details>`
+      );
+    }
+
+    groupsWrap.innerHTML = sections.join('') || `<div class="mini">No matches.</div>`;
 
     // bind input changes
-    tb.querySelectorAll('input[data-k], textarea[data-k]').forEach(el => {
+    groupsWrap.querySelectorAll('input[data-k], textarea[data-k]').forEach(el => {
       el.addEventListener('input', () => {
         const k = el.getAttribute('data-k');
         const t = el.getAttribute('data-type');
@@ -4588,7 +4613,7 @@ PAGE_CONFIG = r"""
     });
 
     // bind actions
-    tb.querySelectorAll('button[data-act]').forEach(btn => {
+    groupsWrap.querySelectorAll('button[data-act]').forEach(btn => {
       btn.addEventListener('click', async () => {
         const act = btn.getAttribute('data-act');
         const k = btn.getAttribute('data-k');
