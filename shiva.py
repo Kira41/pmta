@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from email import policy as email_policy
 from email.message import EmailMessage
 from email.utils import formataddr, format_datetime
-from typing import Optional, Any, Tuple, Dict, List, Set
+from typing import Optional, Any, Tuple, Dict, List
 from concurrent.futures import ThreadPoolExecutor
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -84,8 +84,8 @@ if dns is not None:
         DNS_RESOLVER = None
 
 # MX/A cache to avoid repeated DNS queries
-_MX_CACHE = {}  # type: Dict[str, Dict[str, Any]]
-_MX_CACHE_EXPIRES_AT = {}  # type: Dict[str, float]
+_MX_CACHE: dict[str, dict] = {}
+_MX_CACHE_EXPIRES_AT: dict[str, float] = {}
 MX_CACHE_TTL_OK = 3600.0
 MX_CACHE_TTL_SOFT_FAIL = 120.0
 
@@ -113,12 +113,11 @@ EMAIL_FIND_RE = re.compile(
 )
 
 
-def now_iso():
-    """Return UTC time in ISO-8601 format (seconds precision) with Z suffix."""
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+def now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 
-def parse_multiline(text, dedupe_lower=False):
+def parse_multiline(text: str, *, dedupe_lower: bool = False) -> list[str]:
     """Split a textarea input by NEW LINE.
 
     - Removes empty lines.
@@ -126,8 +125,8 @@ def parse_multiline(text, dedupe_lower=False):
     """
     if not text:
         return []
-    out = []
-    seen = set()
+    out: list[str] = []
+    seen: set[str] = set()
     for line in text.splitlines():
         s = (line or "").strip()
         if not s:
@@ -141,7 +140,7 @@ def parse_multiline(text, dedupe_lower=False):
     return out
 
 
-def parse_recipients(text: str) -> List[str]:
+def parse_recipients(text: str) -> list[str]:
     """Parse recipients from textarea/file.
 
     Robust against real-world pasted lists (spaces/tabs/weird unicode separators).
@@ -169,8 +168,8 @@ def parse_recipients(text: str) -> List[str]:
         raw = re.split(r"[\n,;\t ]+", t)
         found = [x.strip() for x in raw if x and x.strip()]
 
-    out: List[str] = []
-    seen: Set[str] = set()
+    out: list[str] = []
+    seen: set[str] = set()
     for e in found:
         e = (e or "").strip()
         if not e:
@@ -184,7 +183,7 @@ def parse_recipients(text: str) -> List[str]:
     return out
 
 
-def filter_valid_emails(emails: List[str]) -> Tuple[List[str], List[str]]:
+def filter_valid_emails(emails: list[str]) -> tuple[list[str], list[str]]:
     valid, invalid = [], []
     for e in emails:
         if EMAIL_RE.match(e):
@@ -194,9 +193,9 @@ def filter_valid_emails(emails: List[str]) -> Tuple[List[str], List[str]]:
     return valid, invalid
 
 
-def count_recipient_domains(emails: List[str]) -> Dict[str, int]:
+def count_recipient_domains(emails: list[str]) -> dict[str, int]:
     """Count recipient domains for a list of emails."""
-    counts: Dict[str, int] = {}
+    counts: dict[str, int] = {}
     for e in emails or []:
         d = _extract_domain_from_email(e)
         if not d:
@@ -205,13 +204,13 @@ def count_recipient_domains(emails: List[str]) -> Dict[str, int]:
     return counts
 
 
-def build_provider_buckets(recipients: List[str]) -> Tuple[Dict[str, List[str]], List[str]]:
+def build_provider_buckets(recipients: list[str]) -> tuple[dict[str, list[str]], list[str]]:
     """Group recipients by recipient domain while preserving first-seen order.
 
     Each bucket is treated as one "provider queue" (gmail.com, yahoo.com, ...).
     """
-    buckets: Dict[str, List[str]] = {}
-    order: List[str] = []
+    buckets: dict[str, list[str]] = {}
+    order: list[str] = []
     for rcpt in recipients or []:
         dom = _extract_domain_from_email(rcpt) or "unknown"
         if dom not in buckets:
@@ -221,7 +220,7 @@ def build_provider_buckets(recipients: List[str]) -> Tuple[Dict[str, List[str]],
     return buckets, order
 
 
-def split_body_variants(body: str) -> List[str]:
+def split_body_variants(body: str) -> list[str]:
     """Allow multiple body variants separated by a delimiter line:
 
         ---
@@ -297,7 +296,7 @@ class SendJob:
     stop_reason: str = ""
 
     # Live performance
-    speed_window: List[float] = field(default_factory=list)  # recent event timestamps (seconds)
+    speed_window: list[float] = field(default_factory=list)  # recent event timestamps (seconds)
 
     # Chunk lifecycle / backoff
     chunks_total: int = 0
@@ -306,17 +305,17 @@ class SendJob:
     chunks_abandoned: int = 0
     current_chunk: int = -1
     current_chunk_info: dict = field(default_factory=dict)
-    current_chunk_domains: Dict[str, int] = field(default_factory=dict)
-    chunk_states: List[dict] = field(default_factory=list)   # bounded
-    backoff_items: List[dict] = field(default_factory=list)  # bounded
+    current_chunk_domains: dict[str, int] = field(default_factory=dict)
+    chunk_states: list[dict] = field(default_factory=list)   # bounded
+    backoff_items: list[dict] = field(default_factory=list)  # bounded
 
     # Domain state (recipient domains)
-    domain_plan: Dict[str, int] = field(default_factory=dict)
-    domain_sent: Dict[str, int] = field(default_factory=dict)
-    domain_failed: Dict[str, int] = field(default_factory=dict)
+    domain_plan: dict[str, int] = field(default_factory=dict)
+    domain_sent: dict[str, int] = field(default_factory=dict)
+    domain_failed: dict[str, int] = field(default_factory=dict)
 
     # Error histogram (simple categories)
-    error_counts: Dict[str, int] = field(default_factory=dict)
+    error_counts: dict[str, int] = field(default_factory=dict)
     total: int = 0
     sent: int = 0
     failed: int = 0
@@ -329,11 +328,11 @@ class SendJob:
     deferred: int = 0
     complained: int = 0
     # Per-minute series for simple trends (each item: {t_min, delivered, bounced, deferred, complained})
-    outcome_series: List[dict] = field(default_factory=list)
+    outcome_series: list[dict] = field(default_factory=list)
     accounting_last_ts: str = ""
     # Accounting error rollups (response classes from accounting rows)
-    accounting_error_counts: Dict[str, int] = field(default_factory=dict)
-    accounting_last_errors: List[dict] = field(default_factory=list)  # {ts, email, type, kind, detail}
+    accounting_error_counts: dict[str, int] = field(default_factory=dict)
+    accounting_last_errors: list[dict] = field(default_factory=list)  # {ts, email, type, kind, detail}
 
     # Spam score gate (computed before sending)
     spam_threshold: float = 4.0
@@ -345,8 +344,8 @@ class SendJob:
     safe_list_invalid: int = 0
 
     last_error: str = ""
-    logs: List[JobLog] = field(default_factory=list)
-    recent_results: List[dict] = field(default_factory=list)  # {ts, email, ok, detail}
+    logs: list[JobLog] = field(default_factory=list)
+    recent_results: list[dict] = field(default_factory=list)  # {ts, email, ok, detail}
 
     def log(self, level: str, msg: str):
         self.updated_at = now_iso()
@@ -445,13 +444,13 @@ class SendJob:
             return
 
 
-JOBS: Dict[str, SendJob] = {}
+JOBS: dict[str, SendJob] = {}
 JOBS_LOCK = threading.Lock()
 
 # =========================
 # Start request guard (prevents duplicated jobs from double-submit / multi-tab)
 # =========================
-START_GUARD: Dict[str, float] = {}  # campaign_id -> timestamp
+START_GUARD: dict[str, float] = {}  # campaign_id -> timestamp
 START_GUARD_LOCK = threading.Lock()
 START_GUARD_TTL = 180.0  # seconds (safety: auto-release if server crashed)
 
@@ -658,7 +657,7 @@ def db_init() -> None:
 def _sanitize_form_data(data: dict) -> dict:
     if not isinstance(data, dict):
         return {}
-    out: Dict[str, Any] = {}
+    out: dict[str, Any] = {}
     for k, v in data.items():
         if k not in _ALLOWED_FORM_FIELDS:
             continue
@@ -897,7 +896,7 @@ def db_get_app_config(key: str) -> Optional[str]:
 
 def db_list_app_config() -> dict:
     """Return all UI-stored config overrides as a dict."""
-    out: Dict[str, str] = {}
+    out: dict[str, str] = {}
     try:
         with DB_LOCK:
             conn = _db_conn()
@@ -1051,7 +1050,7 @@ def db_load_jobs_into_memory() -> None:
         finally:
             conn.close()
 
-    loaded: Dict[str, SendJob] = {}
+    loaded: dict[str, SendJob] = {}
     for r in rows or []:
         try:
             s = json.loads(r[0] or "{}")
@@ -1072,7 +1071,7 @@ def db_load_jobs_into_memory() -> None:
 # Campaign DB helpers
 # =========================
 
-def db_list_campaigns(browser_id: str) -> List[dict]:
+def db_list_campaigns(browser_id: str) -> list[dict]:
     if not browser_id:
         return []
     with DB_LOCK:
@@ -1333,10 +1332,10 @@ def _extract_json_object(text: str) -> Optional[dict]:
 def ai_rewrite_subjects_and_body(
     *,
     token: str,
-    subjects: List[str],
+    subjects: list[str],
     body: str,
     body_format: str,
-) -> Tuple[List[str], str, str]:
+) -> tuple[list[str], str, str]:
     """Rewrite subject lines + body using OpenRouter.
 
     Returns: (new_subjects, new_body, backend_info)
@@ -1425,7 +1424,7 @@ def ai_rewrite_subjects_and_body(
     if not isinstance(new_subjects, list):
         new_subjects = []
 
-    cleaned: List[str] = []
+    cleaned: list[str] = []
     for x in new_subjects:
         if x is None:
             continue
@@ -5113,7 +5112,7 @@ def smtp_test_connection(
     """Test connect + optional auth. Does NOT send emails."""
     t0 = time.perf_counter()
     server = None
-    steps: List[str] = []
+    steps: list[str] = []
     try:
         if smtp_security == "ssl":
             steps.append("connect:ssl")
@@ -5224,7 +5223,7 @@ def _score_via_spamd(raw_msg: bytes) -> Tuple[Optional[float], str]:
         s.sendall(header)
         s.sendall(payload)
 
-        chunks: List[bytes] = []
+        chunks: list[bytes] = []
         while True:
             try:
                 b = s.recv(4096)
@@ -5462,8 +5461,8 @@ _RBL_ZONES_RAW = (os.getenv("RBL_ZONES") or "zen.spamhaus.org,bl.spamcop.net,cbl
 _DBL_ZONES_RAW = (os.getenv("DBL_ZONES") or "dbl.spamhaus.org").strip()
 
 
-def _parse_zones(raw: str) -> List[str]:
-    out: List[str] = []
+def _parse_zones(raw: str) -> list[str]:
+    out: list[str] = []
     for part in (raw or "").split(","):
         z = (part or "").strip().lower().strip(".")
         if not z:
@@ -5485,7 +5484,7 @@ def _is_ipv4(s: str) -> bool:
         return False
 
 
-def _resolve_ipv4(host: str) -> List[str]:
+def _resolve_ipv4(host: str) -> list[str]:
     host = (host or "").strip()
     if not host:
         return []
@@ -5517,12 +5516,12 @@ def _dns_a_lookup(name: str) -> Optional[str]:
         return None
 
 
-def check_ip_dnsbl(ip: str) -> List[dict]:
+def check_ip_dnsbl(ip: str) -> list[dict]:
     """Return a list of {'zone': zone, 'answer': a} where listed."""
     if not _is_ipv4(ip):
         return []
     rev = _reverse_ipv4(ip)
-    listed: List[dict] = []
+    listed: list[dict] = []
     for zone in RBL_ZONES_LIST:
         q = f"{rev}.{zone}"
         a = _dns_a_lookup(q)
@@ -5539,12 +5538,12 @@ def _extract_domain_from_email(email: str) -> str:
     return dom
 
 
-def check_domain_dnsbl(domain: str) -> List[dict]:
+def check_domain_dnsbl(domain: str) -> list[dict]:
     """Return a list of {'zone': zone, 'answer': a} where listed (DBL-style)."""
     d = (domain or "").strip().lower().strip(".")
     if not d:
         return []
-    listed: List[dict] = []
+    listed: list[dict] = []
     for zone in DBL_ZONES_LIST:
         q = f"{d}.{zone}"
         a = _dns_a_lookup(q)
@@ -5560,7 +5559,7 @@ def domain_mail_route(domain: str) -> dict:
       {
         'domain': str,
         'status': 'mx' | 'a_fallback' | 'none' | 'unknown',
-        'mx_hosts': List[str]
+        'mx_hosts': list[str]
       }
 
     Rules:
@@ -5587,7 +5586,7 @@ def domain_mail_route(domain: str) -> dict:
         _MX_CACHE_EXPIRES_AT[d] = time.time() + float(ttl)
         return out
 
-    mx_hosts: List[str] = []
+    mx_hosts: list[str] = []
 
     # If dnspython is available, use it.
     if DNS_RESOLVER is not None:
@@ -5632,7 +5631,7 @@ def domain_mail_route(domain: str) -> dict:
         return _cache_and_return(out)
 
 
-def filter_emails_by_mx(emails: List[str]) -> Tuple[List[str], List[str], dict]:
+def filter_emails_by_mx(emails: list[str]) -> tuple[list[str], list[str], dict]:
     """Filter emails by domain MX/A existence (best-effort).
 
     Returns:
@@ -5640,8 +5639,8 @@ def filter_emails_by_mx(emails: List[str]) -> Tuple[List[str], List[str], dict]:
 
     meta includes per-domain route status.
     """
-    ok: List[str] = []
-    bad: List[str] = []
+    ok: list[str] = []
+    bad: list[str] = []
     meta: dict = {"domains": {}}
 
     for e in emails:
@@ -5702,12 +5701,12 @@ def _smtp_rcpt_probe(email: str, route: dict) -> dict:
             pass
 
 
-def pre_send_recipient_filter(emails: List[str], *, smtp_probe: bool = True) -> Tuple[List[str], List[str], dict]:
+def pre_send_recipient_filter(emails: list[str], *, smtp_probe: bool = True) -> tuple[list[str], list[str], dict]:
     """Pre-send recipient filter with syntax/domain checks + optional SMTP probes."""
-    ok: List[str] = []
-    bad: List[str] = []
+    ok: list[str] = []
+    bad: list[str] = []
 
-    report: Dict[str, Any] = {
+    report: dict[str, Any] = {
         "enabled": True,
         "checks": ["syntax", "mx_or_a"],
         "smtp_probe": bool(smtp_probe and RECIPIENT_FILTER_ENABLE_SMTP_PROBE),
@@ -5717,7 +5716,7 @@ def pre_send_recipient_filter(emails: List[str], *, smtp_probe: bool = True) -> 
         "domains": {},
     }
 
-    seen_domain_probe: Set[str] = set()
+    seen_domain_probe: set[str] = set()
 
     for e in emails or []:
         em = (e or "").strip()
@@ -5758,7 +5757,7 @@ def pre_send_recipient_filter(emails: List[str], *, smtp_probe: bool = True) -> 
     return ok, bad, report
 
 
-def resolve_sender_domain_ips(domain: str) -> List[str]:
+def resolve_sender_domain_ips(domain: str) -> list[str]:
     """Resolve IPv4 addresses for a sending domain.
 
     Goal: show the IP(s) that are actually linked to the *mail* infra for the sender domain.
@@ -5774,8 +5773,8 @@ def resolve_sender_domain_ips(domain: str) -> List[str]:
     if not d:
         return []
 
-    out: List[str] = []
-    seen: Set[str] = set()
+    out: list[str] = []
+    seen: set[str] = set()
 
     # 1) MX -> resolve exchange hostnames to IPv4
     try:
@@ -5822,7 +5821,7 @@ def db_mark_job_recipient(job_id: str, campaign_id: str, rcpt: str) -> None:
             conn.close()
 
 
-def db_find_job_ids_by_recipient(rcpt: str, limit: int = 8) -> List[str]:
+def db_find_job_ids_by_recipient(rcpt: str, limit: int = 8) -> list[str]:
     em = (rcpt or "").strip().lower()
     if not em:
         return []
@@ -5963,7 +5962,7 @@ def _pmta_has_any_counts(pm: dict) -> bool:
     return False
 
 
-def _http_get_json(url: str, *, timeout_s: float) -> Tuple[bool, dict, str]:
+def _http_get_json(url: str, *, timeout_s: float) -> tuple[bool, dict, str]:
     """Fetch JSON from a URL with best-effort handling for PMTA monitor setups.
 
     Why this exists:
@@ -5980,7 +5979,7 @@ def _http_get_json(url: str, *, timeout_s: float) -> Tuple[bool, dict, str]:
     want a fully secure setup, fix the PMTA HTTPS cert (use RSA-2048+), or keep monitor on HTTP.
     """
 
-    def _attempt(ctx: Optional[ssl.SSLContext]) -> Tuple[bool, dict, str]:
+    def _attempt(ctx: ssl.SSLContext | None) -> tuple[bool, dict, str]:
         try:
             req = Request(url, headers=_pmta_headers(), method="GET")
             if ctx is None:
@@ -6029,10 +6028,10 @@ def _http_get_json(url: str, *, timeout_s: float) -> Tuple[bool, dict, str]:
     return ok, js, err
 
 
-def _http_get_text(url: str, *, timeout_s: float) -> Tuple[bool, str, str, dict]:
+def _http_get_text(url: str, *, timeout_s: float) -> tuple[bool, str, str, dict]:
     """Fetch raw text + metadata from PMTA monitor endpoints (debug/probing)."""
 
-    def _attempt(ctx: Optional[ssl.SSLContext]) -> Tuple[bool, str, str, dict]:
+    def _attempt(ctx: ssl.SSLContext | None) -> tuple[bool, str, str, dict]:
         try:
             req = Request(url, headers=_pmta_headers(), method="GET")
             if ctx is None:
@@ -6109,7 +6108,7 @@ def pmta_probe_endpoints(*, smtp_host: str) -> dict:
     for name, p in paths:
         url = base + p
         ok, txt, err, meta = _http_get_text(url, timeout_s=min(6.0, max(2.0, PMTA_MONITOR_TIMEOUT_S)))
-        entry: Dict[str, Any] = {"ok": bool(ok), "url": url, "meta": meta}
+        entry: dict[str, Any] = {"ok": bool(ok), "url": url, "meta": meta}
         if ok:
             # try parse JSON keys to understand schema
             parsed = None
@@ -6163,7 +6162,7 @@ def _to_int(v: Any) -> Optional[int]:
         return None
 
 
-def _deep_find_first_int(obj: Any, keys: Set[str], *, max_nodes: int = 2500) -> Optional[int]:
+def _deep_find_first_int(obj: Any, keys: set[str], *, max_nodes: int = 2500) -> Optional[int]:
     # Best-effort: walk nested dict/list and return the first int-like value for a key.
     seen = 0
 
@@ -6194,7 +6193,7 @@ def _deep_find_first_int(obj: Any, keys: Set[str], *, max_nodes: int = 2500) -> 
     return walk(obj)
 
 
-def _sum_queue_counts(obj: Any) -> Tuple[Optional[int], Optional[int]]:
+def _sum_queue_counts(obj: Any) -> tuple[Optional[int], Optional[int]]:
     """Try to sum queued recipients/messages from /queues JSON.
 
     PMTA /queues schemas differ across versions. We use a conservative heuristic:
@@ -6204,10 +6203,10 @@ def _sum_queue_counts(obj: Any) -> Tuple[Optional[int], Optional[int]]:
     Returns: (queued_recipients, queued_messages)
     """
 
-    def _find_list_of_dicts(x: Any, *, max_nodes: int = 4000) -> List[dict]:
+    def _find_list_of_dicts(x: Any, *, max_nodes: int = 4000) -> list[dict]:
         seen = 0
 
-        def walk(v: Any) -> Optional[List[dict]]:
+        def walk(v: Any) -> Optional[list[dict]]:
             nonlocal seen
             if seen > max_nodes:
                 return None
@@ -6300,7 +6299,7 @@ def _normalize_pmta_queue_to_domain(name: Any) -> str:
     return s if "." in s else ""
 
 
-def _queues_extract_top(obj: Any, *, top_n: int = 6) -> List[dict]:
+def _queues_extract_top(obj: Any, *, top_n: int = 6) -> list[dict]:
     """Best-effort: extract top queues (by recipients) from /queues JSON.
 
     If schema is unknown, we scan for the first list-of-dicts anywhere in the payload.
@@ -6309,10 +6308,10 @@ def _queues_extract_top(obj: Any, *, top_n: int = 6) -> List[dict]:
     if n <= 0:
         return []
 
-    def _find_list_of_dicts(x: Any, *, max_nodes: int = 3500) -> List[dict]:
+    def _find_list_of_dicts(x: Any, *, max_nodes: int = 3500) -> list[dict]:
         seen = 0
 
-        def walk(v: Any) -> Optional[List[dict]]:
+        def walk(v: Any) -> Optional[list[dict]]:
             nonlocal seen
             if seen > max_nodes:
                 return None
@@ -6349,7 +6348,7 @@ def _queues_extract_top(obj: Any, *, top_n: int = 6) -> List[dict]:
             return f"{d.strip()}/{v.strip()}"
         return ""
 
-    def pick_int(it: dict, keys: Tuple[str, ...]) -> Optional[int]:
+    def pick_int(it: dict, keys: tuple[str, ...]) -> Optional[int]:
         lower_map = {str(k).strip().lower(): k for k in it.keys()}
         for kk in keys:
             k0 = lower_map.get(kk)
@@ -6360,7 +6359,7 @@ def _queues_extract_top(obj: Any, *, top_n: int = 6) -> List[dict]:
                 return int(iv)
         return None
 
-    out: List[dict] = []
+    out: list[dict] = []
     for it in items:
         qn = pick_queue_name(it)
         if not qn:
@@ -6520,7 +6519,7 @@ def pmta_health_check(*, smtp_host: str) -> dict:
     max_q_rcpt = cfg_get_int("PMTA_MAX_QUEUED_RECIPIENTS", 250000)
     max_q_msg = cfg_get_int("PMTA_MAX_QUEUED_MESSAGES", 60000)
 
-    busy_reasons: List[str] = []
+    busy_reasons: list[str] = []
     if spool_rcpt is not None and spool_rcpt > max_spool_rcpt:
         busy_reasons.append(f"spool_recipients={spool_rcpt}>{max_spool_rcpt}")
     if spool_msg is not None and spool_msg > max_spool_msg:
@@ -6759,10 +6758,10 @@ def pmta_domains_overview(*, smtp_host: str) -> dict:
     if not ok:
         return {"ok": False, "reason": err, "url": url, "domains": {}}
 
-    def _find_list_of_dicts(x: Any, *, max_nodes: int = 4500) -> List[dict]:
+    def _find_list_of_dicts(x: Any, *, max_nodes: int = 4500) -> list[dict]:
         seen = 0
 
-        def walk(v: Any) -> Optional[List[dict]]:
+        def walk(v: Any) -> Optional[list[dict]]:
             nonlocal seen
             if seen > max_nodes:
                 return None
@@ -6792,7 +6791,7 @@ def pmta_domains_overview(*, smtp_host: str) -> dict:
                 return v.strip().lower().strip(".")
         return ""
 
-    out: Dict[str, dict] = {}
+    out: dict[str, dict] = {}
     for it in items:
         raw_name = pick_name(it)
         dom = _normalize_pmta_queue_to_domain(raw_name)
@@ -6823,7 +6822,7 @@ def pmta_domains_overview(*, smtp_host: str) -> dict:
 
     return {"ok": True, "reason": "ok", "url": url, "domains": out}
 
-_PMTA_DETAIL_CACHE: Dict[str, Tuple[float, dict]] = {}
+_PMTA_DETAIL_CACHE: dict[str, tuple[float, dict]] = {}
 
 
 def _deep_sum_ints_by_key_pred(obj: Any, pred, *, max_nodes: int = 3500) -> int:
@@ -6851,7 +6850,7 @@ def _deep_sum_ints_by_key_pred(obj: Any, pred, *, max_nodes: int = 3500) -> int:
     return int(total)
 
 
-def _deep_find_first_list(obj: Any, keys: Set[str], *, max_nodes: int = 2500) -> Optional[list]:
+def _deep_find_first_list(obj: Any, keys: set[str], *, max_nodes: int = 2500) -> Optional[list]:
     seen = 0
 
     def walk(x: Any) -> Optional[list]:
@@ -7012,7 +7011,7 @@ def pmta_live_panel(*, smtp_host: str) -> dict:
     # /queues (optional) for queued totals + top queues
     queued_rcpt: Optional[int] = None
     queued_msg: Optional[int] = None
-    top_queues: List[dict] = []
+    top_queues: list[dict] = []
 
     queues_url = f"{base}/queues?format=json"
     ok2, js2, _ = _http_get_json(queues_url, timeout_s=min(6.0, max(2.0, PMTA_MONITOR_TIMEOUT_S)))
@@ -7101,10 +7100,10 @@ def _pmta_detail_metrics(js: Any) -> dict:
     # try to find a list of recent errors / events
     err_list = _deep_find_first_list(js, {"errors", "lasterrors", "last_errors", "recent_errors", "recipient_events"})
     errors_count = 0
-    errors_sample: List[str] = []
+    errors_sample: list[str] = []
     if isinstance(err_list, list):
         errors_count = len(err_list)
-        for it in err_List[:3]:
+        for it in err_list[:3]:
             errors_sample.append(str(it)[:140])
     else:
         errors_count = _deep_find_first_int(js, {"errorcount", "errorscount", "last_errors_count"}) or 0
@@ -7185,7 +7184,7 @@ def pmta_queue_detail_metrics(*, smtp_host: str, queue: str) -> dict:
 # -------------------------
 # PMTA diagnostics helpers (point 7)
 # -------------------------
-_PMTA_ERR_DIAG_CACHE: Dict[str, float] = {}
+_PMTA_ERR_DIAG_CACHE: dict[str, float] = {}
 
 
 def _classify_send_exception(e: Exception) -> str:
@@ -7278,7 +7277,7 @@ def pmta_diag_on_error(*, smtp_host: str, rcpt: str, exc: Exception) -> dict:
     }
 
 
-def pmta_chunk_policy(*, smtp_host: str, chunk_domain_counts: Dict[str, int]) -> dict:
+def pmta_chunk_policy(*, smtp_host: str, chunk_domain_counts: dict[str, int]) -> dict:
     """Decide if we should block/backoff or slow down based on PMTA domain/queue errors.
 
     Returns:
@@ -7372,7 +7371,7 @@ except Exception:
     PMTA_BRIDGE_PULL_MAX_LINES = 2000
 
 _BRIDGE_DEBUG_LOCK = threading.Lock()
-_BRIDGE_DEBUG_STATE: Dict[str, Any] = {
+_BRIDGE_DEBUG_STATE: dict[str, Any] = {
     "last_attempt_ts": "",
     "last_success_ts": "",
     "last_error_ts": "",
@@ -7401,7 +7400,7 @@ def _bridge_debug_update(**kwargs: Any) -> None:
     with _BRIDGE_DEBUG_LOCK:
         _BRIDGE_DEBUG_STATE.update(kwargs)
 
-_PMTA_ACC_HEADERS: Dict[str, List[str]] = {}
+_PMTA_ACC_HEADERS: dict[str, list[str]] = {}
 
 # Extract job id from Message-ID we generate:
 #   <uuid.<job_id>.<campaign_id>.c<chunk>.w<worker>@local>
@@ -7481,7 +7480,7 @@ def _find_job_by_campaign(campaign_id: str) -> Optional[SendJob]:
     running = [j for j in candidates if (j.status or "") in {"running", "backoff", "paused"}]
     pool = running or candidates
 
-    def _sort_key(j: SendJob) -> Tuple[str, str]:
+    def _sort_key(j: SendJob) -> tuple[str, str]:
         return (str(j.updated_at or ""), str(j.created_at or ""))
 
     pool.sort(key=_sort_key, reverse=True)
@@ -7500,7 +7499,7 @@ def _find_job_by_recipient(rcpt: str) -> Optional[SendJob]:
             return job
 
     # 2) Fallback to in-memory recent send results if DB has no hit.
-    candidates: List[SendJob] = []
+    candidates: list[SendJob] = []
     for job in JOBS.values():
         if bool(job.deleted):
             continue
@@ -7558,7 +7557,7 @@ def _parse_accounting_line(line: str, *, path: str = "") -> Optional[dict]:
         return None
 
     hdr = _PMTA_ACC_HEADERS.get(path or "") or []
-    ev: Dict[str, Any] = {"raw": s}
+    ev: dict[str, Any] = {"raw": s}
 
     if hdr and len(hdr) == len(fields):
         for k, v in zip(hdr, fields):
@@ -7659,7 +7658,7 @@ def _apply_outcome_to_job(job: SendJob, rcpt: str, kind: str) -> None:
     job.accounting_last_ts = now_iso()
 
 
-def _classify_accounting_response(ev: dict, typ: str) -> Tuple[str, str]:
+def _classify_accounting_response(ev: dict, typ: str) -> tuple[str, str]:
     """Return (kind, full_error_text) using accounting response data.
 
     kind is one of: accepted, temporary_error, blocked.
@@ -7905,7 +7904,7 @@ def _poll_accounting_bridge_once() -> dict:
     # Some bridges return structured rows instead of raw accounting lines,
     # for example: {"results":[{"email":"a@b.com","status":"failed"}, ...]}
     # We support both forms.
-    bridge_rows: List[Any] = []
+    bridge_rows: list[Any] = []
     if isinstance(lines, list):
         bridge_rows = list(lines)
     elif isinstance(obj, dict):
@@ -8020,16 +8019,16 @@ def smtp_send_job(
     smtp_timeout: int,
     smtp_user: str,
     smtp_pass: str,
-    sender_names: List[str],
-    sender_emails: List[str],
-    subjects: List[str],
+    sender_names: list[str],
+    sender_emails: list[str],
+    subjects: list[str],
     reply_to: str,
     body_format: str,  # text | html
     body: str,
-    recipients: List[str],
+    recipients: list[str],
     delay_s: float,
-    urls_list: List[str],
-    src_list: List[str],
+    urls_list: list[str],
+    src_list: list[str],
     chunk_size: int,
     thread_workers: int,
     sleep_chunks: float,
@@ -8150,7 +8149,7 @@ def smtp_send_job(
             except Exception:
                 return default
 
-        out: Dict[str, Any] = {}
+        out: dict[str, Any] = {}
 
         out["chunk_size"] = max(1, min(50000, as_int("chunk_size", chunk_size)))
         out["thread_workers"] = max(1, min(200, as_int("thread_workers", thread_workers)))
@@ -8182,8 +8181,8 @@ def smtp_send_job(
 
         return out
 
-    def _blacklist_check(from_email: str) -> Tuple[bool, str]:
-        parts: List[str] = []
+    def _blacklist_check(from_email: str) -> tuple[bool, str]:
+        parts: list[str] = []
         listed = False
 
         dom = _extract_domain_from_email(from_email)
@@ -8203,7 +8202,7 @@ def smtp_send_job(
 
         return listed, " | ".join([p for p in parts if p])
 
-    def _spam_check(from_email: str, subject: str, body_text: str, body_format2: str) -> Tuple[Optional[float], str]:
+    def _spam_check(from_email: str, subject: str, body_text: str, body_format2: str) -> tuple[Optional[float], str]:
         return compute_spam_score(subject=subject, body=body_text, body_format=body_format2, from_email=from_email)
 
     def _smtp_code_class(detail: str) -> Optional[int]:
@@ -8336,7 +8335,7 @@ def smtp_send_job(
             "reduced": bool(reduced),
         }
 
-    def _render_body(local_rng: random.Random, base_body: str, urls2: List[str], src2: List[str]) -> str:
+    def _render_body(local_rng: random.Random, base_body: str, urls2: list[str], src2: list[str]) -> str:
         rendered = base_body
         if "[URL]" in rendered:
             rendered = rendered.replace("[URL]", local_rng.choice(urls2) if urls2 else "")
@@ -8347,7 +8346,7 @@ def smtp_send_job(
     def _send_chunk(
         *,
         chunk_idx: int,
-        chunk_rcpts: List[str],
+        chunk_rcpts: list[str],
         from_name: str,
         from_email: str,
         subject: str,
@@ -8356,10 +8355,10 @@ def smtp_send_job(
         reply_to2: str,
         delay2: float,
         workers2: int,
-        urls2: List[str],
-        src2: List[str],
+        urls2: list[str],
+        src2: list[str],
     ):
-        def worker_send(worker_idx: int, rcpts: List[str]):
+        def worker_send(worker_idx: int, rcpts: list[str]):
             if not rcpts:
                 return
 
@@ -8464,7 +8463,7 @@ def smtp_send_job(
                     pass
 
         wc = max(1, min(int(workers2 or 1), len(chunk_rcpts)))
-        groups: List[List[str]] = [[] for _ in range(wc)]
+        groups: list[list[str]] = [[] for _ in range(wc)]
         for i2, r2 in enumerate(chunk_rcpts):
             groups[i2 % wc].append(r2)
 
@@ -8490,7 +8489,7 @@ def smtp_send_job(
 
         # Per-provider sender rotation cursor: if a provider has many recipients,
         # chunk#1 can use sender/IP-A, chunk#2 sender/IP-B, ... then wrap.
-        provider_sender_cursor: Dict[str, int] = {}
+        provider_sender_cursor: dict[str, int] = {}
 
         def _remaining_total() -> int:
             return sum(len(v) for v in provider_buckets.values())
@@ -8537,8 +8536,8 @@ def smtp_send_job(
             src2 = rt.get("src_list") or src_list
 
             # PMTA pressure-based adaptive speed control (global)
-            pmta_pressure_applied: Dict[str, Any] = {}
-            health_policy_applied: Dict[str, Any] = {}
+            pmta_pressure_applied: dict[str, Any] = {}
+            health_policy_applied: dict[str, Any] = {}
 
             # Adaptive policy from accounting + SMTP responses.
             try:
@@ -8755,7 +8754,7 @@ def smtp_send_job(
                 # PMTA domain/queue adaptive backoff (best-effort)
                 pmta_sig = {"enabled": False, "ok": True, "blocked": False, "slow": None, "reason": ""}
                 pmta_reason = ""
-                pmta_slow: Dict[str, Any] = {}
+                pmta_slow: dict[str, Any] = {}
 
                 if PMTA_QUEUE_BACKOFF:
                     try:
@@ -8953,7 +8952,7 @@ def smtp_send_job(
 # App Config Schema + helpers
 # =========================
 
-APP_CONFIG_SCHEMA: List[dict] = [
+APP_CONFIG_SCHEMA: list[dict] = [
     # Spam score
     {"key": "SPAMCHECK_BACKEND", "type": "str", "default": "spamd", "group": "Spam", "restart_required": False,
      "desc": "Spam scoring backend: spamd | spamc | spamassassin | module | off."},
@@ -9071,7 +9070,7 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "If enabled: wipes SQLite tables on app start (danger). Requires restart."},
 ]
 
-APP_CONFIG_INDEX: Dict[str, dict] = {it["key"]: it for it in APP_CONFIG_SCHEMA if isinstance(it, dict) and it.get("key")}
+APP_CONFIG_INDEX: dict[str, dict] = {it["key"]: it for it in APP_CONFIG_SCHEMA if isinstance(it, dict) and it.get("key")}
 
 
 def _cfg_boolish(s: str) -> bool:
@@ -9079,7 +9078,7 @@ def _cfg_boolish(s: str) -> bool:
     return v in {"1", "true", "yes", "on", "y"}
 
 
-def _cfg_get_raw_and_source(key: str) -> Tuple[Optional[str], str, Optional[str], Optional[str]]:
+def _cfg_get_raw_and_source(key: str) -> tuple[Optional[str], str, Optional[str], Optional[str]]:
     """Return (effective_raw, source, ui_raw, env_raw)."""
     k = (key or "").strip()
     ui = db_get_app_config(k)
@@ -9125,9 +9124,9 @@ def cfg_get_bool(key: str, default: bool) -> bool:
     return _cfg_boolish(str(raw))
 
 
-def config_items() -> List[dict]:
+def config_items() -> list[dict]:
     """Return schema + current effective values for the UI."""
-    items: List[dict] = []
+    items: list[dict] = []
     for it in APP_CONFIG_SCHEMA:
         k = str(it.get("key") or "").strip()
         typ = str(it.get("type") or "str").strip().lower()
@@ -9619,7 +9618,7 @@ def api_campaign_domains_stats(campaign_id: str):
         invalid_all = list(invalid_syntax) + list(invalid_mx)
 
         # Count domains (recipient domains)
-        counts: Dict[str, int] = {}
+        counts: dict[str, int] = {}
         for e in valid_mx:
             d = _extract_domain_from_email(e)
             if not d:
@@ -9630,14 +9629,14 @@ def api_campaign_domains_stats(campaign_id: str):
 
         # Limit expensive checks to top N domains
         MAX_CHECKS = 200
-        out_items: List[dict] = []
+        out_items: list[dict] = []
 
         for idx, (dom, cnt) in enumerate(domains_sorted):
             route = filter_report.get("domains", {}).get(dom) or domain_mail_route(dom)
             mx_status = route.get("status", "unknown")
             mx_hosts = route.get("mx_hosts", [])
 
-            mail_ips: List[str] = []
+            mail_ips: list[str] = []
             any_listed = False
 
             if idx < MAX_CHECKS:
@@ -9791,7 +9790,7 @@ def api_version():
     })
 
 
-def _cfg_validate_and_canon(key: str, value: Any) -> Tuple[bool, str, str]:
+def _cfg_validate_and_canon(key: str, value: Any) -> tuple[bool, str, str]:
     """Return (ok, canon_value_str, error)."""
     meta = APP_CONFIG_INDEX.get(key)
     if not meta:
@@ -9834,7 +9833,7 @@ def api_config_set():
     if isinstance(data, dict) and isinstance(data.get("items"), dict):
         items = data.get("items") or {}
         saved = 0
-        errors: Dict[str, str] = {}
+        errors: dict[str, str] = {}
         for k, v in items.items():
             key = str(k or "").strip()
             ok, canon, err = _cfg_validate_and_canon(key, v)
@@ -10022,7 +10021,7 @@ def api_domains_stats():
         invalid_all = list(invalid_syntax) + list(invalid_mx)
 
         # Count domains
-        counts: Dict[str, int] = {}
+        counts: dict[str, int] = {}
         for e in valid_mx:
             d = _extract_domain_from_email(e)
             if not d:
@@ -10034,14 +10033,14 @@ def api_domains_stats():
 
         # Limit expensive checks to top N domains
         MAX_CHECKS = 200
-        out_items: List[dict] = []
+        out_items: list[dict] = []
 
         for idx, (dom, cnt) in enumerate(domains_sorted):
             route = meta.get("domains", {}).get(dom) or domain_mail_route(dom)
             mx_status = route.get("status", "unknown")
             mx_hosts = route.get("mx_hosts", [])
 
-            mail_ips: List[str] = []
+            mail_ips: list[str] = []
             any_listed = False
 
             if idx < MAX_CHECKS:
@@ -10132,8 +10131,8 @@ def api_preflight():
     domain_listings = check_domain_dnsbl(domain) if domain else []
 
     # NEW: Check ALL sender domains (from the textarea list)
-    sender_domains: List[str] = []
-    _seen_dom: Set[str] = set()
+    sender_domains: list[str] = []
+    _seen_dom: set[str] = set()
     for em in valid_sender_emails:
         d = _extract_domain_from_email(em)
         if not d:
@@ -10151,14 +10150,14 @@ def api_preflight():
     sender_domain_dbl_listings = {d: check_domain_dnsbl(d) for d in sender_domains}
 
     # NEW: Spam score per sender domain (build email using the domain)
-    domain_to_sender_email: Dict[str, str] = {}
+    domain_to_sender_email: dict[str, str] = {}
     for em in valid_sender_emails:
         d = _extract_domain_from_email(em)
         if d and d not in domain_to_sender_email:
             domain_to_sender_email[d] = em
 
-    sender_domain_spam_scores: Dict[str, Optional[float]] = {}
-    sender_domain_spam_backends: Dict[str, str] = {}
+    sender_domain_spam_scores: dict[str, Optional[float]] = {}
+    sender_domain_spam_backends: dict[str, str] = {}
 
     for d in sender_domains:
         fe = domain_to_sender_email.get(d) or f"support@{d}"
@@ -10357,7 +10356,7 @@ def start():
         return "AI token is required when 'Use AI rewrite' is enabled.", 400
 
     # --- Better validation (more helpful than "Missing required fields")
-    errors: List[str] = []
+    errors: list[str] = []
     if not smtp_host:
         errors.append("SMTP Host is required")
 
@@ -10437,7 +10436,7 @@ def start():
         return f"Too many recipients ({len(valid)}). Max allowed is {max_rcpt}.", 400
 
     # Compute spam score BEFORE sending (check ALL sender domains)
-    domain_to_sender: Dict[str, str] = {}
+    domain_to_sender: dict[str, str] = {}
     for em in valid_sender_emails:
         d = _extract_domain_from_email(em)
         if d and d not in domain_to_sender:
