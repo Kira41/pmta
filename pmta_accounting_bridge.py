@@ -760,69 +760,66 @@ def pull_latest_accounting(
     group_by_header: int = 1,
     _: None = Depends(require_token),
 ):
-    """Return newly appended accounting lines so Shiva can pull them periodically."""
-    patterns = ALLOWED_KINDS.get(kind)
-    if not patterns:
-        raise HTTPException(status_code=400, detail=f"Invalid kind. Use one of: {list(ALLOWED_KINDS.keys())}")
+    """Return job scoped records (type/email/job_id) collected from all accounting CSV files.
 
-    read_all = (request.query_params.get("all", "0").strip().lower() in {"1", "true", "yes", "on"})
-    filters = _request_filters(request)
+    This endpoint intentionally supports one accounting flow only:
+    - Shiva sends header: X-Job-ID
+    - Bridge searches all acct-*.csv files
+    - Bridge returns only: type, email, job_id
+    """
+    jid = _normalize_job_id(request.headers.get("x-job-id", ""))
+    if not jid:
+        raise HTTPException(status_code=400, detail="Missing required header: X-Job-ID")
 
-    if not read_all:
-        latest = _find_latest_file(patterns)
-        chunk = _read_new_lines(latest, max_lines)
-        grouped = _group_accounting_events(chunk["lines"], source_file=latest.name) if group_by_header else {"events": [], "batches": []}
-        events = grouped["events"] if group_by_header else chunk["lines"]
-        if group_by_header:
-            events = [ev for ev in events if _event_matches_filter(ev, filters)]
-        return {
-            "ok": True,
-            "kind": kind,
-            "mode": "latest",
-            "file": chunk["file"],
-            "from_offset": chunk["from_offset"],
-            "to_offset": chunk["to_offset"],
-            "has_more": chunk["has_more"],
-            "count": len(events),
-            "lines": events,
-            "batches": _build_batches_from_events(events) if group_by_header else [],
-            "filters": filters,
+    patterns = ALLOWED_KINDS.get("acct") or ["acct-*.csv"]
+    rows: List[Dict[str, str]] = []
+    for ev in _walk_accounting_events(patterns):
+        ev_jid = _event_job_id(ev)
+        if ev_jid != jid:
+            continue
+
+        email = str(
+            ev.get("rcpt")
+            or ev.get("recipient")
+            or ev.get("email")
+            or ev.get("to")
+            or ev.get("rcpt_to")
+            or ""
+        ).strip().lower()
+        if not email:
+            continue
+
+        outcome = _normalize_outcome_type(
+            ev.get("type")
+            or ev.get("event")
+            or ev.get("kind")
+            or ev.get("record")
+            or ev.get("status")
+            or ev.get("result")
+            or ev.get("state")
+            or ev.get("dsnAction")
+            or ev.get("dsn_action")
+            or ev.get("dsnStatus")
+            or ev.get("dsn_status")
+            or ev.get("dsnDiag")
+            or ev.get("dsn_diag")
+        )
+        letter_map = {
+            "deferred": "T",
+            "delivered": "D",
+            "bounced": "B",
         }
+        out_type = letter_map.get(outcome, "")
+        if not out_type:
+            continue
 
-    files = _find_matching_files(patterns)
-    safe_max = max(1, int(max_lines or 1))
-    lines: List[str] = []
-    touched: List[str] = []
-    all_events: List[Dict[str, Any]] = []
-    for fp in files:
-        if len(lines) >= safe_max:
-            break
-        remaining = safe_max - len(lines)
-        chunk = _read_new_lines(fp, remaining)
-        if chunk.get("count"):
-            touched.append(fp.name)
-            lines.extend(chunk.get("lines") or [])
-            if group_by_header:
-                grouped = _group_accounting_events(chunk.get("lines") or [], source_file=fp.name)
-                all_events.extend(grouped["events"])
-
-    if group_by_header:
-        all_events = [ev for ev in all_events if _event_matches_filter(ev, filters)]
-        merged_batches = _build_batches_from_events(all_events)
-    else:
-        merged_batches = []
+        rows.append({"type": out_type, "email": email, "job_id": jid})
 
     return {
         "ok": True,
-        "kind": kind,
-        "mode": "all",
-        "files_seen": len(files),
-        "files_touched": touched,
-        "count": len(all_events) if group_by_header else len(lines),
-        "lines": all_events if group_by_header else lines,
-        "batches": merged_batches,
-        "filters": filters,
-        "has_more": False,
+        "job_id": jid,
+        "count": len(rows),
+        "lines": rows,
     }
 
 
