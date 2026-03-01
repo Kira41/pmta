@@ -2966,6 +2966,13 @@ PAGE_JOBS = r"""
     @media (max-width: 980px){ .twoCol{grid-template-columns: 1fr;} }
     .panel{border:1px solid rgba(255,255,255,.10); background: rgba(0,0,0,.10); border-radius: 14px; padding: 10px 12px;}
     .panel h4{margin:0 0 8px; font-size: 13px; color: rgba(255,255,255,.86)}
+    .headingRow{display:inline-flex; align-items:center; gap:8px; flex-wrap:wrap;}
+    .liveStatus{display:inline-flex; align-items:center; gap:6px; font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.45px;}
+    .liveDot{width:9px; height:9px; border-radius:999px; display:inline-block; background:rgba(255,255,255,.45); box-shadow:0 0 0 1px rgba(255,255,255,.20) inset;}
+    .liveStatus.good{color: var(--good);}
+    .liveStatus.good .liveDot{background: var(--good); box-shadow:0 0 10px rgba(53,228,154,.45);}
+    .liveStatus.bad{color: var(--bad);}
+    .liveStatus.bad .liveDot{background: var(--bad); box-shadow:0 0 10px rgba(255,94,115,.45);}
 
     /* PMTA Live Panel (Jobs) — clearer layout */
     .pmtaLive{ margin-top:10px; }
@@ -3091,6 +3098,29 @@ PAGE_JOBS = r"""
     .ok{color:var(--good); font-weight:900}
     .no{color:var(--bad); font-weight:900}
 
+    /* Tooltip (same behavior as Config page) */
+    .tip{display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; border-radius:999px;
+      border:1px solid rgba(255,255,255,.18); background: rgba(0,0,0,.18); color: rgba(255,255,255,.86);
+      font-size: 12px; cursor: help; position: relative; user-select:none}
+    .tip:hover::after{
+      content: attr(data-tip);
+      position: absolute;
+      left: 0;
+      top: 24px;
+      min-width: 240px;
+      max-width: 460px;
+      background: rgba(0,0,0,.72);
+      border: 1px solid rgba(255,255,255,.18);
+      box-shadow: 0 18px 55px rgba(0,0,0,.35);
+      backdrop-filter: blur(10px);
+      color: rgba(255,255,255,.92);
+      padding: 10px 12px;
+      border-radius: 14px;
+      z-index: 999;
+      white-space: normal;
+      line-height: 1.45;
+    }
+
     /* Toast */
     .toast-wrap{ position: fixed; right: 16px; bottom: 16px; z-index: 9999; display:flex; flex-direction:column; gap:10px; }
     .toast{
@@ -3164,21 +3194,21 @@ PAGE_JOBS = r"""
 
         <!-- 1) Summary header metrics -->
         <div class="grid">
-          <div class="metric"><b>Sent</b><div class="mini"><span data-k="sent">0</span> / <span data-k="total">0</span></div></div>
-          <div class="metric"><b>Failed</b><div class="mini"><span data-k="failed">0</span></div></div>
-          <div class="metric"><b>Skipped</b><div class="mini"><span data-k="skipped">0</span></div></div>
-          <div class="metric"><b>Invalid</b><div class="mini"><span data-k="invalid">0</span></div></div>
+          <div class="metric"><b>Sent</b> <span class="tip" data-tip="Total messages accepted by the sender workflow out of the job target list.">ⓘ</span><div class="mini"><span data-k="sent">0</span> / <span data-k="total">0</span></div></div>
+          <div class="metric"><b>Failed</b> <span class="tip" data-tip="Messages that failed with a hard or terminal send error.">ⓘ</span><div class="mini"><span data-k="failed">0</span></div></div>
+          <div class="metric"><b>Skipped</b> <span class="tip" data-tip="Recipients skipped by safety checks, policies, or runtime routing decisions.">ⓘ</span><div class="mini"><span data-k="skipped">0</span></div></div>
+          <div class="metric"><b>Invalid</b> <span class="tip" data-tip="Invalid recipients detected during sanitization/validation.">ⓘ</span><div class="mini"><span data-k="invalid">0</span></div></div>
 
-          <div class="metric"><b>Delivered</b><div class="mini"><span data-k="delivered">0</span></div></div>
-          <div class="metric"><b>Bounced</b><div class="mini"><span data-k="bounced">0</span></div></div>
-          <div class="metric"><b>Deferred</b><div class="mini"><span data-k="deferred">0</span></div></div>
-          <div class="metric"><b>Complained</b><div class="mini"><span data-k="complained">0</span></div></div>
+          <div class="metric"><b>Delivered</b> <span class="tip" data-tip="PMTA accounting outcome: delivered to recipient MX.">ⓘ</span><div class="mini"><span data-k="delivered">0</span></div></div>
+          <div class="metric"><b>Bounced</b> <span class="tip" data-tip="PMTA accounting outcome: hard bounce or blocked outcome.">ⓘ</span><div class="mini"><span data-k="bounced">0</span></div></div>
+          <div class="metric"><b>Deferred</b> <span class="tip" data-tip="PMTA accounting outcome: temporary/4xx delay.">ⓘ</span><div class="mini"><span data-k="deferred">0</span></div></div>
+          <div class="metric"><b>Complained</b> <span class="tip" data-tip="PMTA accounting outcome: complaint/FBL events.">ⓘ</span><div class="mini"><span data-k="complained">0</span></div></div>
         </div>
 
         <!-- 4) Progress bars -->
         <div class="bars">
           <div class="panel">
-            <h4>Progress</h4>
+            <h4><span class="headingRow">Progress <span class="tip" data-tip="Live completion for recipients, chunks, and domains in this job.">ⓘ</span></span></h4>
             <div class="mini" data-k="progressText">—</div>
             <div class="bar"><div data-k="barSend"></div></div>
             <div class="mini" style="margin-top:8px" data-k="chunksText">—</div>
@@ -3191,55 +3221,61 @@ PAGE_JOBS = r"""
         <!-- 2) Current chunk + 3) backoff info -->
         <div class="twoCol">
           <div class="panel">
-            <h4>Current chunk</h4>
+            <h4><span class="headingRow">Current chunk <span class="tip" data-tip="Current chunk id, size, and the active target domains being processed now.">ⓘ</span></span></h4>
             <div class="mini" data-k="chunkLine">—</div>
             <div class="mini" data-k="chunkDomains">—</div>
           </div>
           <div class="panel">
-            <h4>Backoff</h4>
+            <h4><span class="headingRow">Backoff <span class="tip" data-tip="Latest backoff state and throttle reason for the running job.">ⓘ</span></span></h4>
             <div class="mini" data-k="backoffLine">—</div>
           </div>
         </div>
 
         <div class="panel" style="margin-top:10px">
-          <h4>PMTA Live Panel</h4>
+          <h4><span class="headingRow">PMTA Live Panel <span class="tip" data-tip="Real-time PMTA monitor snapshot for queue, traffic, and pressure signals.">ⓘ</span></span></h4>
           <div class="pmtaLive" data-k="pmtaLine">—</div>
           <div class="mini" style="margin-top:6px" data-k="pmtaNote">Note: <b>sent</b> = accepted by PMTA (client-side). Delivery may still be queued/deferred.</div>
           <div class="mini" style="margin-top:6px" data-k="pmtaDiag">Diag: —</div>
         </div>
 
         <details class="more">
-          <summary>More details</summary>
+          <summary>More details <span class="tip" data-tip="Expanded diagnostics, outcomes, and preflight history for the selected job.">ⓘ</span></summary>
           <div class="moreGrid">
 
             <!-- 5) Top domains -->
             <div class="panel">
-              <h4>Top domains (Top 10)</h4>
+              <h4><span class="headingRow">Top domains (Top 10) <span class="tip" data-tip="Most active domains in the plan with send/fail progress and PMTA domain overlays.">ⓘ</span></span></h4>
               <div class="mini" data-k="topDomains">—</div>
-              <div class="mini" style="margin-top:10px"><b>Domain progress (bars)</b></div>
+              <div class="mini" style="margin-top:10px"><b>Domain progress (bars)</b> <span class="tip" data-tip="Visual completion bars by top domain in the active plan.">ⓘ</span></div>
               <div data-k="topDomainsBars"></div>
             </div>
 
             <div class="panel">
-              <h4>Quality + Errors</h4>
+              <h4>
+                <span class="headingRow">
+                  Quality + Errors
+                  <span class="tip" data-tip="Quality counters and accounting error analytics for this job.">ⓘ</span>
+                  <span class="liveStatus" data-k="monitorStatus"><span class="liveDot"></span>Disconnected</span>
+                </span>
+              </h4>
 
               <!-- 6) counters -->
               <div class="mini" data-k="counters">—</div>
 
               <div style="height:10px"></div>
-              <div class="mini"><b>Outcomes (PMTA accounting)</b></div>
+              <div class="mini"><b>Outcomes (PMTA accounting)</b> <span class="tip" data-tip="Delivered / bounced / deferred / complained outcomes from PMTA accounting stream.">ⓘ</span></div>
               <div class="outcomesWrap" data-k="outcomes">—</div>
               <div class="outTrend" data-k="outcomeTrend">—</div>
 
               <div style="height:10px"></div>
 
               <!-- 7) error types -->
-              <div class="mini"><b>Error types</b></div>
+              <div class="mini"><b>Error types</b> <span class="tip" data-tip="Error categories and dominant SMTP signature extracted from recent failures.">ⓘ</span></div>
               <div class="mini" data-k="errorTypes">—</div>
 
               <div style="height:10px"></div>
 
-              <div class="mini"><b>Last errors (last 10)</b></div>
+              <div class="mini"><b>Last errors (last 10)</b> <span class="tip" data-tip="Most recent 10 accounting error lines (4XX/5XX only).">ⓘ</span></div>
               <div class="mini" data-k="lastErrors">—</div>
             </div>
 
@@ -3247,7 +3283,7 @@ PAGE_JOBS = r"""
 
           <!-- 8) Preflight history per chunk -->
           <div class="panel" style="margin-top:10px">
-            <h4>Chunk preflight history (last 12)</h4>
+            <h4><span class="headingRow">Chunk preflight history (last 12) <span class="tip" data-tip="Recent preflight checks, attempts, and retry decisions before sending each chunk.">ⓘ</span></span></h4>
             <div style="overflow:auto; margin-top:8px">
               <table>
                 <thead>
@@ -3828,6 +3864,15 @@ This will remove it from Jobs history.`);
       const pm = j.pmta_live || null;
       const pr = j.pmta_pressure || null;
       pmEl.innerHTML = _renderPmtaPanel(pm, pr);
+    }
+
+    const monitorStatusEl = qk(card,'monitorStatus');
+    if(monitorStatusEl){
+      const pm = j.pmta_live || {};
+      const connected = !!(pm && pm.enabled && pm.ok);
+      monitorStatusEl.classList.remove('good','bad');
+      monitorStatusEl.classList.add(connected ? 'good' : 'bad');
+      monitorStatusEl.innerHTML = `<span class="liveDot"></span>${connected ? 'Connected' : 'Disconnected'}`;
     }
 
     // PMTA diagnostics snapshot (point 7)
