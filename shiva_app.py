@@ -7711,6 +7711,8 @@ try:
     PMTA_BRIDGE_PULL_MAX_LINES = int((os.getenv("PMTA_BRIDGE_PULL_MAX_LINES", "2000") or "2000").strip())
 except Exception:
     PMTA_BRIDGE_PULL_MAX_LINES = 2000
+PMTA_BRIDGE_PULL_KIND = (os.getenv("PMTA_BRIDGE_PULL_KIND", "acct") or "acct").strip().lower()
+PMTA_BRIDGE_PULL_ALL_FILES = (os.getenv("PMTA_BRIDGE_PULL_ALL_FILES", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
 
 _BRIDGE_DEBUG_LOCK = threading.Lock()
 _BRIDGE_DEBUG_STATE: Dict[str, Any] = {
@@ -7937,6 +7939,27 @@ def _parse_accounting_line(line: str, *, path: str = "") -> Optional[dict]:
     return ev
 
 
+def _normalize_accounting_event(ev: dict) -> dict:
+    """Normalize common PMTA/accounting header fields to stable aliases."""
+    if not isinstance(ev, dict):
+        return {}
+    out = dict(ev)
+    for k, v in list(ev.items()):
+        kk = str(k or "").strip().lower().replace("_", "-")
+        if not kk:
+            continue
+        vv = str(v or "").strip()
+        if not vv:
+            continue
+        if "x-job-id" in kk and not out.get("x-job-id"):
+            out["x-job-id"] = vv
+        if "x-campaign-id" in kk and not out.get("x-campaign-id"):
+            out["x-campaign-id"] = vv
+        if "message-id" in kk and not out.get("message-id"):
+            out["message-id"] = vv
+    return out
+
+
 def _push_outcome_bucket(job: SendJob, kind: str):
     try:
         now_min = int(time.time() // 60)
@@ -8058,6 +8081,7 @@ def process_pmta_accounting_event(ev: dict) -> dict:
     """Process one accounting event dict. Returns small result info."""
     if not isinstance(ev, dict):
         return {"ok": False, "reason": "not_dict"}
+    ev = _normalize_accounting_event(ev)
 
     typ = _normalize_outcome_type(
         ev.get("type")
@@ -8199,7 +8223,11 @@ def _poll_accounting_bridge_once() -> dict:
         url = url.rstrip("/") + "/api/v1/pull/latest"
 
     sep = "&" if "?" in url else "?"
-    req_url = f"{url}{sep}max_lines={max(1, int(PMTA_BRIDGE_PULL_MAX_LINES or 1))}"
+    req_url = (
+        f"{url}{sep}kind={quote_plus(PMTA_BRIDGE_PULL_KIND or 'acct')}"
+        f"&max_lines={max(1, int(PMTA_BRIDGE_PULL_MAX_LINES or 1))}"
+        f"&all={1 if PMTA_BRIDGE_PULL_ALL_FILES else 0}"
+    )
     _bridge_debug_update(last_req_url=req_url)
 
     headers = {"Accept": "application/json"}
@@ -9489,6 +9517,10 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "Polling interval (seconds) for Shiva bridge pull thread."},
     {"key": "PMTA_BRIDGE_PULL_MAX_LINES", "type": "int", "default": "2000", "group": "Accounting", "restart_required": False,
      "desc": "max_lines query used when Shiva pulls from bridge endpoint."},
+    {"key": "PMTA_BRIDGE_PULL_KIND", "type": "str", "default": "acct", "group": "Accounting", "restart_required": False,
+     "desc": "Bridge kind requested by Shiva (acct|diag|log|pmtahttp|all)."},
+    {"key": "PMTA_BRIDGE_PULL_ALL_FILES", "type": "bool", "default": "0", "group": "Accounting", "restart_required": False,
+     "desc": "When enabled, Shiva asks bridge to return new lines from all matched files (not only latest)."},
 
     # App (restart-only)
     {"key": "DB_CLEAR_ON_START", "type": "bool", "default": "0", "group": "App", "restart_required": True,
@@ -9601,6 +9633,7 @@ def reload_runtime_config() -> dict:
         global PMTA_DOMAIN_STATS, PMTA_DOMAINS_POLL_S, PMTA_DOMAINS_TOP_N
         global OPENROUTER_ENDPOINT, OPENROUTER_MODEL, OPENROUTER_TIMEOUT_S
         global PMTA_BRIDGE_PULL_ENABLED, PMTA_BRIDGE_PULL_URL, PMTA_BRIDGE_PULL_TOKEN, PMTA_BRIDGE_PULL_S, PMTA_BRIDGE_PULL_MAX_LINES
+        global PMTA_BRIDGE_PULL_KIND, PMTA_BRIDGE_PULL_ALL_FILES
 
         # Spam
         SPAMCHECK_BACKEND = (cfg_get_str("SPAMCHECK_BACKEND", "spamd") or "spamd").strip().lower()
@@ -9659,6 +9692,8 @@ def reload_runtime_config() -> dict:
         PMTA_BRIDGE_PULL_TOKEN = (cfg_get_str("PMTA_BRIDGE_PULL_TOKEN", PMTA_BRIDGE_PULL_TOKEN) or "").strip()
         PMTA_BRIDGE_PULL_S = float(cfg_get_float("PMTA_BRIDGE_PULL_S", float(PMTA_BRIDGE_PULL_S or 5.0)))
         PMTA_BRIDGE_PULL_MAX_LINES = int(cfg_get_int("PMTA_BRIDGE_PULL_MAX_LINES", int(PMTA_BRIDGE_PULL_MAX_LINES or 2000)))
+        PMTA_BRIDGE_PULL_KIND = (cfg_get_str("PMTA_BRIDGE_PULL_KIND", PMTA_BRIDGE_PULL_KIND) or "acct").strip().lower()
+        PMTA_BRIDGE_PULL_ALL_FILES = bool(cfg_get_bool("PMTA_BRIDGE_PULL_ALL_FILES", bool(PMTA_BRIDGE_PULL_ALL_FILES)))
 
         # If bridge pull gets enabled/configured from UI after startup, ensure poller thread is running.
         start_accounting_bridge_poller_if_needed()
@@ -10704,6 +10739,8 @@ def api_accounting_bridge_status():
     state["pull_enabled"] = bool(PMTA_BRIDGE_PULL_ENABLED)
     state["pull_interval_s"] = float(PMTA_BRIDGE_PULL_S or 0)
     state["pull_max_lines"] = int(PMTA_BRIDGE_PULL_MAX_LINES or 0)
+    state["pull_kind"] = (PMTA_BRIDGE_PULL_KIND or "").strip()
+    state["pull_all_files"] = bool(PMTA_BRIDGE_PULL_ALL_FILES)
     state["pull_url"] = (PMTA_BRIDGE_PULL_URL or "").strip()
     state["pull_url_configured"] = bool(state["pull_url"])
     if state["pull_url"]:

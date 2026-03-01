@@ -119,6 +119,25 @@ def list_dir_files(patterns: List[str]) -> List[Dict[str, Any]]:
     return items
 
 
+def _find_matching_files(patterns: List[str]) -> List[Path]:
+    candidates: List[Tuple[float, Path]] = []
+    for p in PMTA_LOG_DIR.iterdir():
+        if not p.is_file() or p.is_symlink():
+            continue
+        if not _file_matches(p.name, patterns):
+            continue
+        try:
+            candidates.append((p.stat().st_mtime, p))
+        except FileNotFoundError:
+            continue
+
+    if not candidates:
+        raise HTTPException(status_code=404, detail="No accounting/log files matched")
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return [p for _, p in candidates]
+
+
 def _find_latest_file(patterns: List[str]) -> Path:
     candidates: List[Tuple[float, Path]] = []
     for p in PMTA_LOG_DIR.iterdir():
@@ -240,6 +259,7 @@ def get_files(
 
 @app.get("/api/v1/pull/latest")
 def pull_latest_accounting(
+    request: Request,
     kind: str = "acct",
     max_lines: int = DEFAULT_PUSH_MAX_LINES,
     _: None = Depends(require_token),
@@ -249,17 +269,45 @@ def pull_latest_accounting(
     if not patterns:
         raise HTTPException(status_code=400, detail=f"Invalid kind. Use one of: {list(ALLOWED_KINDS.keys())}")
 
-    latest = _find_latest_file(patterns)
-    chunk = _read_new_lines(latest, max_lines)
+    read_all = (request.query_params.get("all", "0").strip().lower() in {"1", "true", "yes", "on"})
+
+    if not read_all:
+        latest = _find_latest_file(patterns)
+        chunk = _read_new_lines(latest, max_lines)
+        return {
+            "ok": True,
+            "kind": kind,
+            "mode": "latest",
+            "file": chunk["file"],
+            "from_offset": chunk["from_offset"],
+            "to_offset": chunk["to_offset"],
+            "has_more": chunk["has_more"],
+            "count": chunk["count"],
+            "lines": chunk["lines"],
+        }
+
+    files = _find_matching_files(patterns)
+    safe_max = max(1, int(max_lines or 1))
+    lines: List[str] = []
+    touched: List[str] = []
+    for fp in files:
+        if len(lines) >= safe_max:
+            break
+        remaining = safe_max - len(lines)
+        chunk = _read_new_lines(fp, remaining)
+        if chunk.get("count"):
+            touched.append(fp.name)
+            lines.extend(chunk.get("lines") or [])
+
     return {
         "ok": True,
         "kind": kind,
-        "file": chunk["file"],
-        "from_offset": chunk["from_offset"],
-        "to_offset": chunk["to_offset"],
-        "has_more": chunk["has_more"],
-        "count": chunk["count"],
-        "lines": chunk["lines"],
+        "mode": "all",
+        "files_seen": len(files),
+        "files_touched": touched,
+        "count": len(lines),
+        "lines": lines,
+        "has_more": False,
     }
 
 
