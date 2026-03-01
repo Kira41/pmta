@@ -8288,31 +8288,26 @@ def _poll_accounting_bridge_once() -> dict:
         _bridge_debug_update(last_ok=False, last_error="invalid_bridge_payload", last_job_id=job_id, last_mails_matched_job_id=[])
         return {"ok": False, "error": "invalid_bridge_payload", "processed": 0}
 
-    matched_emails = obj.get("mails_matched_job_id") if isinstance(obj, dict) else None
-    if not isinstance(matched_emails, list):
-        matched_emails = []
+    processed = len(bridge_rows)
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            _bridge_debug_update(last_ok=False, last_error="job_not_found", last_job_id=job_id, last_mails_matched_job_id=[])
+            return {"ok": False, "error": "job_not_found", "processed": 0, "count": processed, "job_id": job_id}
 
-    processed = 0
-    for row in bridge_rows:
-        ev: Optional[dict] = row if isinstance(row, dict) else None
-        if not ev:
-            continue
-        res = process_pmta_accounting_event({
-            "type": ev.get("type"),
-            "email": ev.get("email"),
-            "x-job-id": ev.get("job_id") or job_id,
-        })
-        processed += 1
-        if not res.get("ok"):
-            continue
+        # Requested behavior: use only the current bridge response line count
+        # as the delivery value on each pull.
+        job.delivered = int(processed)
+        job.accounting_last_ts = now_iso()
+        job.maybe_persist()
 
     _bridge_debug_update(
         last_ok=True,
         last_error="",
         last_job_id=job_id,
-        last_mails_matched_job_id=[str(x or "").strip().lower() for x in matched_emails if str(x or "").strip()],
+        last_mails_matched_job_id=[],
     )
-    return {"ok": True, "processed": processed, "count": len(bridge_rows), "job_id": job_id}
+    return {"ok": True, "processed": processed, "count": processed, "job_id": job_id}
 
 
 def _accounting_bridge_poller_thread():

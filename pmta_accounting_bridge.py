@@ -766,73 +766,32 @@ def pull_latest_accounting(
     group_by_header: int = 1,
     _: None = Depends(require_token),
 ):
-    """Return job scoped records (type/email/job_id) collected from all accounting CSV files.
+    """Return raw lines that contain the requested X-Job-ID across all accounting files.
 
-    This endpoint intentionally supports one accounting flow only:
-    - Shiva sends header: X-Job-ID
-    - Bridge searches all acct-*.csv files
-    - Bridge returns only: type, email, job_id
+    Bridge does not parse CSV/JSON rows here; it only filters text lines by job id.
     """
     jid = _normalize_job_id(request.headers.get("x-job-id", ""))
     if not jid:
         raise HTTPException(status_code=400, detail="Missing required header: X-Job-ID")
 
     patterns = ALLOWED_KINDS.get("acct") or ["acct-*.csv"]
-    rows: List[Dict[str, str]] = []
-    matched_emails: List[str] = []
-    for ev in _walk_accounting_events(patterns):
-        # Use explicit accounting job-id only.
-        # This avoids matching older rows by message-id-derived ids.
-        ev_jid = _event_explicit_job_id(ev)
-        if ev_jid != jid:
-            continue
+    files = _find_matching_files(patterns)
+    rows: List[str] = []
 
-        email = str(
-            ev.get("rcpt")
-            or ev.get("recipient")
-            or ev.get("email")
-            or ev.get("to")
-            or ev.get("rcpt_to")
-            or ""
-        ).strip().lower()
-        if not email:
-            continue
-
-        outcome = _normalize_outcome_type(
-            ev.get("type")
-            or ev.get("event")
-            or ev.get("kind")
-            or ev.get("record")
-            or ev.get("status")
-            or ev.get("result")
-            or ev.get("state")
-            or ev.get("dsnAction")
-            or ev.get("dsn_action")
-            or ev.get("dsnStatus")
-            or ev.get("dsn_status")
-            or ev.get("dsnDiag")
-            or ev.get("dsn_diag")
-        )
-        letter_map = {
-            "deferred": "T",
-            "delivered": "D",
-            "bounced": "B",
-        }
-        out_type = letter_map.get(outcome, "")
-        if not out_type:
-            continue
-
-        rows.append({"type": out_type, "email": email, "job_id": jid})
-        matched_emails.append(email)
-
-    unique_matched_emails = sorted(set(matched_emails))
+    for fp in files:
+        with fp.open("r", encoding="utf-8", errors="replace") as f:
+            for raw_line in f:
+                line = str(raw_line or "").strip()
+                if not line:
+                    continue
+                if jid in line.lower():
+                    rows.append(line)
 
     return {
         "ok": True,
         "job_id": jid,
         "count": len(rows),
         "lines": rows,
-        "mails_matched_job_id": unique_matched_emails,
     }
 
 
