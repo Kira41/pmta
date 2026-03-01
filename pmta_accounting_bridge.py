@@ -3,6 +3,7 @@ import os
 import fnmatch
 import json
 import csv
+import re
 import threading
 from pathlib import Path
 from datetime import datetime, timezone
@@ -66,6 +67,87 @@ ACCOUNTING_HEADER_CANDIDATES = [
     "message-id",
     "message_id",
 ]
+
+_JOBID_RE_1 = re.compile(r"[.][a-f0-9]{8,64}[.]([a-f0-9]{12})[.]([a-f0-9]{8,64}|none)[.]c[0-9]+[.]w[0-9]+@local", re.IGNORECASE)
+_JOBID_RE_2 = re.compile(r"[.][a-f0-9]{8,64}[.]([a-f0-9]{12})[.]c[0-9]+[.]w[0-9]+@local", re.IGNORECASE)
+
+
+def _extract_job_id_from_text(text: str) -> str:
+    t = str(text or "").strip().lower()
+    if not t:
+        return ""
+    m = _JOBID_RE_1.search(t)
+    if m:
+        return str(m.group(1) or "").strip().lower()
+    m = _JOBID_RE_2.search(t)
+    if m:
+        return str(m.group(1) or "").strip().lower()
+    return ""
+
+
+def _normalize_outcome_type(v: Any) -> str:
+    s = str(v or "").strip().lower()
+    if not s:
+        return ""
+    if s in {"d", "delivered", "delivery", "success", "accepted", "ok", "sent"}:
+        return "delivered"
+    if s in {"b", "bounce", "bounced", "hardbounce", "softbounce", "failed", "failure", "reject", "rejected", "error"}:
+        return "bounced"
+    if s in {"t", "defer", "deferred", "deferral", "transient"}:
+        return "deferred"
+    if s in {"c", "complaint", "complained", "fbl"}:
+        return "complained"
+    if any(x in s for x in ("success", "2.0.0", "relayed", "delivered", "accepted", "250 ")):
+        return "delivered"
+    if any(x in s for x in ("bounce", "bounced", "failed", "failure", "reject", "5.", " 550", " 551", " 552", " 553", " 554")):
+        return "bounced"
+    if any(x in s for x in ("defer", "deferred", "transient", "4.", " 421", " 450", " 451", " 452")):
+        return "deferred"
+    if any(x in s for x in ("complaint", "fbl", "abuse")):
+        return "complained"
+    return ""
+
+
+def _event_value(ev: Dict[str, Any], *names: str) -> str:
+    aliases = {str(n or "").strip().lower().replace("_", "-") for n in names if str(n or "").strip()}
+    if not aliases:
+        return ""
+    for k, v in (ev or {}).items():
+        kk = str(k or "").strip().lower().replace("_", "-")
+        vv = str(v or "").strip()
+        if kk in aliases and vv:
+            return vv
+    for k, v in (ev or {}).items():
+        kk = str(k or "").strip().lower().replace("_", "-")
+        vv = str(v or "").strip()
+        if vv and any(a in kk for a in aliases):
+            return vv
+    return ""
+
+
+def _event_job_id(ev: Dict[str, Any]) -> str:
+    jid = _event_value(ev, "header_x-job-id", "x-job-id", "job-id", "job_id", "jobid")
+    jid = str(jid or "").strip().lower()
+    if jid:
+        return jid
+    msgid = _event_value(ev, "header_message-id", "message-id", "message_id", "msgid", "messageid")
+    jid = _extract_job_id_from_text(msgid)
+    if jid:
+        return jid
+    return _extract_job_id_from_text(str(ev.get("raw") or ""))
+
+
+def _walk_accounting_events(patterns: List[str]):
+    files = _find_matching_files(patterns)
+    for fp in files:
+        with fp.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                s = (line or "").strip()
+                if not s:
+                    continue
+                ev = _parse_accounting_line(s, source_file=fp.name)
+                if ev:
+                    yield ev
 
 
 def require_token(request: Request):
@@ -481,9 +563,91 @@ def root():
             "health": "/health",
             "files": "/api/v1/files?kind=acct",
             "pull_latest": "/api/v1/pull/latest?kind=acct",
+            "job_outcomes": "/api/v1/job/outcomes?job_id=<job_id>",
         },
     }
 
+
+
+
+@app.get("/api/v1/job/outcomes")
+def get_job_outcomes(
+    job_id: str = "",
+    _: None = Depends(require_token),
+):
+    """Scrape all accounting CSV files and return recipients grouped by outcome for one job id."""
+    jid = str(job_id or "").strip().lower()
+    if not jid:
+        raise HTTPException(status_code=400, detail="Missing required query param: job_id")
+
+    patterns = ALLOWED_KINDS.get("acct") or ["acct-*.csv"]
+    by_recipient: Dict[str, str] = {}
+    status_rank = {"deferred": 1, "delivered": 2, "bounced": 2, "complained": 2}
+
+    for ev in _walk_accounting_events(patterns):
+        ev_jid = _event_job_id(ev)
+        if ev_jid != jid:
+            continue
+
+        rcpt = str(
+            ev.get("rcpt")
+            or ev.get("recipient")
+            or ev.get("email")
+            or ev.get("to")
+            or ev.get("rcpt_to")
+            or ""
+        ).strip().lower()
+        if not rcpt:
+            continue
+
+        typ = _normalize_outcome_type(
+            ev.get("type")
+            or ev.get("event")
+            or ev.get("kind")
+            or ev.get("record")
+            or ev.get("status")
+            or ev.get("result")
+            or ev.get("state")
+            or ev.get("dsnAction")
+            or ev.get("dsn_action")
+            or ev.get("dsnStatus")
+            or ev.get("dsn_status")
+            or ev.get("dsnDiag")
+            or ev.get("dsn_diag")
+        )
+        if typ not in {"delivered", "bounced", "deferred", "complained"}:
+            continue
+
+        prev = by_recipient.get(rcpt)
+        if not prev:
+            by_recipient[rcpt] = typ
+            continue
+        if status_rank.get(typ, 0) >= status_rank.get(prev, 0):
+            by_recipient[rcpt] = typ
+
+    buckets: Dict[str, List[str]] = {
+        "delivered": [],
+        "deferred": [],
+        "bounced": [],
+        "complained": [],
+    }
+    for email, typ in by_recipient.items():
+        buckets[typ].append(email)
+
+    for k in buckets:
+        buckets[k] = sorted(set(buckets[k]))
+
+    total_unique = sum(len(v) for v in buckets.values())
+    return {
+        "ok": True,
+        "job_id": jid,
+        "count": total_unique,
+        "emails": sorted(by_recipient.keys()),
+        "delivered": {"count": len(buckets["delivered"]), "emails": buckets["delivered"]},
+        "deferred": {"count": len(buckets["deferred"]), "emails": buckets["deferred"]},
+        "bounced": {"count": len(buckets["bounced"]), "emails": buckets["bounced"]},
+        "complained": {"count": len(buckets["complained"]), "emails": buckets["complained"]},
+    }
 
 @app.get("/api/v1/files")
 def get_files(

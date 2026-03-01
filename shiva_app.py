@@ -8263,6 +8263,65 @@ def _bridge_collect_pull_targets() -> List[Dict[str, str]]:
     return targets
 
 
+def _sync_job_outcomes_from_bridge(job_id: str) -> Dict[str, Any]:
+    """Fetch aggregated recipients/outcomes for one job-id from bridge and apply to job counters."""
+    jid = str(job_id or "").strip().lower()
+    if not jid:
+        return {"ok": False, "error": "missing_job_id", "synced": 0}
+
+    with JOBS_LOCK:
+        job = JOBS.get(jid)
+    if not job:
+        return {"ok": False, "error": "job_not_found", "synced": 0}
+
+    base_url = (PMTA_BRIDGE_PULL_URL or "").strip()
+    if not base_url:
+        return {"ok": False, "error": "bridge_pull_url_not_configured", "synced": 0}
+
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", base_url):
+        base_url = f"http://{base_url}"
+
+    if "/api/v1/" in base_url:
+        base_url = base_url.split("/api/v1/", 1)[0]
+    req_url = f"{base_url.rstrip('/')}/api/v1/job/outcomes?job_id={quote_plus(jid)}"
+
+    headers = {"Accept": "application/json"}
+    if PMTA_BRIDGE_PULL_TOKEN:
+        headers["Authorization"] = f"Bearer {PMTA_BRIDGE_PULL_TOKEN}"
+
+    try:
+        req = Request(req_url, headers=headers, method="GET")
+        with urlopen(req, timeout=20) as resp:
+            raw = (resp.read() or b"{}").decode("utf-8", errors="replace")
+        payload = json.loads(raw)
+    except Exception as e:
+        return {"ok": False, "error": f"bridge_job_outcomes_failed: {e}", "synced": 0}
+
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return {"ok": False, "error": "invalid_bridge_job_outcomes_payload", "synced": 0}
+
+    synced = 0
+    with JOBS_LOCK:
+        target_job = JOBS.get(jid)
+        if not target_job:
+            return {"ok": False, "error": "job_not_found", "synced": 0}
+
+        for typ in ("delivered", "deferred", "bounced", "complained"):
+            block = payload.get(typ) or {}
+            emails = block.get("emails") if isinstance(block, dict) else []
+            if not isinstance(emails, list):
+                continue
+            for rcpt in emails:
+                e = str(rcpt or "").strip().lower()
+                if not e:
+                    continue
+                _apply_outcome_to_job(target_job, e, typ)
+                synced += 1
+        target_job.maybe_persist()
+
+    return {"ok": True, "synced": synced, "count": int(payload.get("count") or 0)}
+
+
 def _bridge_pick_target(targets: List[Dict[str, str]]) -> Dict[str, str]:
     if not targets:
         return {"scope": "all"}
@@ -8304,7 +8363,10 @@ def _poll_accounting_bridge_once() -> dict:
     )
 
     target = _bridge_pick_target(_bridge_collect_pull_targets())
-    _bridge_debug_update(last_req_url=req_url, last_target=target)
+    sync_res = {}
+    if isinstance(target, dict) and target.get("x-job-id"):
+        sync_res = _sync_job_outcomes_from_bridge(str(target.get("x-job-id")))
+    _bridge_debug_update(last_req_url=req_url, last_target=target, last_job_sync=sync_res)
 
     headers = {"Accept": "application/json"}
     if PMTA_BRIDGE_PULL_TOKEN:
