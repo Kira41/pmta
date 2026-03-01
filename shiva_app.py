@@ -8235,6 +8235,35 @@ def _bridge_pick_target(targets: List[Dict[str, str]]) -> Dict[str, str]:
         _BRIDGE_TARGET_CURSOR = idx + 1
     return targets[idx]
 
+
+def _bridge_row_to_event(row: Any, *, job_id: str) -> Optional[dict]:
+    """Convert one bridge line/object into a normalized accounting event dict.
+
+    Bridge pull payload usually returns raw accounting lines in `lines`.
+    We parse CSV/JSON with existing accounting parser, then enforce type from first
+    comma-separated token as requested (D/B/T/...).
+    """
+    ev: Optional[dict] = None
+
+    if isinstance(row, dict):
+        ev = dict(row)
+    else:
+        line = str(row or "").strip()
+        if not line:
+            return None
+        ev = _parse_accounting_line(line, path="bridge_pull") or {"raw": line}
+
+        # Required behavior: split by comma and use first segment to determine type.
+        first = line.split(",", 1)[0].strip().lower()
+        if first:
+            ev["type"] = first
+
+    ev = _normalize_accounting_event(ev or {})
+    if job_id and not _normalize_job_id(_event_value(ev, "x-job-id", "job-id", "job_id", "jobid")):
+        # Keep job context even when row lacks explicit job-id fields.
+        ev["x-job-id"] = job_id
+    return ev
+
 def _poll_accounting_bridge_once() -> dict:
     url = (PMTA_BRIDGE_PULL_URL or "").strip()
     if not url:
@@ -8289,17 +8318,38 @@ def _poll_accounting_bridge_once() -> dict:
         return {"ok": False, "error": "invalid_bridge_payload", "processed": 0}
 
     processed = len(bridge_rows)
+    accepted = 0
+    rejected = 0
+    reasons: Dict[str, int] = {}
+
     with JOBS_LOCK:
-        job = JOBS.get(job_id)
-        if not job:
+        if job_id not in JOBS:
             _bridge_debug_update(last_ok=False, last_error="job_not_found", last_job_id=job_id, last_mails_matched_job_id=[])
             return {"ok": False, "error": "job_not_found", "processed": 0, "count": processed, "job_id": job_id}
 
-        # Requested behavior: use only the current bridge response line count
-        # as the delivery value on each pull.
-        job.delivered = int(processed)
-        job.accounting_last_ts = now_iso()
-        job.maybe_persist()
+    # Parse each matching bridge row and update full Jobs accounting sections
+    # (Delivered/Bounced/Deferred/Complained + Quality and Errors).
+    for row in bridge_rows:
+        ev = _bridge_row_to_event(row, job_id=job_id)
+        if not ev:
+            rejected += 1
+            reasons["empty_row"] = int(reasons.get("empty_row", 0)) + 1
+            continue
+
+        res = process_pmta_accounting_event(ev)
+        if bool(res.get("ok")):
+            accepted += 1
+            continue
+
+        rejected += 1
+        rs = str(res.get("reason") or "rejected")
+        reasons[rs] = int(reasons.get(rs, 0)) + 1
+
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job:
+            job.accounting_last_ts = now_iso()
+            job.maybe_persist()
 
     _bridge_debug_update(
         last_ok=True,
@@ -8307,7 +8357,15 @@ def _poll_accounting_bridge_once() -> dict:
         last_job_id=job_id,
         last_mails_matched_job_id=[],
     )
-    return {"ok": True, "processed": processed, "count": processed, "job_id": job_id}
+    return {
+        "ok": True,
+        "processed": processed,
+        "accepted": accepted,
+        "rejected": rejected,
+        "reasons": reasons,
+        "count": accepted,
+        "job_id": job_id,
+    }
 
 
 def _accounting_bridge_poller_thread():
