@@ -360,6 +360,107 @@ def _merge_batches(batches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     )
 
 
+def _normalize_match_value(v: Any) -> str:
+    s = str(v or "").strip().lower()
+    if not s:
+        return ""
+    if s.startswith("<") and s.endswith(">"):
+        s = s[1:-1].strip()
+    return s
+
+
+def _event_matches_filter(ev: Dict[str, Any], filters: Dict[str, str]) -> bool:
+    if not filters:
+        return True
+
+    normalized = {}
+    for k, v in (ev or {}).items():
+        kk = str(k or "").strip().lower().replace("_", "-")
+        vv = _normalize_match_value(v)
+        if kk and vv:
+            normalized[kk] = vv
+
+    job_id = _normalize_match_value(filters.get("job_id"))
+    campaign_id = _normalize_match_value(filters.get("campaign_id"))
+    message_id = _normalize_match_value(filters.get("message_id"))
+
+    if job_id:
+        vals = [
+            normalized.get("x-job-id", ""),
+            normalized.get("job-id", ""),
+            normalized.get("jobid", ""),
+        ]
+        if job_id not in vals:
+            return False
+
+    if campaign_id:
+        vals = [
+            normalized.get("x-campaign-id", ""),
+            normalized.get("campaign-id", ""),
+            normalized.get("cid", ""),
+        ]
+        if campaign_id not in vals:
+            return False
+
+    if message_id:
+        vals = [
+            normalized.get("message-id", ""),
+            normalized.get("msgid", ""),
+            normalized.get("messageid", ""),
+            normalized.get("header-message-id", ""),
+        ]
+        if message_id not in vals:
+            return False
+
+    return True
+
+
+
+
+def _build_batches_from_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for ev in events or []:
+        header_key, header_value = _event_header_value(ev)
+        key = (header_key, header_value)
+        if key not in by_key:
+            by_key[key] = {
+                "header_key": header_key,
+                "header_value": header_value,
+                "count": 0,
+                "emails": [],
+                "events": [],
+            }
+        dst = by_key[key]
+        dst["count"] = int(dst.get("count") or 0) + 1
+        recipient = str(ev.get("rcpt") or ev.get("recipient") or ev.get("email") or ev.get("to") or "").strip()
+        if recipient and recipient not in dst["emails"]:
+            dst["emails"].append(recipient)
+        dst["events"].append(ev)
+
+    return _merge_batches(list(by_key.values()))
+
+def _request_filters(request: Request) -> Dict[str, str]:
+    q = request.query_params
+    return {
+        "job_id": (
+            request.headers.get("x-job-id", "").strip()
+            or q.get("job_id", "").strip()
+            or q.get("x_job_id", "").strip()
+        ),
+        "campaign_id": (
+            request.headers.get("x-campaign-id", "").strip()
+            or q.get("campaign_id", "").strip()
+            or q.get("x_campaign_id", "").strip()
+        ),
+        "message_id": (
+            request.headers.get("message-id", "").strip()
+            or request.headers.get("x-message-id", "").strip()
+            or q.get("message_id", "").strip()
+            or q.get("msgid", "").strip()
+        ),
+    }
+
+
 @app.get("/health")
 def health():
     return {
@@ -430,11 +531,15 @@ def pull_latest_accounting(
         raise HTTPException(status_code=400, detail=f"Invalid kind. Use one of: {list(ALLOWED_KINDS.keys())}")
 
     read_all = (request.query_params.get("all", "0").strip().lower() in {"1", "true", "yes", "on"})
+    filters = _request_filters(request)
 
     if not read_all:
         latest = _find_latest_file(patterns)
         chunk = _read_new_lines(latest, max_lines)
         grouped = _group_accounting_events(chunk["lines"], source_file=latest.name) if group_by_header else {"events": [], "batches": []}
+        events = grouped["events"] if group_by_header else chunk["lines"]
+        if group_by_header:
+            events = [ev for ev in events if _event_matches_filter(ev, filters)]
         return {
             "ok": True,
             "kind": kind,
@@ -443,9 +548,10 @@ def pull_latest_accounting(
             "from_offset": chunk["from_offset"],
             "to_offset": chunk["to_offset"],
             "has_more": chunk["has_more"],
-            "count": chunk["count"],
-            "lines": grouped["events"] if group_by_header else chunk["lines"],
-            "batches": grouped["batches"],
+            "count": len(events),
+            "lines": events,
+            "batches": _build_batches_from_events(events) if group_by_header else [],
+            "filters": filters,
         }
 
     files = _find_matching_files(patterns)
@@ -453,7 +559,6 @@ def pull_latest_accounting(
     lines: List[str] = []
     touched: List[str] = []
     all_events: List[Dict[str, Any]] = []
-    all_batches: List[Dict[str, Any]] = []
     for fp in files:
         if len(lines) >= safe_max:
             break
@@ -465,9 +570,12 @@ def pull_latest_accounting(
             if group_by_header:
                 grouped = _group_accounting_events(chunk.get("lines") or [], source_file=fp.name)
                 all_events.extend(grouped["events"])
-                all_batches.extend(grouped["batches"])
 
-    merged_batches = _merge_batches(all_batches) if group_by_header else []
+    if group_by_header:
+        all_events = [ev for ev in all_events if _event_matches_filter(ev, filters)]
+        merged_batches = _build_batches_from_events(all_events)
+    else:
+        merged_batches = []
 
     return {
         "ok": True,
@@ -478,6 +586,7 @@ def pull_latest_accounting(
         "count": len(all_events) if group_by_header else len(lines),
         "lines": all_events if group_by_header else lines,
         "batches": merged_batches,
+        "filters": filters,
         "has_more": False,
     }
 

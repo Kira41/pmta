@@ -7713,6 +7713,11 @@ except Exception:
     PMTA_BRIDGE_PULL_MAX_LINES = 2000
 PMTA_BRIDGE_PULL_KIND = (os.getenv("PMTA_BRIDGE_PULL_KIND", "acct") or "acct").strip().lower()
 PMTA_BRIDGE_PULL_ALL_FILES = (os.getenv("PMTA_BRIDGE_PULL_ALL_FILES", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+PMTA_BRIDGE_PULL_TARGET_MODE = (os.getenv("PMTA_BRIDGE_PULL_TARGET_MODE", "auto") or "auto").strip().lower()  # auto|job|campaign|all
+try:
+    PMTA_BRIDGE_PULL_TARGET_LIMIT = int((os.getenv("PMTA_BRIDGE_PULL_TARGET_LIMIT", "12") or "12").strip())
+except Exception:
+    PMTA_BRIDGE_PULL_TARGET_LIMIT = 12
 
 _BRIDGE_DEBUG_LOCK = threading.Lock()
 _BRIDGE_DEBUG_STATE: Dict[str, Any] = {
@@ -7734,10 +7739,14 @@ _BRIDGE_DEBUG_STATE: Dict[str, Any] = {
     "last_processed": 0,
     "last_accepted": 0,
     "last_lines_sample": [],
+    "last_target": {},
 }
 
 _BRIDGE_POLLER_LOCK = threading.Lock()
 _BRIDGE_POLLER_STARTED = False
+
+_BRIDGE_TARGET_CURSOR_LOCK = threading.Lock()
+_BRIDGE_TARGET_CURSOR = 0
 
 
 def _bridge_debug_update(**kwargs: Any) -> None:
@@ -8198,6 +8207,71 @@ def process_campaign_accounting_payload(payload: dict) -> dict:
     return {"ok": True, "campaign_id": campaign_id, "processed": processed, "accepted": accepted}
 
 
+
+def _bridge_collect_pull_targets() -> List[Dict[str, str]]:
+    """Collect targeted pull scopes for bridge requests.
+
+    - job: events for one job (multiple recipients)
+    - campaign: events for one campaign
+    - message: optional one-email scope when message-id is available
+    """
+    mode = (PMTA_BRIDGE_PULL_TARGET_MODE or "auto").strip().lower()
+    if mode in {"", "off", "none"}:
+        mode = "all"
+
+    targets: List[Dict[str, str]] = []
+    with JOBS_LOCK:
+        jobs = [j for j in JOBS.values() if not bool(j.deleted)]
+
+    def _add(kind: str, value: str):
+        vv = str(value or "").strip()
+        if not vv:
+            return
+        key = f"{kind}:{vv.lower()}"
+        if any(t.get("_k") == key for t in targets):
+            return
+        t = {"scope": kind}
+        if kind == "job":
+            t["x-job-id"] = vv
+        elif kind == "campaign":
+            t["x-campaign-id"] = vv
+        elif kind == "message":
+            t["message-id"] = vv
+        t["_k"] = key
+        targets.append(t)
+
+    interesting = [j for j in jobs if (j.status or "") in {"running", "backoff", "paused", "queued"}]
+    if not interesting:
+        interesting = jobs
+
+    if mode in {"auto", "job"}:
+        for j in interesting:
+            _add("job", j.id)
+    if mode in {"auto", "campaign"}:
+        for j in interesting:
+            _add("campaign", j.campaign_id)
+
+    if mode == "all" or not targets:
+        return [{"scope": "all"}]
+
+    lim = max(1, int(PMTA_BRIDGE_PULL_TARGET_LIMIT or 1))
+    if len(targets) > lim:
+        targets = targets[:lim]
+
+    for t in targets:
+        t.pop("_k", None)
+    return targets
+
+
+def _bridge_pick_target(targets: List[Dict[str, str]]) -> Dict[str, str]:
+    if not targets:
+        return {"scope": "all"}
+    global _BRIDGE_TARGET_CURSOR
+    with _BRIDGE_TARGET_CURSOR_LOCK:
+        idx = int(_BRIDGE_TARGET_CURSOR or 0) % len(targets)
+        _BRIDGE_TARGET_CURSOR = idx + 1
+    return targets[idx]
+
 def _poll_accounting_bridge_once() -> dict:
     t0 = time.time()
     url = (PMTA_BRIDGE_PULL_URL or "").strip()
@@ -8228,11 +8302,20 @@ def _poll_accounting_bridge_once() -> dict:
         f"&max_lines={max(1, int(PMTA_BRIDGE_PULL_MAX_LINES or 1))}"
         f"&all={1 if PMTA_BRIDGE_PULL_ALL_FILES else 0}"
     )
-    _bridge_debug_update(last_req_url=req_url)
+
+    target = _bridge_pick_target(_bridge_collect_pull_targets())
+    _bridge_debug_update(last_req_url=req_url, last_target=target)
 
     headers = {"Accept": "application/json"}
     if PMTA_BRIDGE_PULL_TOKEN:
         headers["Authorization"] = f"Bearer {PMTA_BRIDGE_PULL_TOKEN}"
+    if isinstance(target, dict):
+        if target.get("x-job-id"):
+            headers["X-Job-ID"] = str(target.get("x-job-id"))
+        if target.get("x-campaign-id"):
+            headers["X-Campaign-ID"] = str(target.get("x-campaign-id"))
+        if target.get("message-id"):
+            headers["Message-ID"] = str(target.get("message-id"))
 
     try:
         req = Request(req_url, headers=headers, method="GET")
