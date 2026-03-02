@@ -7910,6 +7910,7 @@ except Exception:
 
 _BRIDGE_DEBUG_LOCK = threading.Lock()
 _BRIDGE_DEBUG_STATE: dict[str, Any] = {
+    "last_poll_time": "",
     "last_attempt_ts": "",
     "last_success_ts": "",
     "last_error_ts": "",
@@ -7930,6 +7931,11 @@ _BRIDGE_DEBUG_STATE: dict[str, Any] = {
     "last_lines_sample": [],
     "last_cursor": "",
     "has_more": False,
+    "events_received": 0,
+    "events_ingested": 0,
+    "duplicates_dropped": 0,
+    "job_not_found": 0,
+    "db_write_failures": 0,
 }
 
 _BRIDGE_POLLER_LOCK = threading.Lock()
@@ -8512,6 +8518,8 @@ def _poll_accounting_bridge_once() -> dict:
     global _BRIDGE_CURSOR_COMPAT_WARNED
 
     t0 = time.time()
+    poll_ts = now_iso()
+    _bridge_debug_update(last_poll_time=poll_ts)
     raw_url = (PMTA_BRIDGE_PULL_URL or "").strip()
     if not raw_url:
         _bridge_debug_update(
@@ -8538,6 +8546,8 @@ def _poll_accounting_bridge_once() -> dict:
     total_count = 0
     batches = 0
     used_cursor_fields = False
+    total_duplicates = 0
+    total_job_not_found = 0
     last_obj: Any = {}
     last_rows: list[Any] = []
 
@@ -8627,6 +8637,8 @@ def _poll_accounting_bridge_once() -> dict:
 
         processed = 0
         accepted = 0
+        duplicates = 0
+        job_not_found = 0
         for row in bridge_rows:
             ev: Optional[dict] = None
             if isinstance(row, dict):
@@ -8640,10 +8652,17 @@ def _poll_accounting_bridge_once() -> dict:
                 continue
             res = process_pmta_accounting_event(ev)
             processed += 1
-            accepted += 1 if res.get("ok") else 0
+            if res.get("duplicate"):
+                duplicates += 1
+            elif res.get("reason") == "job_not_found":
+                job_not_found += 1
+            elif res.get("ok"):
+                accepted += 1
 
         total_processed += processed
         total_accepted += accepted
+        total_duplicates += duplicates
+        total_job_not_found += job_not_found
         total_count += len(bridge_rows)
         last_obj = obj
         last_rows = bridge_rows
@@ -8686,6 +8705,7 @@ def _poll_accounting_bridge_once() -> dict:
             break
 
     _bridge_debug_update(
+        last_poll_time=poll_ts,
         last_attempt_ts=now_iso(),
         last_success_ts=now_iso(),
         attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
@@ -8701,6 +8721,11 @@ def _poll_accounting_bridge_once() -> dict:
         last_duration_ms=int((time.time() - t0) * 1000),
         last_cursor=cursor,
         has_more=bool(isinstance(last_obj, dict) and last_obj.get("has_more")),
+        events_received=int(_BRIDGE_DEBUG_STATE.get("events_received", 0) or 0) + total_processed,
+        events_ingested=int(_BRIDGE_DEBUG_STATE.get("events_ingested", 0) or 0) + total_accepted,
+        duplicates_dropped=int(_BRIDGE_DEBUG_STATE.get("duplicates_dropped", 0) or 0) + total_duplicates,
+        job_not_found=int(_BRIDGE_DEBUG_STATE.get("job_not_found", 0) or 0) + total_job_not_found,
+        db_write_failures=int(_DB_WRITER_STATUS.get("failed", 0) or 0) + int(_DB_WRITER_STATUS.get("queue_full", 0) or 0),
     )
     return {
         "ok": True,

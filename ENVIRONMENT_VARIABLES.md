@@ -866,3 +866,59 @@ OPENROUTER_TIMEOUT_S=40
 - **الدوال:** `config_items`, `reload_runtime_config`, `cfg_get_*`.
 - **الفكرة:** عدد كبير من المتغيرات في هذا الملف يُعاد تحميله وقت التشغيل (UI > ENV > Default).
 - **السيناريو:** إذا لم يظهر أثر تعديل `.env`، راجع قيمة المتغير داخل واجهة الإعدادات أولًا.
+
+---
+
+## 9) Bridge Cursor + Visibility (Operational)
+
+### Bridge cursor/pull knobs
+
+- `DEFAULT_PULL_LIMIT` (Bridge, default `500`)
+  - عدد events الافتراضي لكل `GET /api/v1/pull`.
+- `MAX_PULL_LIMIT` (Bridge, default `2000`)
+  - سقف `limit` لمنع payloads كبيرة جدًا.
+- `RECENT_PULL_MAX_FILES` / `RECENT_PULL_MAX_AGE_HOURS`
+  - نطاق الملفات التي يدخلها cursor scan.
+
+**السلوك الجديد (Cursor):**
+- Bridge يرجّع `next_cursor` + `has_more`.
+- Shiva يحفظ `next_cursor` في جدول `bridge_pull_state` ويستكمل منه بعد restart.
+- هذا يمنع فقد outcomes عند إعادة تشغيل Shiva منتصف ingestion.
+
+### Bridge endpoint visibility
+
+- `GET /api/v1/status` (token protected)
+  - `last_processed_file`
+  - `last_cursor`
+  - `parsed`
+  - `skipped`
+  - `unknown_outcome`
+  - `last_error`
+  - `server_time`
+
+> الهدف: تعرف فورًا إن المشكلة parsing في Bridge أو payload/cursor.
+
+### Shiva endpoint visibility
+
+- `GET /api/accounting/bridge/status`
+  - `last_poll_time`
+  - `last_cursor`
+  - `events_received`
+  - `events_ingested`
+  - `duplicates_dropped`
+  - `job_not_found`
+  - `db_write_failures`
+
+> الهدف: تمييز فوري بين (events بلا job mapping) و (مشاكل DB writer/locks).
+
+### Recommended production notes
+
+- ابدأ عادة بالقيم التالية:
+  - `DEFAULT_PULL_LIMIT=500`
+  - `MAX_PULL_LIMIT=2000`
+  - `PMTA_BRIDGE_PULL_MAX_LINES=2000`
+  - `PMTA_BRIDGE_PULL_S=3` إلى `5`
+- SQLite WAL مهم جدًا للتشغيل المستمر:
+  - `PRAGMA journal_mode=WAL`
+  - `PRAGMA busy_timeout` غير صفري لتقليل lock errors
+  - راقب `db_write_failures` من endpoint في حال ضغط عالي.

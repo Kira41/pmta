@@ -1,0 +1,6 @@
+type,timeLogged,mailfrom,rcpt,dsnAction,dsnStatus,dsnDiag,header_x-job-id,header_x-campaign-id,header_message-id
+d,2026-01-01T00:00:00Z,sender@example.com,a@example.com,relayed,2.0.0,250 ok,abcdef123456,camp001,<u1.abcdef123456.camp001.c1.w1@local>
+t,2026-01-01T00:00:01Z,sender@example.com,b@example.com,delayed,4.2.0,451 temp,abcdef123456,camp001,<u2.abcdef123456.camp001.c1.w1@local>
+b,2026-01-01T00:00:02Z,sender@example.com,c@example.com,failed,5.1.1,550 no user,abcdef123456,camp001,<u3.abcdef123456.camp001.c1.w1@local>
+c,2026-01-01T00:00:03Z,sender@example.com,d@example.com,failed,5.7.1,complaint,abcdef123456,camp001,<u4.abcdef123456.camp001.c1.w1@local>
+x,2026-01-01T00:00:04Z,sender@example.com,e@example.com,unknown,0.0.0,unknown,abcdef123456,camp001,<u5.abcdef123456.camp001.c1.w1@local>
