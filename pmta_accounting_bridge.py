@@ -66,22 +66,6 @@ except ModuleNotFoundError:  # pragma: no cover - test/runtime fallback when fas
 PMTA_LOG_DIR = Path(os.getenv("PMTA_LOG_DIR", "/var/log/pmta")).resolve()
 
 
-def _normalize_auth_token(raw: Any) -> str:
-    token = str(raw or "").strip()
-    if not token:
-        return ""
-    if len(token) >= 2 and ((token[0] == '"' and token[-1] == '"') or (token[0] == "'" and token[-1] == "'")):
-        token = token[1:-1].strip()
-    if token.lower().startswith("bearer "):
-        token = token.split(" ", 1)[1].strip()
-    return token
-
-
-# Keep backward compatibility with the historical default, but prefer environment override.
-_DEFAULT_STATIC_API_TOKEN = "mxft0zDIEHkdoTHF94jhxtKe1hdXSjVW5hHskfmuFXEdwzHtt9foI7ZZCz303Jyx"
-API_TOKEN = _normalize_auth_token(os.getenv("API_TOKEN", _DEFAULT_STATIC_API_TOKEN))
-ALLOW_NO_AUTH = os.getenv("ALLOW_NO_AUTH", "0") == "1"
-DEBUG_ALLOW_QUERY_TOKEN = os.getenv("DEBUG_ALLOW_QUERY_TOKEN", "0") == "1"
 DEFAULT_PUSH_MAX_LINES = int(os.getenv("DEFAULT_PUSH_MAX_LINES", "5000"))
 DEFAULT_PULL_LIMIT = int(os.getenv("DEFAULT_PULL_LIMIT", "500"))
 MAX_PULL_LIMIT = int(os.getenv("MAX_PULL_LIMIT", "2000"))
@@ -320,47 +304,9 @@ def _walk_accounting_events(patterns: List[str]):
                     yield ev
 
 
-def require_token(request: Request):
-    """
-    Supported auth methods:
-      - Header: Authorization: Bearer <token>
-      - Header: x-api-token: <token>
-
-    Query param token auth is disabled by default and only allowed when
-    DEBUG_ALLOW_QUERY_TOKEN=1 is explicitly set.
-    """
-    if ALLOW_NO_AUTH:
-        return
-
-    if not API_TOKEN:
-        raise HTTPException(
-            status_code=500,
-            detail={"error": "server_misconfig", "message": "API_TOKEN is not set"},
-        )
-
-    auth = request.headers.get("authorization", "")
-    token = ""
-    if auth.lower().startswith("bearer "):
-        token = auth.split(" ", 1)[1].strip()
-    else:
-        token = request.headers.get("x-api-token", "").strip()
-
-    if not token and DEBUG_ALLOW_QUERY_TOKEN:
-        token = request.query_params.get("token", "").strip() or request.query_params.get("api_token", "").strip()
-
-    token = _normalize_auth_token(token)
-
-    if token != API_TOKEN:
-        raise HTTPException(
-            status_code=401,
-            detail={
-                "error": "unauthorized",
-                "message": "Missing or invalid API token",
-                "auth_methods": ["Authorization: Bearer <token>", "x-api-token: <token>"],
-                "allow_no_auth": ALLOW_NO_AUTH,
-                "debug_query_token_enabled": DEBUG_ALLOW_QUERY_TOKEN,
-            },
-        )
+def require_token(_: Request):
+    """Bridge API is intentionally open; no token/auth is required."""
+    return None
 
 
 def _file_matches(name: str, patterns: List[str]) -> bool:
