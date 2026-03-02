@@ -9134,6 +9134,14 @@ APP_CONFIG_SCHEMA: list[dict] = [
      "desc": "max_lines query used when Shiva pulls from bridge endpoint."},
 
     # App (restart-only)
+    {"key": "SHIVA_HOST", "type": "str", "default": "0.0.0.0", "group": "App", "restart_required": True,
+     "desc": "Bind host used by Flask when Shiva starts. Requires restart."},
+    {"key": "SHIVA_PORT", "type": "int", "default": "5001", "group": "App", "restart_required": True,
+     "desc": "Bind port used by Flask when Shiva starts. Requires restart."},
+    {"key": "SHIVA_DB_PATH", "type": "str", "default": "", "group": "App", "restart_required": True,
+     "desc": "Optional SQLite database path override for Shiva. Requires restart."},
+    {"key": "SMTP_SENDER_DB_PATH", "type": "str", "default": "", "group": "App", "restart_required": True,
+     "desc": "Legacy alias for SHIVA_DB_PATH. Requires restart."},
     {"key": "DB_CLEAR_ON_START", "type": "bool", "default": "0", "group": "App", "restart_required": True,
      "desc": "If enabled: wipes SQLite tables on app start (danger). Requires restart."},
 ]
