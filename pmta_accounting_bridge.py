@@ -64,8 +64,22 @@ except ModuleNotFoundError:  # pragma: no cover - test/runtime fallback when fas
 # Config (ENV)
 # ----------------------------
 PMTA_LOG_DIR = Path(os.getenv("PMTA_LOG_DIR", "/var/log/pmta")).resolve()
-# Static bridge token (kept in code by request to avoid env export dependency).
-API_TOKEN = "mxft0zDIEHkdoTHF94jhxtKe1hdXSjVW5hHskfmuFXEdwzHtt9foI7ZZCz303Jyx"
+
+
+def _normalize_auth_token(raw: Any) -> str:
+    token = str(raw or "").strip()
+    if not token:
+        return ""
+    if len(token) >= 2 and ((token[0] == '"' and token[-1] == '"') or (token[0] == "'" and token[-1] == "'")):
+        token = token[1:-1].strip()
+    if token.lower().startswith("bearer "):
+        token = token.split(" ", 1)[1].strip()
+    return token
+
+
+# Keep backward compatibility with the historical default, but prefer environment override.
+_DEFAULT_STATIC_API_TOKEN = "mxft0zDIEHkdoTHF94jhxtKe1hdXSjVW5hHskfmuFXEdwzHtt9foI7ZZCz303Jyx"
+API_TOKEN = _normalize_auth_token(os.getenv("API_TOKEN", _DEFAULT_STATIC_API_TOKEN))
 ALLOW_NO_AUTH = os.getenv("ALLOW_NO_AUTH", "0") == "1"
 DEBUG_ALLOW_QUERY_TOKEN = os.getenv("DEBUG_ALLOW_QUERY_TOKEN", "0") == "1"
 DEFAULT_PUSH_MAX_LINES = int(os.getenv("DEFAULT_PUSH_MAX_LINES", "5000"))
@@ -333,6 +347,8 @@ def require_token(request: Request):
 
     if not token and DEBUG_ALLOW_QUERY_TOKEN:
         token = request.query_params.get("token", "").strip() or request.query_params.get("api_token", "").strip()
+
+    token = _normalize_auth_token(token)
 
     if token != API_TOKEN:
         raise HTTPException(
