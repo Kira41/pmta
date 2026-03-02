@@ -962,9 +962,16 @@ def db_set_app_config(key: str, value: str) -> bool:
                     try:
                         conn.execute(upsert_sql, (k, v, ts))
                     except sqlite3.OperationalError as e:
-                        # Legacy DBs might have app_config without a UNIQUE/PRIMARY KEY on `key`.
-                        # In that case ON CONFLICT(...) is rejected; fall back to update+insert.
-                        if "on conflict clause" not in str(e).lower():
+                        # Legacy SQLite builds can reject UPSERT syntax entirely (`near "ON": syntax error`),
+                        # and legacy DB schemas might have app_config without a UNIQUE/PRIMARY KEY on `key`
+                        # (`ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint`).
+                        # Fall back to update+insert for both cases.
+                        err = str(e).lower()
+                        if (
+                            "on conflict clause" not in err
+                            and "near \"on\": syntax error" not in err
+                            and "near 'on': syntax error" not in err
+                        ):
                             raise
                         cur = conn.execute(
                             "UPDATE app_config SET value=?, updated_at=? WHERE key=?",
