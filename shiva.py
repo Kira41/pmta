@@ -3644,6 +3644,10 @@ PAGE_JOBS = r"""
               <div style="height:10px"></div>
               <div class="mini"><b>Internal errors (Shiva)</b></div>
               <div class="mini" data-k="internalErrors">—</div>
+
+              <div style="height:10px"></div>
+              <div class="mini"><b>Internal Error Receiver (Shiva ← Bridge.py)</b></div>
+              <div class="mini" data-k="bridgeReceiver">—</div>
             </div>
 
           </div>
@@ -4499,6 +4503,7 @@ This will remove it from Jobs history.`);
       const j = await r.json().catch(()=>({}));
       if(r.ok && j && j.ok && j.bridge){
         const b = j.bridge || {};
+        cards.forEach(card => renderBridgeReceiver(card, b));
         console.log('[Bridge↔Shiva Debug]', {
           connected: !!b.connected,
           last_ok: !!b.last_ok,
@@ -4520,8 +4525,45 @@ This will remove it from Jobs history.`);
         console.warn('[Bridge↔Shiva Debug] bridge status failed', {http_status: r.status, payload: j});
       }
     }catch(e){
+      cards.forEach(card => renderBridgeReceiver(card, null));
       console.error('[Bridge↔Shiva Debug] bridge status exception', e);
     }
+  }
+
+  function renderBridgeReceiver(card, b){
+    const el = qk(card, 'bridgeReceiver');
+    if(!el){ return; }
+
+    if(!b || typeof b !== 'object'){
+      el.textContent = 'Unable to fetch bridge receiver data.';
+      return;
+    }
+
+    const linesSample = Array.isArray(b.last_lines_sample) ? b.last_lines_sample : [];
+    const processed = Number(b.last_processed || 0);
+    const accepted = Number(b.last_accepted || 0);
+    const received = Number(b.events_received || 0);
+    const ingested = Number(b.events_ingested || 0);
+    const duplicates = Number(b.duplicates_dropped || 0);
+    const notFound = Number(b.job_not_found || 0);
+    const bridgeCount = Number(b.last_bridge_count || 0);
+
+    const rows = [
+      `Last poll: <b>${esc((b.last_attempt_ts || '—').toString())}</b> · Last success: <b>${esc((b.last_success_ts || '—').toString())}</b>`,
+      `Bridge rows: <b>${bridgeCount}</b> · Processed by Shiva: <b>${processed}</b> · Accepted: <b>${accepted}</b>`,
+      `Receiver totals → received: <b>${received}</b> · ingested: <b>${ingested}</b> · duplicates: <b>${duplicates}</b> · job_not_found: <b>${notFound}</b>`,
+      `Cursor: <code>${esc((b.last_cursor || '—').toString())}</code>`,
+      `Source URL: <code>${esc((b.last_req_url || b.pull_url_masked || '—').toString())}</code>`,
+    ];
+
+    if(linesSample.length){
+      rows.push('Latest data from Bridge.py:');
+      rows.push(linesSample.map(x => `• <code>${esc((x ?? '').toString())}</code>`).join('<br>'));
+    }else{
+      rows.push('Latest data from Bridge.py: —');
+    }
+
+    el.innerHTML = rows.join('<br>');
   }
 
   document.getElementById('btnRefreshAll')?.addEventListener('click', tickAll);
