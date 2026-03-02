@@ -7947,7 +7947,25 @@ def _get_bridge_pull_url_compat(default: str = "") -> str:
 
 
 PMTA_BRIDGE_PULL_URL = _get_bridge_pull_url_compat("")
-PMTA_BRIDGE_PULL_TOKEN = (os.getenv("PMTA_BRIDGE_PULL_TOKEN", "") or "").strip()
+
+
+def _normalize_bridge_pull_token(raw: Any) -> str:
+    """Normalize bridge token from env/UI values.
+
+    Accepts plain token or accidental `Bearer <token>` wrappers,
+    and strips matching single/double wrapper quotes.
+    """
+    token = str(raw or "").strip()
+    if not token:
+        return ""
+    if len(token) >= 2 and ((token[0] == '"' and token[-1] == '"') or (token[0] == "'" and token[-1] == "'")):
+        token = token[1:-1].strip()
+    if token.lower().startswith("bearer "):
+        token = token.split(" ", 1)[1].strip()
+    return token
+
+
+PMTA_BRIDGE_PULL_TOKEN = _normalize_bridge_pull_token(os.getenv("PMTA_BRIDGE_PULL_TOKEN", ""))
 try:
     PMTA_BRIDGE_PULL_S = float((os.getenv("PMTA_BRIDGE_PULL_S", "5") or "5").strip())
 except Exception:
@@ -8615,8 +8633,9 @@ def _poll_accounting_bridge_once() -> dict:
         return {"ok": False, "error": "bridge_pull_url_not_configured", "processed": 0, "accepted": 0}
 
     headers = {"Accept": "application/json"}
-    if PMTA_BRIDGE_PULL_TOKEN:
-        headers["Authorization"] = f"Bearer {PMTA_BRIDGE_PULL_TOKEN}"
+    bridge_token = _normalize_bridge_pull_token(PMTA_BRIDGE_PULL_TOKEN)
+    if bridge_token:
+        headers["Authorization"] = f"Bearer {bridge_token}"
 
     cursor = _db_get_bridge_cursor()
     total_processed = 0
@@ -10140,7 +10159,7 @@ def reload_runtime_config() -> dict:
         # Bridge pull mode (Shiva -> Bridge)
         PMTA_BRIDGE_PULL_ENABLED = bool(cfg_get_bool("PMTA_BRIDGE_PULL_ENABLED", bool(PMTA_BRIDGE_PULL_ENABLED)))
         PMTA_BRIDGE_PULL_URL = cfg_get_first_str(["PMTA_BRIDGE_PULL_URL", "PMTA_ACCOUNTING_BRIDGE_PULL_URL", "PMTA_BRIDGE_URL"], PMTA_BRIDGE_PULL_URL)
-        PMTA_BRIDGE_PULL_TOKEN = (cfg_get_str("PMTA_BRIDGE_PULL_TOKEN", PMTA_BRIDGE_PULL_TOKEN) or "").strip()
+        PMTA_BRIDGE_PULL_TOKEN = _normalize_bridge_pull_token(cfg_get_str("PMTA_BRIDGE_PULL_TOKEN", PMTA_BRIDGE_PULL_TOKEN))
         PMTA_BRIDGE_PULL_S = float(cfg_get_float("PMTA_BRIDGE_PULL_S", float(PMTA_BRIDGE_PULL_S or 5.0)))
         PMTA_BRIDGE_PULL_MAX_LINES = int(cfg_get_int("PMTA_BRIDGE_PULL_MAX_LINES", int(PMTA_BRIDGE_PULL_MAX_LINES or 2000)))
 

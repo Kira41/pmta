@@ -92,6 +92,16 @@ class BridgeShivaHarnessTests(unittest.TestCase):
         self.assertLess(avg_ms, 20.0)
         self.assertLess(p95_ms, 50.0)
 
+    def test_bridge_token_normalization_accepts_bearer_and_quotes(self):
+        self.assertEqual(
+            shiva._normalize_bridge_pull_token('"Bearer mxft0zDIEHkdoTHF94jhxtKe1hdXSjVW5hHskfmuFXEdwzHtt9foI7ZZCz303Jyx"'),
+            "mxft0zDIEHkdoTHF94jhxtKe1hdXSjVW5hHskfmuFXEdwzHtt9foI7ZZCz303Jyx",
+        )
+        self.assertEqual(
+            shiva._normalize_bridge_pull_token("Bearer abc123"),
+            "abc123",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
