@@ -93,43 +93,20 @@ class BridgeShivaHarnessTests(unittest.TestCase):
         self.assertLess(p95_ms, 50.0)
 
 
-    def test_bridge_url_resolution_falls_back_to_last_req_url(self):
-        old_cfg = shiva.PMTA_BRIDGE_PULL_URL
-        old_state = dict(shiva._BRIDGE_DEBUG_STATE)
-        old_env = os.environ.get("PMTA_BRIDGE_PULL_URL")
-        old_env_legacy = os.environ.get("PMTA_ACCOUNTING_BRIDGE_PULL_URL")
-        old_env_bridge = os.environ.get("PMTA_BRIDGE_URL")
+    def test_bridge_url_resolution_uses_host_ip_and_fixed_path(self):
+        old_host = os.environ.get("SHIVA_HOST")
         try:
-            shiva.PMTA_BRIDGE_PULL_URL = ""
-            for k in ("PMTA_BRIDGE_PULL_URL", "PMTA_ACCOUNTING_BRIDGE_PULL_URL", "PMTA_BRIDGE_URL"):
-                os.environ.pop(k, None)
-            with shiva._BRIDGE_DEBUG_LOCK:
-                shiva._BRIDGE_DEBUG_STATE["last_req_url"] = (
-                    "http://194.116.172.135:8090/api/v1/pull/latest?kind=acct&max_lines=2000&cursor=abc123"
-                )
-
+            os.environ["SHIVA_HOST"] = "194.116.172.135"
             resolved = shiva._resolve_bridge_pull_url_runtime()
             self.assertEqual(
                 resolved,
-                "http://194.116.172.135:8090/api/v1/pull/latest?kind=acct",
+                "http://194.116.172.135:8090/api/v1/pull/latest?kind=acct&max_lines=2000",
             )
         finally:
-            shiva.PMTA_BRIDGE_PULL_URL = old_cfg
-            if old_env is None:
-                os.environ.pop("PMTA_BRIDGE_PULL_URL", None)
+            if old_host is None:
+                os.environ.pop("SHIVA_HOST", None)
             else:
-                os.environ["PMTA_BRIDGE_PULL_URL"] = old_env
-            if old_env_legacy is None:
-                os.environ.pop("PMTA_ACCOUNTING_BRIDGE_PULL_URL", None)
-            else:
-                os.environ["PMTA_ACCOUNTING_BRIDGE_PULL_URL"] = old_env_legacy
-            if old_env_bridge is None:
-                os.environ.pop("PMTA_BRIDGE_URL", None)
-            else:
-                os.environ["PMTA_BRIDGE_URL"] = old_env_bridge
-            with shiva._BRIDGE_DEBUG_LOCK:
-                shiva._BRIDGE_DEBUG_STATE.clear()
-                shiva._BRIDGE_DEBUG_STATE.update(old_state)
+                os.environ["SHIVA_HOST"] = old_host
 
     def test_bridge_token_normalization_accepts_bearer_and_quotes(self):
         self.assertEqual(
@@ -140,28 +117,6 @@ class BridgeShivaHarnessTests(unittest.TestCase):
             shiva._normalize_bridge_pull_token("Bearer abc123"),
             "abc123",
         )
-
-    def test_bridge_url_resolution_accepts_whitespace_around_env_key(self):
-        old_cfg = shiva.PMTA_BRIDGE_PULL_URL
-        old_env = os.environ.get("PMTA_BRIDGE_PULL_URL")
-        old_env_spaced = os.environ.get(" PMTA_BRIDGE_PULL_URL ")
-        try:
-            shiva.PMTA_BRIDGE_PULL_URL = ""
-            os.environ.pop("PMTA_BRIDGE_PULL_URL", None)
-            os.environ[" PMTA_BRIDGE_PULL_URL "] = "http://194.116.172.135:8090/api/v1/pull/latest?kind=acct"
-
-            resolved = shiva._get_bridge_pull_url_compat("")
-            self.assertEqual(resolved, "http://194.116.172.135:8090/api/v1/pull/latest?kind=acct")
-        finally:
-            shiva.PMTA_BRIDGE_PULL_URL = old_cfg
-            if old_env is None:
-                os.environ.pop("PMTA_BRIDGE_PULL_URL", None)
-            else:
-                os.environ["PMTA_BRIDGE_PULL_URL"] = old_env
-            if old_env_spaced is None:
-                os.environ.pop(" PMTA_BRIDGE_PULL_URL ", None)
-            else:
-                os.environ[" PMTA_BRIDGE_PULL_URL "] = old_env_spaced
 
 
 if __name__ == "__main__":
