@@ -8606,30 +8606,38 @@ def _poll_accounting_bridge_once() -> dict:
         req_url = ""
         request_error: Optional[Exception] = None
 
-        for base_url in pull_urls:
-            sep = "&" if "?" in base_url else "?"
-            req_url = f"{base_url}{sep}max_lines={max(1, int(PMTA_BRIDGE_PULL_MAX_LINES or 1))}"
-            if cursor:
-                req_url += f"&cursor={quote_plus(cursor)}"
-            _bridge_debug_update(last_req_url=req_url)
-            try:
-                req = Request(req_url, headers=headers, method="GET")
-                with urlopen(req, timeout=20) as resp:
-                    code = getattr(resp, "status", None)
-                    raw = (resp.read() or b"{}").decode("utf-8", errors="replace")
-                _bridge_debug_update(last_http_ok=True, last_http_status=code)
-                request_error = None
+        max_request_attempts = 3
+        for attempt in range(1, max_request_attempts + 1):
+            for base_url in pull_urls:
+                sep = "&" if "?" in base_url else "?"
+                req_url = f"{base_url}{sep}max_lines={max(1, int(PMTA_BRIDGE_PULL_MAX_LINES or 1))}"
+                if cursor:
+                    req_url += f"&cursor={quote_plus(cursor)}"
+                _bridge_debug_update(last_req_url=req_url)
+                try:
+                    req = Request(req_url, headers=headers, method="GET")
+                    with urlopen(req, timeout=20) as resp:
+                        code = getattr(resp, "status", None)
+                        raw = (resp.read() or b"{}").decode("utf-8", errors="replace")
+                    _bridge_debug_update(last_http_ok=True, last_http_status=code)
+                    request_error = None
+                    break
+                except HTTPError as e:
+                    request_error = e
+                    _bridge_debug_update(last_http_ok=False, last_http_status=e.code)
+                    if e.code in {404, 405} and base_url != pull_urls[-1]:
+                        continue
+                    break
+                except Exception as e:
+                    request_error = e
+                    _bridge_debug_update(last_http_ok=False)
+                    if base_url != pull_urls[-1]:
+                        continue
+                    break
+            if not request_error or raw:
                 break
-            except HTTPError as e:
-                request_error = e
-                _bridge_debug_update(last_http_ok=False, last_http_status=e.code)
-                if e.code in {404, 405} and base_url != pull_urls[-1]:
-                    continue
-                break
-            except Exception as e:
-                request_error = e
-                _bridge_debug_update(last_http_ok=False)
-                break
+            if attempt < max_request_attempts:
+                time.sleep(min(1.0 * attempt, 2.0))
 
         if request_error is not None and not raw:
             _bridge_debug_update(
@@ -8639,10 +8647,10 @@ def _poll_accounting_bridge_once() -> dict:
                 connected=False,
                 failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + 1,
                 last_error_ts=now_iso(),
-                last_error=f"bridge_request_failed: {request_error}",
+                last_error=f"bridge_request_failed: {request_error} (url={req_url})",
                 last_duration_ms=int((time.time() - t0) * 1000),
             )
-            return {"ok": False, "error": f"bridge_request_failed: {request_error}", "processed": total_processed, "accepted": total_accepted}
+            return {"ok": False, "error": f"bridge_request_failed: {request_error} (url={req_url})", "processed": total_processed, "accepted": total_accepted}
 
         try:
             obj = json.loads(raw)
