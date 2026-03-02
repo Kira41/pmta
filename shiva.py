@@ -3,6 +3,7 @@ import os
 import json
 import math
 import csv
+import logging
 import random
 import re
 import socket
@@ -712,6 +713,15 @@ def db_init() -> None:
             # App-wide config overrides (UI-managed)
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS app_config(
+                       key TEXT PRIMARY KEY,
+                       value TEXT NOT NULL,
+                       updated_at TEXT NOT NULL
+                   )"""
+            )
+
+
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS bridge_pull_state(
                        key TEXT PRIMARY KEY,
                        value TEXT NOT NULL,
                        updated_at TEXT NOT NULL
@@ -7583,10 +7593,13 @@ _BRIDGE_DEBUG_STATE: dict[str, Any] = {
     "last_processed": 0,
     "last_accepted": 0,
     "last_lines_sample": [],
+    "last_cursor": "",
+    "has_more": False,
 }
 
 _BRIDGE_POLLER_LOCK = threading.Lock()
 _BRIDGE_POLLER_STARTED = False
+_BRIDGE_CURSOR_COMPAT_WARNED = False
 
 
 def _bridge_debug_update(**kwargs: Any) -> None:
@@ -8025,10 +8038,60 @@ def process_campaign_accounting_payload(payload: dict) -> dict:
     return {"ok": True, "campaign_id": campaign_id, "processed": processed, "accepted": accepted}
 
 
-def _poll_accounting_bridge_once() -> dict:
-    t0 = time.time()
-    url = (PMTA_BRIDGE_PULL_URL or "").strip()
+def _db_get_bridge_cursor() -> str:
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            row = conn.execute("SELECT value FROM bridge_pull_state WHERE key='accounting_cursor'").fetchone()
+            return str(row[0]).strip() if row and row[0] is not None else ""
+        finally:
+            conn.close()
+
+
+def _db_set_bridge_cursor(cursor: str) -> None:
+    cur = (cursor or "").strip()
+    if not cur:
+        return
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            ts = now_iso()
+            _exec_upsert_compat(
+                conn,
+                "INSERT INTO bridge_pull_state(key, value, updated_at) VALUES(?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                ("accounting_cursor", cur, ts),
+                "UPDATE bridge_pull_state SET value=?, updated_at=? WHERE key=?",
+                (cur, ts, "accounting_cursor"),
+                "INSERT INTO bridge_pull_state(key, value, updated_at) VALUES(?, ?, ?)",
+                ("accounting_cursor", cur, ts),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _normalize_bridge_pull_urls(raw_url: str) -> list[str]:
+    url = (raw_url or "").strip()
+    if url and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+        url = f"http://{url}"
     if not url:
+        return []
+    if "/api/v1/pull/latest" in url:
+        return [url]
+    if "/api/v1/pull" in url:
+        latest = url.replace("/api/v1/pull", "/api/v1/pull/latest", 1)
+        return [url, latest] if latest != url else [url]
+    base = url.rstrip("/")
+    return [f"{base}/api/v1/pull", f"{base}/api/v1/pull/latest"]
+
+
+def _poll_accounting_bridge_once() -> dict:
+    global _BRIDGE_CURSOR_COMPAT_WARNED
+
+    t0 = time.time()
+    raw_url = (PMTA_BRIDGE_PULL_URL or "").strip()
+    if not raw_url:
         _bridge_debug_update(
             last_attempt_ts=now_iso(),
             attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
@@ -8039,104 +8102,166 @@ def _poll_accounting_bridge_once() -> dict:
         )
         return {"ok": False, "error": "bridge_pull_url_not_configured", "processed": 0, "accepted": 0}
 
-    # Accept a bare host:port and default to HTTP to avoid urlopen failures
-    # like "unknown url type: 194.116.172.135".
-    if url and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
-        url = f"http://{url}"
-
-    # Allow passing a base bridge URL (e.g. http://host:8090) and normalize it
-    # to the pull endpoint expected by this poller.
-    if "/api/v1/pull/latest" not in url:
-        url = url.rstrip("/") + "/api/v1/pull/latest"
-
-    sep = "&" if "?" in url else "?"
-    req_url = f"{url}{sep}max_lines={max(1, int(PMTA_BRIDGE_PULL_MAX_LINES or 1))}"
-    _bridge_debug_update(last_req_url=req_url)
+    pull_urls = _normalize_bridge_pull_urls(raw_url)
+    if not pull_urls:
+        return {"ok": False, "error": "bridge_pull_url_not_configured", "processed": 0, "accepted": 0}
 
     headers = {"Accept": "application/json"}
     if PMTA_BRIDGE_PULL_TOKEN:
         headers["Authorization"] = f"Bearer {PMTA_BRIDGE_PULL_TOKEN}"
 
-    try:
-        req = Request(req_url, headers=headers, method="GET")
-        with urlopen(req, timeout=20) as resp:
-            code = getattr(resp, "status", None)
-            raw = (resp.read() or b"{}").decode("utf-8", errors="replace")
-        _bridge_debug_update(last_http_ok=True, last_http_status=code)
-    except Exception as e:
-        _bridge_debug_update(
-            last_attempt_ts=now_iso(),
-            attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
-            last_ok=False,
-            connected=False,
-            failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + 1,
-            last_error_ts=now_iso(),
-            last_error=f"bridge_request_failed: {e}",
-            last_http_ok=False,
-            last_duration_ms=int((time.time() - t0) * 1000),
-        )
-        return {"ok": False, "error": f"bridge_request_failed: {e}", "processed": 0, "accepted": 0}
+    cursor = _db_get_bridge_cursor()
+    total_processed = 0
+    total_accepted = 0
+    total_count = 0
+    batches = 0
+    used_cursor_fields = False
+    last_obj: Any = {}
+    last_rows: list[Any] = []
 
-    try:
-        obj = json.loads(raw)
-    except Exception:
-        _bridge_debug_update(
-            last_attempt_ts=now_iso(),
-            attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
-            last_ok=False,
-            connected=False,
-            failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + 1,
-            last_error_ts=now_iso(),
-            last_error="invalid_bridge_json",
-            last_duration_ms=int((time.time() - t0) * 1000),
-        )
-        return {"ok": False, "error": "invalid_bridge_json", "processed": 0, "accepted": 0}
+    while True:
+        batches += 1
+        raw = ""
+        req_url = ""
+        request_error: Optional[Exception] = None
 
-    lines = obj.get("lines") if isinstance(obj, dict) else None
-
-    # Some bridges return structured rows instead of raw accounting lines,
-    # for example: {"results":[{"email":"a@b.com","status":"failed"}, ...]}
-    # We support both forms.
-    bridge_rows: list[Any] = []
-    if isinstance(lines, list):
-        bridge_rows = list(lines)
-    elif isinstance(obj, dict):
-        for key in ("outcomes", "results", "messages", "items", "rows", "data"):
-            v = obj.get(key)
-            if isinstance(v, list):
-                bridge_rows = v
+        for base_url in pull_urls:
+            sep = "&" if "?" in base_url else "?"
+            req_url = f"{base_url}{sep}max_lines={max(1, int(PMTA_BRIDGE_PULL_MAX_LINES or 1))}"
+            if cursor:
+                req_url += f"&cursor={quote_plus(cursor)}"
+            _bridge_debug_update(last_req_url=req_url)
+            try:
+                req = Request(req_url, headers=headers, method="GET")
+                with urlopen(req, timeout=20) as resp:
+                    code = getattr(resp, "status", None)
+                    raw = (resp.read() or b"{}").decode("utf-8", errors="replace")
+                _bridge_debug_update(last_http_ok=True, last_http_status=code)
+                request_error = None
+                break
+            except HTTPError as e:
+                request_error = e
+                _bridge_debug_update(last_http_ok=False, last_http_status=e.code)
+                if e.code in {404, 405} and base_url != pull_urls[-1]:
+                    continue
+                break
+            except Exception as e:
+                request_error = e
+                _bridge_debug_update(last_http_ok=False)
                 break
 
-    if not isinstance(bridge_rows, list):
-        _bridge_debug_update(
-            last_attempt_ts=now_iso(),
-            attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
-            last_ok=False,
-            connected=False,
-            failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + 1,
-            last_error_ts=now_iso(),
-            last_error="invalid_bridge_payload",
-            last_response_keys=list(obj.keys()) if isinstance(obj, dict) else [],
-            last_duration_ms=int((time.time() - t0) * 1000),
-        )
-        return {"ok": False, "error": "invalid_bridge_payload", "processed": 0, "accepted": 0}
+        if request_error is not None and not raw:
+            _bridge_debug_update(
+                last_attempt_ts=now_iso(),
+                attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
+                last_ok=False,
+                connected=False,
+                failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + 1,
+                last_error_ts=now_iso(),
+                last_error=f"bridge_request_failed: {request_error}",
+                last_duration_ms=int((time.time() - t0) * 1000),
+            )
+            return {"ok": False, "error": f"bridge_request_failed: {request_error}", "processed": total_processed, "accepted": total_accepted}
 
-    processed = 0
-    accepted = 0
-    for row in bridge_rows:
-        ev: Optional[dict] = None
-        if isinstance(row, dict):
-            ev = row
-        else:
-            s = str(row or "").strip()
-            if not s:
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            _bridge_debug_update(
+                last_attempt_ts=now_iso(),
+                attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
+                last_ok=False,
+                connected=False,
+                failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + 1,
+                last_error_ts=now_iso(),
+                last_error="invalid_bridge_json",
+                last_duration_ms=int((time.time() - t0) * 1000),
+            )
+            return {"ok": False, "error": "invalid_bridge_json", "processed": total_processed, "accepted": total_accepted}
+
+        lines = obj.get("lines") if isinstance(obj, dict) else None
+        bridge_rows: list[Any] = []
+        if isinstance(lines, list):
+            bridge_rows = list(lines)
+        elif isinstance(obj, dict):
+            for key in ("outcomes", "results", "messages", "items", "rows", "data"):
+                v = obj.get(key)
+                if isinstance(v, list):
+                    bridge_rows = v
+                    break
+
+        if not isinstance(bridge_rows, list):
+            _bridge_debug_update(
+                last_attempt_ts=now_iso(),
+                attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
+                last_ok=False,
+                connected=False,
+                failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + 1,
+                last_error_ts=now_iso(),
+                last_error="invalid_bridge_payload",
+                last_response_keys=list(obj.keys()) if isinstance(obj, dict) else [],
+                last_duration_ms=int((time.time() - t0) * 1000),
+            )
+            return {"ok": False, "error": "invalid_bridge_payload", "processed": total_processed, "accepted": total_accepted}
+
+        processed = 0
+        accepted = 0
+        for row in bridge_rows:
+            ev: Optional[dict] = None
+            if isinstance(row, dict):
+                ev = row
+            else:
+                s2 = str(row or "").strip()
+                if not s2:
+                    continue
+                ev = _parse_accounting_line(s2, path="bridge")
+            if not ev:
                 continue
-            ev = _parse_accounting_line(s, path="bridge")
-        if not ev:
-            continue
-        res = process_pmta_accounting_event(ev)
-        processed += 1
-        accepted += 1 if res.get("ok") else 0
+            res = process_pmta_accounting_event(ev)
+            processed += 1
+            accepted += 1 if res.get("ok") else 0
+
+        total_processed += processed
+        total_accepted += accepted
+        total_count += len(bridge_rows)
+        last_obj = obj
+        last_rows = bridge_rows
+
+        has_cursor_fields = isinstance(obj, dict) and any(k in obj for k in ("cursor", "next_cursor", "has_more"))
+        if has_cursor_fields:
+            used_cursor_fields = True
+        elif not _BRIDGE_CURSOR_COMPAT_WARNED:
+            _BRIDGE_CURSOR_COMPAT_WARNED = True
+            logging.getLogger("shiva").warning(
+                "Bridge response has no cursor fields; using legacy pull mode (max_lines truncation may lose events)."
+            )
+
+        has_more = bool(obj.get("has_more")) if isinstance(obj, dict) and has_cursor_fields else False
+        next_cursor = ""
+        if isinstance(obj, dict):
+            next_cursor = str(obj.get("next_cursor") or obj.get("cursor") or "").strip()
+
+        if used_cursor_fields and next_cursor:
+            _db_set_bridge_cursor(next_cursor)
+            cursor = next_cursor
+
+        logging.getLogger("shiva").info(
+            "Bridge ingestion progress batch=%s rows=%s processed=%s accepted=%s has_more=%s cursor=%s",
+            batches,
+            len(bridge_rows),
+            processed,
+            accepted,
+            bool(has_more),
+            cursor or "-",
+        )
+
+        if not (used_cursor_fields and has_more):
+            break
+
+        if used_cursor_fields and has_more and not next_cursor:
+            logging.getLogger("shiva").warning(
+                "Bridge returned has_more=true without next_cursor; stopping immediate repull to avoid duplicates."
+            )
+            break
 
     _bridge_debug_update(
         last_attempt_ts=now_iso(),
@@ -8146,14 +8271,23 @@ def _poll_accounting_bridge_once() -> dict:
         last_ok=True,
         connected=True,
         last_error="",
-        last_bridge_count=len(bridge_rows),
-        last_processed=processed,
-        last_accepted=accepted,
-        last_response_keys=list(obj.keys()) if isinstance(obj, dict) else [],
-        last_lines_sample=[str(x)[:220] for x in bridge_rows[:3]],
+        last_bridge_count=total_count,
+        last_processed=total_processed,
+        last_accepted=total_accepted,
+        last_response_keys=list(last_obj.keys()) if isinstance(last_obj, dict) else [],
+        last_lines_sample=[str(x)[:220] for x in (last_rows or [])[:3]],
         last_duration_ms=int((time.time() - t0) * 1000),
+        last_cursor=cursor,
+        has_more=bool(isinstance(last_obj, dict) and last_obj.get("has_more")),
     )
-    return {"ok": True, "processed": processed, "accepted": accepted, "count": len(bridge_rows)}
+    return {
+        "ok": True,
+        "processed": total_processed,
+        "accepted": total_accepted,
+        "count": total_count,
+        "batches": batches,
+        "cursor": cursor,
+    }
 
 
 def _accounting_bridge_poller_thread():
