@@ -236,6 +236,9 @@ BACKOFF_MAX_S=1800
 # PMTA policy-based backoff
 PMTA_QUEUE_BACKOFF=1
 PMTA_QUEUE_REQUIRED=0
+
+# Disable DNSBL/DBL blacklist checks بالكامل (اختياري)
+SHIVA_DISABLE_BLACKLIST=0  # يقبل: 1/0, true/false, yes/no (alias: DISABLE_BLACKLIST)
 ```
 
 ### C) جواب مباشر: backoff يكون Active أم Disable؟
