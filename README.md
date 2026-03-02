@@ -4,53 +4,53 @@ This project now uses a simplified accounting ingestion flow.
 
 ## Flow
 
-1. `pmta_accounting_bridge.py` stays unchanged.
-2. Shiva pulls raw lines from bridge using `X-Job-ID`.
-3. Shiva applies:
-   - CSV parse (`csv.reader`)
-   - outcome mapping from first field (`D/B/C/T` by default)
-   - dedupe by `line_hash = sha1(line.strip().replace("\r\n", "\n"))`
-4. Shiva stores rows in `accounting_events`.
+1. `pmta_accounting_bridge.py` tails PMTA accounting files and exposes pull/status APIs.
+2. Shiva polls Bridge (`/api/v1/pull`) using a persisted cursor stored in `bridge_pull_state`.
+3. Shiva parses and ingests rows, then applies outcome transitions per recipient.
+4. Status endpoints show exactly where failures happen (bridge parse vs job lookup vs DB writer).
 
-## ENV mapping
+## Cursor behavior (new)
 
-Default mapping:
+- Bridge returns `next_cursor` + `has_more` from `/api/v1/pull`.
+- Shiva persists that cursor in SQLite (`bridge_pull_state.accounting_cursor`) and resumes after restart.
+- If a bridge payload has no cursor fields, Shiva falls back to legacy behavior and logs a compatibility warning.
 
-- `D -> delivered`
-- `B -> bounced`
-- `C -> complained`
-- `T -> deferred`
-- anything else -> `unknown`
+## Endpoints
 
-Override with:
+### Bridge (`pmta_accounting_bridge.py`)
 
-```bash
-export PMTA_ACCT_TYPE_MAP="D:delivered,B:bounced,C:complained,T:deferred"
-```
+- `GET /api/v1/pull?kinds=acct&limit=<n>&cursor=<token>` (token protected)
+- `GET /api/v1/status` (token protected):
+  - `last_processed_file`, `last_cursor`, `parsed`, `skipped`, `unknown_outcome`, `last_error`, `server_time`
 
-## API
+### Shiva (`shiva.py`)
 
-### Pull + Save
+- `GET /api/accounting/bridge/status`
+  - Includes `last_poll_time`, `last_cursor`, `events_received`, `events_ingested`,
+    `duplicates_dropped`, `job_not_found`, `db_write_failures`
+- `POST /api/accounting/bridge/pull` (manual one-shot pull)
 
-```bash
-curl -X POST "http://localhost:5000/api/accounting/pull" \
-  -H "Content-Type: application/json" \
-  -d '{"job_id":"job_2026_001"}'
-```
+## Test harness
 
-### Counts
+Run the ingestion harness tests:
 
 ```bash
-curl "http://localhost:5000/api/accounting/job_2026_001/counts"
+python -m unittest -v tests/test_bridge_shiva_harness.py
 ```
 
-### Events list
+Covers:
+- replay of saved PMTA accounting CSV through Bridge + Shiva
+- restart/resume from cursor without missing outcomes
+- volume ingestion latency stability checks
 
-```bash
-curl "http://localhost:5000/api/accounting/job_2026_001/events?outcome=delivered&limit=200&offset=0"
-```
+## Recommended settings
 
-## Runtime requirement
-
-- Run Shiva with Python 3.9+ (`python3 shiva.py`).
-- Using `python shiva.py` may invoke Python 2.x on some servers and fail with syntax errors.
+- Bridge:
+  - `DEFAULT_PULL_LIMIT=500`
+  - `MAX_PULL_LIMIT=2000`
+- Shiva:
+  - `PMTA_BRIDGE_PULL_MAX_LINES=2000`
+  - `PMTA_BRIDGE_PULL_S=3..5` for near-real-time visibility
+- SQLite:
+  - Keep WAL enabled (`PRAGMA journal_mode=WAL`) for concurrent reads/writes.
+  - Keep `busy_timeout` non-zero (already configured) to reduce transient lock failures.

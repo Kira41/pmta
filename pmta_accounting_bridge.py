@@ -63,6 +63,20 @@ _TAIL_STATE_LOCK = threading.Lock()
 _TAIL_STATE: Dict[str, int] = {}
 _CSV_HEADER_STATE_LOCK = threading.Lock()
 _CSV_HEADER_STATE: Dict[str, List[str]] = {}
+_BRIDGE_STATUS_LOCK = threading.Lock()
+_BRIDGE_STATUS: Dict[str, Any] = {
+    "last_processed_file": "",
+    "last_cursor": "",
+    "parsed": 0,
+    "skipped": 0,
+    "unknown_outcome": 0,
+    "last_error": "",
+}
+
+
+def _status_update(**kwargs: Any) -> None:
+    with _BRIDGE_STATUS_LOCK:
+        _BRIDGE_STATUS.update(kwargs)
 
 
 def _error_payload(error: str, detail: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -905,6 +919,14 @@ def root():
     }
 
 
+@app.get("/api/v1/status")
+def bridge_status(_: None = Depends(require_token)):
+    with _BRIDGE_STATUS_LOCK:
+        state = dict(_BRIDGE_STATUS)
+    state["server_time"] = datetime.now(timezone.utc).isoformat()
+    return {"ok": True, **state}
+
+
 
 
 @app.get("/api/v1/job/outcomes")
@@ -1133,29 +1155,55 @@ def pull_accounting(
     max_lines: int = DEFAULT_PUSH_MAX_LINES,
     group_by_header: int = 1,
     _: None = Depends(require_token),
-):
+): 
     del request, max_lines, group_by_header
-    requested_kinds = [x.strip() for x in (kinds or "").split(",") if x.strip()]
-    if not requested_kinds:
-        requested_kinds = [kind.strip() or "acct"]
+    try:
+        requested_kinds = [x.strip() for x in (kinds or "").split(",") if x.strip()]
+        if not requested_kinds:
+            requested_kinds = [kind.strip() or "acct"]
 
-    patterns: List[str] = []
-    for k in requested_kinds:
-        p = ALLOWED_KINDS.get(k)
-        if not p:
-            raise HTTPException(status_code=400, detail=f"Invalid kind: {k}. Use one of: {list(ALLOWED_KINDS.keys())}")
-        patterns.extend(p)
+        patterns: List[str] = []
+        for k in requested_kinds:
+            p = ALLOWED_KINDS.get(k)
+            if not p:
+                raise HTTPException(status_code=400, detail=f"Invalid kind: {k}. Use one of: {list(ALLOWED_KINDS.keys())}")
+            patterns.extend(p)
 
-    safe_limit = max(1, min(MAX_PULL_LIMIT, int(limit or DEFAULT_PULL_LIMIT)))
-    files = _recent_matching_files(patterns)
-    payload = _decode_cursor(cursor) if cursor else None
-    result = _read_from_cursor(files, payload, safe_limit)
-    return {
-        "ok": True,
-        "kinds": requested_kinds,
-        "count": len(result["items"]),
-        **result,
-    }
+        safe_limit = max(1, min(MAX_PULL_LIMIT, int(limit or DEFAULT_PULL_LIMIT)))
+        files = _recent_matching_files(patterns)
+        payload = _decode_cursor(cursor) if cursor else None
+        result = _read_from_cursor(files, payload, safe_limit)
+
+        last_processed_file = ""
+        items = result.get("items") or []
+        if items:
+            last_processed_file = str(items[-1].get("source_file") or "")
+        elif result.get("next_cursor"):
+            c = _decode_cursor(result.get("next_cursor") or "")
+            last_processed_file = Path(str(c.get("path") or "")).name
+
+        stats = result.get("stats") or {}
+        _status_update(
+            last_processed_file=last_processed_file,
+            last_cursor=str(result.get("next_cursor") or ""),
+            parsed=int(stats.get("parsed") or 0),
+            skipped=int(stats.get("skipped") or 0),
+            unknown_outcome=int(stats.get("unknown_outcome") or 0),
+            last_error="",
+        )
+
+        return {
+            "ok": True,
+            "kinds": requested_kinds,
+            "count": len(result["items"]),
+            **result,
+        }
+    except HTTPException as exc:
+        _status_update(last_error=str(exc.detail))
+        raise
+    except Exception as exc:
+        _status_update(last_error=str(exc))
+        raise
 
 
 @app.get("/api/v1/pull/latest")
