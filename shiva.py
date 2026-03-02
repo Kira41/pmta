@@ -508,7 +508,29 @@ def _release_start_guard(exc):
 # SQLite Form Storage (replaces browser localStorage)
 # =========================
 APP_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path(os.getcwd())
-DB_PATH = str(APP_DIR / "smtp_sender.db")
+
+
+def _resolve_db_path() -> str:
+    """Resolve SQLite path from env with safe fallback to app-local DB file."""
+    raw = (
+        os.getenv("SHIVA_DB_PATH")
+        or os.getenv("SMTP_SENDER_DB_PATH")
+        or str(APP_DIR / "smtp_sender.db")
+    )
+    candidate = Path(str(raw or "").strip()).expanduser()
+    if not candidate.is_absolute():
+        candidate = (APP_DIR / candidate).resolve()
+
+    try:
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # If parent creation fails, keep candidate; sqlite/open will emit a clear error.
+        pass
+
+    return str(candidate)
+
+
+DB_PATH = _resolve_db_path()
 DB_LOCK = threading.Lock()
 
 BROWSER_COOKIE = "smtp_sender_bid"
