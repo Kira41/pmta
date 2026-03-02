@@ -68,6 +68,11 @@ ACCOUNTING_HEADER_CANDIDATES = [
     "message_id",
 ]
 
+_PMTA_MESSAGE_ID_RE = re.compile(
+    r"^<[^.<>@\s]+[.]([^.<>@\s]+)[.]([^.<>@\s]+)[.]c\d+[.]w\d+@[^>]+>$",
+    re.IGNORECASE,
+)
+
 _JOBID_RE_1 = re.compile(r"[.][a-f0-9]{8,64}[.]([a-f0-9]{12})[.]([a-f0-9]{8,64}|none)[.]c[0-9]+[.]w[0-9]+@local", re.IGNORECASE)
 _JOBID_RE_2 = re.compile(r"[.][a-f0-9]{8,64}[.]([a-f0-9]{12})[.]c[0-9]+[.]w[0-9]+@local", re.IGNORECASE)
 
@@ -83,6 +88,16 @@ def _extract_job_id_from_text(text: str) -> str:
     if m:
         return str(m.group(1) or "").strip().lower()
     return ""
+
+
+def _parse_ids_from_message_id(value: Any) -> Tuple[str, str]:
+    msgid = str(value or "").strip()
+    if not msgid:
+        return "", ""
+    m = _PMTA_MESSAGE_ID_RE.match(msgid)
+    if not m:
+        return "", ""
+    return str(m.group(1) or "").strip().lower(), str(m.group(2) or "").strip().lower()
 
 
 def _normalize_job_id(value: Any) -> str:
@@ -144,15 +159,31 @@ def _event_value(ev: Dict[str, Any], *names: str) -> str:
 
 
 def _event_job_id(ev: Dict[str, Any]) -> str:
-    jid = _event_value(ev, "header_x-job-id", "x-job-id", "job-id", "job_id", "jobid")
+    jid = _event_value(ev, "header_x-job-id", "x-job-id")
     jid = _normalize_job_id(jid)
     if jid:
         return jid
     msgid = _event_value(ev, "header_message-id", "message-id", "message_id", "msgid", "messageid")
-    jid = _extract_job_id_from_text(msgid)
+    jid, _ = _parse_ids_from_message_id(msgid)
+    jid = _normalize_job_id(jid)
     if jid:
         return jid
-    return _extract_job_id_from_text(str(ev.get("raw") or ""))
+
+    # PMTA columns can exist but are often empty in acct files; keep as last fallback only.
+    jid = _normalize_job_id(_event_value(ev, "job-id", "job_id", "jobid", "envid", "env-id"))
+    if jid:
+        return jid
+    return ""
+
+
+def _event_campaign_id(ev: Dict[str, Any]) -> str:
+    campaign_id = _event_value(ev, "header_x-campaign-id", "x-campaign-id")
+    campaign_id = str(campaign_id or "").strip().lower()
+    if campaign_id:
+        return campaign_id
+    msgid = _event_value(ev, "header_message-id", "message-id", "message_id", "msgid", "messageid")
+    _, campaign_id = _parse_ids_from_message_id(msgid)
+    return campaign_id
 
 
 def _event_explicit_job_id(ev: Dict[str, Any]) -> str:
@@ -165,11 +196,11 @@ def _walk_accounting_events(patterns: List[str]):
     files = _find_matching_files(patterns)
     for fp in files:
         with fp.open("r", encoding="utf-8", errors="replace") as f:
-            for line in f:
+            for line_no, line in enumerate(f, start=1):
                 s = (line or "").strip()
                 if not s:
                     continue
-                ev = _parse_accounting_line(s, source_file=fp.name)
+                ev = _parse_accounting_line(s, source_file=fp.name, line_no_or_offset=line_no)
                 if ev:
                     yield ev
 
@@ -322,7 +353,12 @@ def _read_new_lines(path: Path, max_lines: int) -> Dict[str, Any]:
     }
 
 
-def _parse_accounting_line(line: str, *, source_file: str = "") -> Optional[Dict[str, Any]]:
+def _parse_accounting_line(
+    line: str,
+    *,
+    source_file: str = "",
+    line_no_or_offset: Any = "",
+) -> Optional[Dict[str, Any]]:
     """Parse accounting line into dict (best-effort).
 
     Supports JSON lines and CSV files with/without header rows.
@@ -335,6 +371,8 @@ def _parse_accounting_line(line: str, *, source_file: str = "") -> Optional[Dict
         try:
             obj = json.loads(s)
             if isinstance(obj, dict):
+                obj.setdefault("source_file", source_file)
+                obj.setdefault("line_no_or_offset", line_no_or_offset)
                 return obj
         except Exception:
             return None
@@ -356,7 +394,7 @@ def _parse_accounting_line(line: str, *, source_file: str = "") -> Optional[Dict
             _CSV_HEADER_STATE[source_file or ""] = [x.strip().lower() for x in fields]
         return None
 
-    ev: Dict[str, Any] = {"raw": s}
+    ev: Dict[str, Any] = {"raw": s, "source_file": source_file, "line_no_or_offset": line_no_or_offset}
     with _CSV_HEADER_STATE_LOCK:
         hdr = _CSV_HEADER_STATE.get(source_file or "") or []
 
@@ -375,6 +413,46 @@ def _parse_accounting_line(line: str, *, source_file: str = "") -> Optional[Dict
         ev["dsnStatus"] = fields[7]
         ev["dsnDiag"] = fields[8]
     return ev
+
+
+def _normalized_outcome(ev: Dict[str, Any]) -> str:
+    typ = str(_event_value(ev, "type") or "").strip().lower()
+    dsn_action = str(_event_value(ev, "dsnAction", "dsn_action") or "").strip().lower()
+    dsn_status = str(_event_value(ev, "dsnStatus", "dsn_status") or "").strip().lower()
+    dsn_diag = str(_event_value(ev, "dsnDiag", "dsn_diag") or "").strip().lower()
+
+    if any(x in dsn_diag for x in ("complaint", "fbl", "feedback loop", "abuse")):
+        return "complained"
+    if typ == "d" or dsn_action == "relayed" or dsn_status.startswith("2"):
+        return "delivered"
+    if typ == "t" or dsn_action == "delayed" or dsn_status.startswith("4"):
+        return "deferred"
+    if typ == "b" or dsn_action == "failed" or dsn_status.startswith("5"):
+        return "bounced"
+    return "unknown"
+
+
+def _structured_event(ev: Dict[str, Any]) -> Dict[str, Any]:
+    message_id = _event_value(ev, "header_message-id", "message-id", "message_id", "msgid", "messageid")
+    return {
+        "type": str(_event_value(ev, "type") or "").strip().lower(),
+        "outcome": _normalized_outcome(ev),
+        "time_logged": _event_value(ev, "timeLogged", "timelogged", "time_logged", "time"),
+        "orig": _event_value(ev, "orig", "mailfrom", "from"),
+        "rcpt": _event_value(ev, "rcpt", "recipient", "email", "to", "rcpt_to"),
+        "job_id": _event_job_id(ev),
+        "campaign_id": _event_campaign_id(ev),
+        "message_id": message_id,
+        "dsn_action": _event_value(ev, "dsnAction", "dsn_action"),
+        "dsn_status": _event_value(ev, "dsnStatus", "dsn_status"),
+        "dsn_diag": _event_value(ev, "dsnDiag", "dsn_diag"),
+        "vmta": _event_value(ev, "vmta"),
+        "dlv_source_ip": _event_value(ev, "dlvSourceIp", "dlv_source_ip"),
+        "dlv_dest_ip": _event_value(ev, "dlvDestinationIp", "dlv_dest_ip", "dlvDestinationIP"),
+        "bounce_cat": _event_value(ev, "bounceCat", "bounce_cat"),
+        "source_file": str(ev.get("source_file") or ""),
+        "line_no_or_offset": ev.get("line_no_or_offset", ""),
+    }
 
 
 def _event_header_value(ev: Dict[str, Any]) -> Tuple[str, str]:
@@ -659,22 +737,14 @@ def _calculate_job_outcomes(jid: str) -> Dict[str, Any]:
         if not rcpt:
             continue
 
-        typ = _normalize_outcome_type(
-            ev.get("type")
-            or ev.get("event")
-            or ev.get("kind")
-            or ev.get("record")
-            or ev.get("status")
-            or ev.get("result")
-            or ev.get("state")
-            or ev.get("dsnAction")
-            or ev.get("dsn_action")
-            or ev.get("dsnStatus")
-            or ev.get("dsn_status")
-            or ev.get("dsnDiag")
-            or ev.get("dsn_diag")
-        )
+        typ = _normalized_outcome(ev)
         if typ not in {"delivered", "bounced", "deferred", "complained"}:
+            print(
+                f"[pmta-accounting-bridge] unknown outcome job_id={ev_jid} rcpt={rcpt} "
+                f"type={ev.get('type')} dsnAction={ev.get('dsnAction') or ev.get('dsn_action')} "
+                f"dsnStatus={ev.get('dsnStatus') or ev.get('dsn_status')} "
+                f"source_file={ev.get('source_file')} line={ev.get('line_no_or_offset')}"
+            )
             continue
 
         prev = by_recipient.get(rcpt)
@@ -780,45 +850,47 @@ def _pull_accounting(
 
     if not jid:
         latest_fp = _find_latest_file(patterns)
-        lines: List[str] = []
+        events: List[Dict[str, Any]] = []
         with latest_fp.open("r", encoding="utf-8", errors="replace") as f:
-            for raw_line in f:
+            for line_no, raw_line in enumerate(f, start=1):
                 line = str(raw_line or "").strip()
                 if line:
-                    lines.append(line)
+                    ev = _parse_accounting_line(line, source_file=latest_fp.name, line_no_or_offset=line_no)
+                    if ev:
+                        events.append(_structured_event(ev))
 
         return {
             "ok": True,
             "job_id": "",
-            "count": min(len(lines), safe_max),
-            "lines": lines[-safe_max:],
+            "count": min(len(events), safe_max),
+            "events": events[-safe_max:],
             "source_file": latest_fp.name,
         }
 
     files = _find_matching_files(patterns)
-    rows: List[str] = []
+    events: List[Dict[str, Any]] = []
 
     for fp in files:
         with fp.open("r", encoding="utf-8", errors="replace") as f:
-            for raw_line in f:
+            for line_no, raw_line in enumerate(f, start=1):
                 line = str(raw_line or "").strip()
                 if not line:
                     continue
-                ev = _parse_accounting_line(line, source_file=fp.name)
+                ev = _parse_accounting_line(line, source_file=fp.name, line_no_or_offset=line_no)
                 if not ev:
                     continue
                 if _event_job_id(ev) == jid:
-                    rows.append(line)
-                if len(rows) >= safe_max:
+                    events.append(_structured_event(ev))
+                if len(events) >= safe_max:
                     break
-        if len(rows) >= safe_max:
+        if len(events) >= safe_max:
             break
 
     return {
         "ok": True,
         "job_id": jid,
-        "count": len(rows),
-        "lines": rows,
+        "count": len(events),
+        "events": events,
     }
 
 
