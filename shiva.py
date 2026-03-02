@@ -23,7 +23,7 @@ from typing import Optional, Any, Tuple, Dict, List
 from concurrent.futures import ThreadPoolExecutor
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit
 
 import sqlite3
 from pathlib import Path
@@ -7949,7 +7949,7 @@ try:
     PMTA_BRIDGE_PULL_PORT = int((os.getenv("PMTA_BRIDGE_PULL_PORT", "8090") or "8090").strip())
 except Exception:
     PMTA_BRIDGE_PULL_PORT = 8090
-PMTA_BRIDGE_PULL_PATH = "/api/v1/pull/latest?kind=acct&max_lines=2000"
+PMTA_BRIDGE_PULL_PATH = "/api/v1/pull"
 
 
 try:
@@ -8014,9 +8014,36 @@ def _resolve_bridge_pull_host_from_campaign() -> str:
     return "127.0.0.1"
 
 
+def _normalize_bridge_host(raw_host: str) -> str:
+    """Normalize host coming from campaign SMTP setting for HTTP bridge URL building."""
+    host = str(raw_host or "").strip()
+    if not host:
+        return "127.0.0.1"
+
+    # Campaign SMTP host may contain a full URL or host:port; keep only hostname.
+    if "://" in host:
+        try:
+            parsed = urlsplit(host)
+            if parsed.hostname:
+                return str(parsed.hostname).strip()
+        except Exception:
+            pass
+
+    # For "hostname:port" (IPv4/domain) drop the port part.
+    if host.count(":") == 1 and not host.startswith("["):
+        return host.split(":", 1)[0].strip() or "127.0.0.1"
+
+    # For bracketed IPv6 like "[::1]:2525".
+    if host.startswith("[") and "]" in host:
+        return host[1:host.index("]")].strip() or "127.0.0.1"
+
+    return host
+
+
 def _resolve_bridge_pull_url_runtime() -> str:
-    host = _resolve_bridge_pull_host_from_campaign()
-    return f"http://{host}:{PMTA_BRIDGE_PULL_PORT}{PMTA_BRIDGE_PULL_PATH}"
+    host = _normalize_bridge_host(_resolve_bridge_pull_host_from_campaign())
+    limit = max(1, int(PMTA_BRIDGE_PULL_MAX_LINES or 2000))
+    return f"http://{host}:{PMTA_BRIDGE_PULL_PORT}{PMTA_BRIDGE_PULL_PATH}?kinds=acct&limit={limit}"
 
 
 def _bridge_debug_update(**kwargs: Any) -> None:

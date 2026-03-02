@@ -96,21 +96,28 @@ class BridgeShivaHarnessTests(unittest.TestCase):
     def test_bridge_url_resolution_uses_campaign_smtp_host_and_configured_port(self):
         old_host = os.environ.get("SHIVA_HOST")
         old_port = shiva.PMTA_BRIDGE_PULL_PORT
+        old_limit = shiva.PMTA_BRIDGE_PULL_MAX_LINES
         try:
             os.environ["SHIVA_HOST"] = "194.116.172.135"
             shiva.PMTA_BRIDGE_PULL_PORT = 18090
+            shiva.PMTA_BRIDGE_PULL_MAX_LINES = 1234
             self._prepare_job(job_id="abcabc123456").smtp_host = "smtp.campaign.local"
             resolved = shiva._resolve_bridge_pull_url_runtime()
             self.assertEqual(
                 resolved,
-                "http://smtp.campaign.local:18090/api/v1/pull/latest?kind=acct&max_lines=2000",
+                "http://smtp.campaign.local:18090/api/v1/pull?kinds=acct&limit=1234",
             )
         finally:
             shiva.PMTA_BRIDGE_PULL_PORT = old_port
+            shiva.PMTA_BRIDGE_PULL_MAX_LINES = old_limit
             if old_host is None:
                 os.environ.pop("SHIVA_HOST", None)
             else:
                 os.environ["SHIVA_HOST"] = old_host
+
+    def test_bridge_host_normalization_strips_scheme_and_port(self):
+        self.assertEqual(shiva._normalize_bridge_host("http://194.116.172.135:2525"), "194.116.172.135")
+        self.assertEqual(shiva._normalize_bridge_host("smtp.campaign.local:2525"), "smtp.campaign.local")
 
 
 if __name__ == "__main__":
