@@ -23,7 +23,7 @@ from typing import Optional, Any, Tuple, Dict, List
 from concurrent.futures import ThreadPoolExecutor
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote_plus, urlparse, urlunparse
+from urllib.parse import quote_plus
 
 import sqlite3
 from pathlib import Path
@@ -7945,40 +7945,8 @@ def pmta_chunk_policy(*, smtp_host: str, chunk_domain_counts: dict[str, int]) ->
 # Single supported mode:
 # Shiva requests accounting from bridge API, and bridge only serves API responses.
 PMTA_BRIDGE_PULL_ENABLED = (os.getenv("PMTA_BRIDGE_PULL_ENABLED", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _get_bridge_pull_url_compat(default: str = "") -> str:
-    """Read bridge URL from current key, then known legacy aliases."""
-    aliases = [
-        "PMTA_BRIDGE_PULL_URL",
-        # Legacy naming used by older deployments/config snapshots.
-        "PMTA_ACCOUNTING_BRIDGE_PULL_URL",
-        "PMTA_BRIDGE_URL",
-    ]
-
-    def _get_env_compat(name: str) -> str:
-        # Prefer exact env key lookup first.
-        v = (os.getenv(name, "") or "").strip()
-        if v:
-            return v
-        # Compatibility: tolerate accidental whitespace around key names,
-        # e.g. `PMTA_BRIDGE_PULL_URL = http://...` parsed literally.
-        wanted = (name or "").strip().upper()
-        for raw_k, raw_v in os.environ.items():
-            if (raw_k or "").strip().upper() == wanted:
-                vv = (raw_v or "").strip()
-                if vv:
-                    return vv
-        return ""
-
-    for k in aliases:
-        v = _get_env_compat(k)
-        if v:
-            return v
-    return (default or "").strip()
-
-
-PMTA_BRIDGE_PULL_URL = _get_bridge_pull_url_compat("")
+PMTA_BRIDGE_PULL_PORT = 8090
+PMTA_BRIDGE_PULL_PATH = "/api/v1/pull/latest?kind=acct&max_lines=2000"
 
 
 def _normalize_bridge_pull_token(raw: Any) -> str:
@@ -8042,53 +8010,28 @@ _BRIDGE_POLLER_STARTED = False
 _BRIDGE_CURSOR_COMPAT_WARNED = False
 
 
-def _resolve_bridge_pull_url_runtime() -> str:
-    """Resolve bridge pull URL from runtime config/env aliases and normalize wrapper quotes."""
-    candidates = [
-        PMTA_BRIDGE_PULL_URL,
-        os.getenv("PMTA_BRIDGE_PULL_URL", ""),
-        os.getenv("PMTA_ACCOUNTING_BRIDGE_PULL_URL", ""),
-        os.getenv("PMTA_BRIDGE_URL", ""),
-    ]
+def _resolve_host_ip_for_bridge_pull() -> str:
+    host = (os.getenv("SHIVA_HOST", "") or "").strip()
+    if host and host not in {"0.0.0.0", "::"}:
+        try:
+            return socket.gethostbyname(host)
+        except Exception:
+            return host
 
-    # When app config helpers are available, prefer them as they include DB/UI overrides.
     try:
-        candidates.insert(0, cfg_get_first_str(["PMTA_BRIDGE_PULL_URL", "PMTA_ACCOUNTING_BRIDGE_PULL_URL", "PMTA_BRIDGE_URL"], PMTA_BRIDGE_PULL_URL))
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = (s.getsockname()[0] or "").strip()
+            if ip:
+                return ip
     except Exception:
         pass
+    return "127.0.0.1"
 
-    for raw in candidates:
-        url = (raw or "").strip()
-        if not url:
-            continue
-        # Defensive: support values accidentally saved with shell/JSON wrapper quotes.
-        if len(url) >= 2 and ((url[0] == '"' and url[-1] == '"') or (url[0] == "'" and url[-1] == "'")):
-            url = url[1:-1].strip()
-        if url:
-            return url
 
-    # Compatibility fallback: if runtime config became empty but we still have
-    # a previously used request URL in diagnostics, recover its base URL.
-    # This helps long-running instances continue pulling after transient
-    # config source glitches.
-    with _BRIDGE_DEBUG_LOCK:
-        last_req_url = str(_BRIDGE_DEBUG_STATE.get("last_req_url") or "").strip()
-    if last_req_url:
-        parsed = urlparse(last_req_url)
-        if parsed.scheme and parsed.netloc:
-            pairs = []
-            for part in (parsed.query or "").split("&"):
-                if not part:
-                    continue
-                name = part.split("=", 1)[0].strip().lower()
-                if name in {"cursor", "max_lines"}:
-                    continue
-                pairs.append(part)
-            recovered_qs = "&".join(pairs)
-            recovered = urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", recovered_qs, "")).strip()
-            if recovered:
-                return recovered
-    return ""
+def _resolve_bridge_pull_url_runtime() -> str:
+    host_ip = _resolve_host_ip_for_bridge_pull()
+    return f"http://{host_ip}:{PMTA_BRIDGE_PULL_PORT}{PMTA_BRIDGE_PULL_PATH}"
 
 
 def _bridge_debug_update(**kwargs: Any) -> None:
@@ -8669,8 +8612,6 @@ def _poll_accounting_bridge_once() -> dict:
     poll_ts = now_iso()
     _bridge_debug_update(last_poll_time=poll_ts)
     raw_url = _resolve_bridge_pull_url_runtime()
-    if raw_url and raw_url != (PMTA_BRIDGE_PULL_URL or "").strip():
-        globals()["PMTA_BRIDGE_PULL_URL"] = raw_url
     if not raw_url:
         _bridge_debug_update(
             last_attempt_ts=now_iso(),
@@ -8711,8 +8652,7 @@ def _poll_accounting_bridge_once() -> dict:
         max_request_attempts = 3
         for attempt in range(1, max_request_attempts + 1):
             for base_url in pull_urls:
-                sep = "&" if "?" in base_url else "?"
-                req_url = f"{base_url}{sep}max_lines={max(1, int(PMTA_BRIDGE_PULL_MAX_LINES or 1))}"
+                req_url = base_url
                 if cursor:
                     req_url += f"&cursor={quote_plus(cursor)}"
                 _bridge_debug_update(last_req_url=req_url)
@@ -10021,8 +9961,6 @@ APP_CONFIG_SCHEMA: list[dict] = [
     # Accounting bridge pull mode (Shiva pull request -> bridge API response)
     {"key": "PMTA_BRIDGE_PULL_ENABLED", "type": "bool", "default": "1", "group": "Accounting", "restart_required": True,
      "desc": "Enable the only accounting flow: Shiva pulls accounting from bridge API."},
-    {"key": "PMTA_BRIDGE_PULL_URL", "type": "str", "default": "", "group": "Accounting", "restart_required": True,
-     "desc": "Full bridge endpoint for pull mode, e.g. http://194.116.172.135:8090/api/v1/pull/latest?kind=acct."},
     {"key": "PMTA_BRIDGE_PULL_S", "type": "float", "default": "5", "group": "Accounting", "restart_required": False,
      "desc": "Polling interval (seconds) for Shiva bridge pull thread."},
     {"key": "PMTA_BRIDGE_PULL_MAX_LINES", "type": "int", "default": "2000", "group": "Accounting", "restart_required": False,
@@ -10154,7 +10092,7 @@ def reload_runtime_config() -> dict:
         global PMTA_PRESSURE_CONTROL, PMTA_PRESSURE_POLL_S
         global PMTA_DOMAIN_STATS, PMTA_DOMAINS_POLL_S, PMTA_DOMAINS_TOP_N
         global OPENROUTER_ENDPOINT, OPENROUTER_MODEL, OPENROUTER_TIMEOUT_S
-        global PMTA_BRIDGE_PULL_ENABLED, PMTA_BRIDGE_PULL_URL, PMTA_BRIDGE_PULL_TOKEN, PMTA_BRIDGE_PULL_S, PMTA_BRIDGE_PULL_MAX_LINES
+        global PMTA_BRIDGE_PULL_ENABLED, PMTA_BRIDGE_PULL_TOKEN, PMTA_BRIDGE_PULL_S, PMTA_BRIDGE_PULL_MAX_LINES
 
         # Spam
         SPAMCHECK_BACKEND = (cfg_get_str("SPAMCHECK_BACKEND", "spamd") or "spamd").strip().lower()
@@ -10212,7 +10150,6 @@ def reload_runtime_config() -> dict:
 
         # Bridge pull mode (Shiva -> Bridge)
         PMTA_BRIDGE_PULL_ENABLED = bool(cfg_get_bool("PMTA_BRIDGE_PULL_ENABLED", bool(PMTA_BRIDGE_PULL_ENABLED)))
-        PMTA_BRIDGE_PULL_URL = cfg_get_first_str(["PMTA_BRIDGE_PULL_URL", "PMTA_ACCOUNTING_BRIDGE_PULL_URL", "PMTA_BRIDGE_URL"], PMTA_BRIDGE_PULL_URL)
         PMTA_BRIDGE_PULL_TOKEN = _normalize_bridge_pull_token(cfg_get_str("PMTA_BRIDGE_PULL_TOKEN", PMTA_BRIDGE_PULL_TOKEN))
         PMTA_BRIDGE_PULL_S = float(cfg_get_float("PMTA_BRIDGE_PULL_S", float(PMTA_BRIDGE_PULL_S or 5.0)))
         PMTA_BRIDGE_PULL_MAX_LINES = int(cfg_get_int("PMTA_BRIDGE_PULL_MAX_LINES", int(PMTA_BRIDGE_PULL_MAX_LINES or 2000)))
