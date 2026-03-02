@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from typing import List, Tuple, Dict, Any, Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # ----------------------------
@@ -19,6 +21,7 @@ PMTA_LOG_DIR = Path(os.getenv("PMTA_LOG_DIR", "/var/log/pmta")).resolve()
 # Static bridge token (kept in code by request to avoid env export dependency).
 API_TOKEN = "mxft0zDIEHkdoTHF94jhxtKe1hdXSjVW5hHskfmuFXEdwzHtt9foI7ZZCz303Jyx"
 ALLOW_NO_AUTH = os.getenv("ALLOW_NO_AUTH", "0") == "1"
+DEBUG_ALLOW_QUERY_TOKEN = os.getenv("DEBUG_ALLOW_QUERY_TOKEN", "0") == "1"
 DEFAULT_PUSH_MAX_LINES = int(os.getenv("DEFAULT_PUSH_MAX_LINES", "5000"))
 
 # CORS (for browser access)
@@ -55,6 +58,40 @@ _TAIL_STATE_LOCK = threading.Lock()
 _TAIL_STATE: Dict[str, int] = {}
 _CSV_HEADER_STATE_LOCK = threading.Lock()
 _CSV_HEADER_STATE: Dict[str, List[str]] = {}
+
+
+def _error_payload(error: str, detail: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "error": str(error or "request_failed"),
+        "detail": detail or {},
+    }
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(_: Request, exc: HTTPException):
+    detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail or "HTTP error")}
+    error = str(detail.get("error") or "http_error")
+    return JSONResponse(status_code=exc.status_code, content=_error_payload(error=error, detail=detail))
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(_: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=400,
+        content=_error_payload(
+            error="invalid_parameters",
+            detail={"message": "Invalid request parameters", "issues": exc.errors()},
+        ),
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(_: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content=_error_payload(error="internal_error", detail={"message": str(exc)}),
+    )
 
 ACCOUNTING_HEADER_CANDIDATES = [
     "x-job-id",
@@ -207,29 +244,43 @@ def _walk_accounting_events(patterns: List[str]):
 
 def require_token(request: Request):
     """
-    Bearer token auth:
+    Supported auth methods:
       - Header: Authorization: Bearer <token>
-      - Or query param: ?token=<token>  (less secure; avoid if possible)
+      - Header: x-api-token: <token>
+
+    Query param token auth is disabled by default and only allowed when
+    DEBUG_ALLOW_QUERY_TOKEN=1 is explicitly set.
     """
     if ALLOW_NO_AUTH:
         return
 
     if not API_TOKEN:
-        raise HTTPException(status_code=500, detail="Server misconfig: API_TOKEN is not set")
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "server_misconfig", "message": "API_TOKEN is not set"},
+        )
 
     auth = request.headers.get("authorization", "")
     token = ""
     if auth.lower().startswith("bearer "):
         token = auth.split(" ", 1)[1].strip()
     else:
-        token = (
-            request.headers.get("x-api-token", "").strip()
-            or request.query_params.get("token", "").strip()
-            or request.query_params.get("api_token", "").strip()
-        )
+        token = request.headers.get("x-api-token", "").strip()
+
+    if not token and DEBUG_ALLOW_QUERY_TOKEN:
+        token = request.query_params.get("token", "").strip() or request.query_params.get("api_token", "").strip()
 
     if token != API_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": "unauthorized",
+                "message": "Missing or invalid API token",
+                "auth_methods": ["Authorization: Bearer <token>", "x-api-token: <token>"],
+                "allow_no_auth": ALLOW_NO_AUTH,
+                "debug_query_token_enabled": DEBUG_ALLOW_QUERY_TOKEN,
+            },
+        )
 
 
 def _file_matches(name: str, patterns: List[str]) -> bool:
