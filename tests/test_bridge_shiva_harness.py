@@ -92,6 +92,45 @@ class BridgeShivaHarnessTests(unittest.TestCase):
         self.assertLess(avg_ms, 20.0)
         self.assertLess(p95_ms, 50.0)
 
+
+    def test_bridge_url_resolution_falls_back_to_last_req_url(self):
+        old_cfg = shiva.PMTA_BRIDGE_PULL_URL
+        old_state = dict(shiva._BRIDGE_DEBUG_STATE)
+        old_env = os.environ.get("PMTA_BRIDGE_PULL_URL")
+        old_env_legacy = os.environ.get("PMTA_ACCOUNTING_BRIDGE_PULL_URL")
+        old_env_bridge = os.environ.get("PMTA_BRIDGE_URL")
+        try:
+            shiva.PMTA_BRIDGE_PULL_URL = ""
+            for k in ("PMTA_BRIDGE_PULL_URL", "PMTA_ACCOUNTING_BRIDGE_PULL_URL", "PMTA_BRIDGE_URL"):
+                os.environ.pop(k, None)
+            with shiva._BRIDGE_DEBUG_LOCK:
+                shiva._BRIDGE_DEBUG_STATE["last_req_url"] = (
+                    "http://194.116.172.135:8090/api/v1/pull/latest?kind=acct&max_lines=2000&cursor=abc123"
+                )
+
+            resolved = shiva._resolve_bridge_pull_url_runtime()
+            self.assertEqual(
+                resolved,
+                "http://194.116.172.135:8090/api/v1/pull/latest?kind=acct",
+            )
+        finally:
+            shiva.PMTA_BRIDGE_PULL_URL = old_cfg
+            if old_env is None:
+                os.environ.pop("PMTA_BRIDGE_PULL_URL", None)
+            else:
+                os.environ["PMTA_BRIDGE_PULL_URL"] = old_env
+            if old_env_legacy is None:
+                os.environ.pop("PMTA_ACCOUNTING_BRIDGE_PULL_URL", None)
+            else:
+                os.environ["PMTA_ACCOUNTING_BRIDGE_PULL_URL"] = old_env_legacy
+            if old_env_bridge is None:
+                os.environ.pop("PMTA_BRIDGE_URL", None)
+            else:
+                os.environ["PMTA_BRIDGE_URL"] = old_env_bridge
+            with shiva._BRIDGE_DEBUG_LOCK:
+                shiva._BRIDGE_DEBUG_STATE.clear()
+                shiva._BRIDGE_DEBUG_STATE.update(old_state)
+
     def test_bridge_token_normalization_accepts_bearer_and_quotes(self):
         self.assertEqual(
             shiva._normalize_bridge_pull_token('"Bearer mxft0zDIEHkdoTHF94jhxtKe1hdXSjVW5hHskfmuFXEdwzHtt9foI7ZZCz303Jyx"'),
