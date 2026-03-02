@@ -424,10 +424,10 @@
 - **الخلفية:** تشغيل/إيقاف خيط السحب الدوري من bridge.
 - **إذا `0`:** لن يتم ingest محاسبة PMTA تلقائيًا.
 
-### `PMTA_BRIDGE_PULL_URL`
-- **الافتراضي:** فارغ
-- **الخلفية:** endpoint الذي يقرأ منه Shiva بيانات accounting.
-- **الشرط:** يجب أن يطابق host/port/path الحقيقية لخدمة Bridge.
+### `PMTA_BRIDGE_PULL_PORT`
+- **الافتراضي:** `8090`
+- **الخلفية:** بورت Bridge الذي يستخدمه Shiva لبناء endpoint السحب.
+- **مهم:** Shiva يبني الـ host من `SMTP Host` داخل الحملة (campaign)، وليس من IP السيرفر.
 
 ### `PMTA_BRIDGE_PULL_TOKEN`
 - **الافتراضي:** فارغ
@@ -599,7 +599,7 @@ PMTA_PRESSURE_L3_SLEEP_MIN=4.0
 
 # --- Accounting pull in Shiva ---
 PMTA_BRIDGE_PULL_ENABLED=1
-PMTA_BRIDGE_PULL_URL=http://127.0.0.1:8090/api/v1/pull/latest?kind=acct
+PMTA_BRIDGE_PULL_PORT=8090
 PMTA_BRIDGE_PULL_TOKEN=
 PMTA_BRIDGE_PULL_S=5
 PMTA_BRIDGE_PULL_MAX_LINES=2000
@@ -833,7 +833,7 @@ OPENROUTER_TIMEOUT_S=40
   - **وظيفته:** تشغيل/إيقاف خيط poller بالكامل.
   - **سيناريو الاستخدام:** تعطيله مؤقتًا أثناء صيانة bridge.
 
-- `PMTA_BRIDGE_PULL_URL`
+- `PMTA_BRIDGE_PULL_PORT`
   - **الدوال المستخدمة:** `_poll_accounting_bridge_once`, `api_accounting_bridge_status`, `api_accounting_bridge_pull_once`.
   - **وظيفته:** endpoint الذي تسحب منه Shiva أحداث accounting.
   - **سيناريو الاستخدام:** تغيير IP/Port bridge أو المسار.
