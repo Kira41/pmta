@@ -7929,7 +7929,24 @@ def pmta_chunk_policy(*, smtp_host: str, chunk_domain_counts: dict[str, int]) ->
 # Single supported mode:
 # Shiva requests accounting from bridge API, and bridge only serves API responses.
 PMTA_BRIDGE_PULL_ENABLED = (os.getenv("PMTA_BRIDGE_PULL_ENABLED", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
-PMTA_BRIDGE_PULL_URL = (os.getenv("PMTA_BRIDGE_PULL_URL", "") or "").strip()
+
+
+def _get_bridge_pull_url_compat(default: str = "") -> str:
+    """Read bridge URL from current key, then known legacy aliases."""
+    aliases = [
+        "PMTA_BRIDGE_PULL_URL",
+        # Legacy naming used by older deployments/config snapshots.
+        "PMTA_ACCOUNTING_BRIDGE_PULL_URL",
+        "PMTA_BRIDGE_URL",
+    ]
+    for k in aliases:
+        v = (os.getenv(k, "") or "").strip()
+        if v:
+            return v
+    return (default or "").strip()
+
+
+PMTA_BRIDGE_PULL_URL = _get_bridge_pull_url_compat("")
 PMTA_BRIDGE_PULL_TOKEN = (os.getenv("PMTA_BRIDGE_PULL_TOKEN", "") or "").strip()
 try:
     PMTA_BRIDGE_PULL_S = float((os.getenv("PMTA_BRIDGE_PULL_S", "5") or "5").strip())
@@ -9941,6 +9958,15 @@ def cfg_get_str(key: str, default: str) -> str:
     return str(raw)
 
 
+def cfg_get_first_str(keys: list[str], default: str = "") -> str:
+    """Return first non-empty config value from a prioritized key list."""
+    for k in (keys or []):
+        v = cfg_get_str((k or "").strip(), "")
+        if (v or "").strip():
+            return v.strip()
+    return (default or "").strip()
+
+
 def cfg_get_int(key: str, default: int) -> int:
     raw, src, _ui, _envv = _cfg_get_raw_and_source(key)
     if raw is None:
@@ -10076,7 +10102,7 @@ def reload_runtime_config() -> dict:
 
         # Bridge pull mode (Shiva -> Bridge)
         PMTA_BRIDGE_PULL_ENABLED = bool(cfg_get_bool("PMTA_BRIDGE_PULL_ENABLED", bool(PMTA_BRIDGE_PULL_ENABLED)))
-        PMTA_BRIDGE_PULL_URL = (cfg_get_str("PMTA_BRIDGE_PULL_URL", PMTA_BRIDGE_PULL_URL) or "").strip()
+        PMTA_BRIDGE_PULL_URL = cfg_get_first_str(["PMTA_BRIDGE_PULL_URL", "PMTA_ACCOUNTING_BRIDGE_PULL_URL", "PMTA_BRIDGE_URL"], PMTA_BRIDGE_PULL_URL)
         PMTA_BRIDGE_PULL_TOKEN = (cfg_get_str("PMTA_BRIDGE_PULL_TOKEN", PMTA_BRIDGE_PULL_TOKEN) or "").strip()
         PMTA_BRIDGE_PULL_S = float(cfg_get_float("PMTA_BRIDGE_PULL_S", float(PMTA_BRIDGE_PULL_S or 5.0)))
         PMTA_BRIDGE_PULL_MAX_LINES = int(cfg_get_int("PMTA_BRIDGE_PULL_MAX_LINES", int(PMTA_BRIDGE_PULL_MAX_LINES or 2000)))
