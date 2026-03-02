@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
 import json
+import hashlib
 import math
 import csv
 import logging
@@ -682,11 +683,41 @@ def db_init() -> None:
                        job_id TEXT NOT NULL,
                        rcpt TEXT NOT NULL,
                        status TEXT NOT NULL,
+                       last_message_id TEXT NOT NULL DEFAULT '',
+                       last_dsn_status TEXT NOT NULL DEFAULT '',
+                       last_dsn_diag TEXT NOT NULL DEFAULT '',
                        updated_at TEXT NOT NULL,
                        PRIMARY KEY(job_id, rcpt)
                    )"""
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_job_outcomes_job ON job_outcomes(job_id)")
+
+            # Append-only accounting event ledger (idempotent ingestion)
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS accounting_events(
+                       event_id TEXT PRIMARY KEY,
+                       job_id TEXT NOT NULL,
+                       rcpt TEXT NOT NULL,
+                       outcome TEXT NOT NULL,
+                       time_logged TEXT NOT NULL,
+                       message_id TEXT NOT NULL,
+                       dsn_status TEXT NOT NULL,
+                       dsn_diag TEXT NOT NULL,
+                       source_file TEXT NOT NULL,
+                       source_offset_or_line TEXT NOT NULL,
+                       created_at TEXT NOT NULL,
+                       raw_json TEXT
+                   )"""
+            )
+
+            # Backward-compatible migrations for old DB files.
+            cols = {str(r[1] or "") for r in conn.execute("PRAGMA table_info(job_outcomes)").fetchall()}
+            if "last_message_id" not in cols:
+                conn.execute("ALTER TABLE job_outcomes ADD COLUMN last_message_id TEXT NOT NULL DEFAULT ''")
+            if "last_dsn_status" not in cols:
+                conn.execute("ALTER TABLE job_outcomes ADD COLUMN last_dsn_status TEXT NOT NULL DEFAULT ''")
+            if "last_dsn_diag" not in cols:
+                conn.execute("ALTER TABLE job_outcomes ADD COLUMN last_dsn_diag TEXT NOT NULL DEFAULT ''")
 
             # Per-job recipient registry (helps map accounting rows with missing job/campaign ids)
             conn.execute(
@@ -738,6 +769,7 @@ def db_init() -> None:
                 conn.execute("DELETE FROM jobs")
                 conn.execute("DELETE FROM job_outcomes")
                 conn.execute("DELETE FROM job_recipients")
+                conn.execute("DELETE FROM accounting_events")
                 conn.commit()
         finally:
             conn.close()
@@ -829,6 +861,7 @@ def db_clear_all() -> None:
             conn.execute("DELETE FROM jobs")
             conn.execute("DELETE FROM job_outcomes")
             conn.execute("DELETE FROM job_recipients")
+            conn.execute("DELETE FROM accounting_events")
             conn.commit()
         finally:
             conn.close()
@@ -947,7 +980,7 @@ def db_delete_job(job_id: str) -> None:
 # Outcomes DB helpers (PMTA accounting)
 # =========================
 
-def db_get_outcome(job_id: str, rcpt: str) -> Optional[str]:
+def db_get_outcome(job_id: str, rcpt: str) -> Optional[dict[str, str]]:
     jid = (job_id or "").strip()
     r = (rcpt or "").strip().lower()
     if not jid or not r:
@@ -956,15 +989,23 @@ def db_get_outcome(job_id: str, rcpt: str) -> Optional[str]:
         conn = _db_conn()
         try:
             row = conn.execute(
-                "SELECT status FROM job_outcomes WHERE job_id=? AND rcpt=?",
+                "SELECT status, last_message_id, last_dsn_status, last_dsn_diag "
+                "FROM job_outcomes WHERE job_id=? AND rcpt=?",
                 (jid, r),
             ).fetchone()
-            return str(row[0]) if row and row[0] else None
+            if not row:
+                return None
+            return {
+                "status": str(row[0] or "").strip().lower(),
+                "last_message_id": str(row[1] or ""),
+                "last_dsn_status": str(row[2] or ""),
+                "last_dsn_diag": str(row[3] or ""),
+            }
         finally:
             conn.close()
 
 
-def db_set_outcome(job_id: str, rcpt: str, status: str) -> None:
+def db_set_outcome(job_id: str, rcpt: str, status: str, message_id: str = "", dsn_status: str = "", dsn_diag: str = "") -> None:
     jid = (job_id or "").strip()
     r = (rcpt or "").strip().lower()
     st = (status or "").strip().lower()
@@ -976,15 +1017,54 @@ def db_set_outcome(job_id: str, rcpt: str, status: str) -> None:
             ts = now_iso()
             _exec_upsert_compat(
                 conn,
-                "INSERT INTO job_outcomes(job_id, rcpt, status, updated_at) VALUES(?,?,?,?) "
-                "ON CONFLICT(job_id, rcpt) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at",
-                (jid, r, st, ts),
-                "UPDATE job_outcomes SET status=?, updated_at=? WHERE job_id=? AND rcpt=?",
-                (st, ts, jid, r),
-                "INSERT INTO job_outcomes(job_id, rcpt, status, updated_at) VALUES(?,?,?,?)",
-                (jid, r, st, ts),
+                "INSERT INTO job_outcomes(job_id, rcpt, status, last_message_id, last_dsn_status, last_dsn_diag, updated_at) "
+                "VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(job_id, rcpt) DO UPDATE SET "
+                "status=excluded.status, "
+                "last_message_id=excluded.last_message_id, "
+                "last_dsn_status=excluded.last_dsn_status, "
+                "last_dsn_diag=excluded.last_dsn_diag, "
+                "updated_at=excluded.updated_at",
+                (jid, r, st, str(message_id or ""), str(dsn_status or ""), str(dsn_diag or ""), ts),
+                "UPDATE job_outcomes SET status=?, last_message_id=?, last_dsn_status=?, last_dsn_diag=?, updated_at=? WHERE job_id=? AND rcpt=?",
+                (st, str(message_id or ""), str(dsn_status or ""), str(dsn_diag or ""), ts, jid, r),
+                "INSERT INTO job_outcomes(job_id, rcpt, status, last_message_id, last_dsn_status, last_dsn_diag, updated_at) VALUES(?,?,?,?,?,?,?)",
+                (jid, r, st, str(message_id or ""), str(dsn_status or ""), str(dsn_diag or ""), ts),
             )
             conn.commit()
+        finally:
+            conn.close()
+
+
+def db_insert_accounting_event(event: dict[str, Any]) -> bool:
+    eid = str((event or {}).get("event_id") or "").strip()
+    if not eid:
+        return False
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            conn.execute(
+                "INSERT INTO accounting_events(event_id, job_id, rcpt, outcome, time_logged, message_id, dsn_status, dsn_diag, "
+                "source_file, source_offset_or_line, created_at, raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    eid,
+                    str(event.get("job_id") or ""),
+                    str(event.get("rcpt") or ""),
+                    str(event.get("outcome") or ""),
+                    str(event.get("time_logged") or ""),
+                    str(event.get("message_id") or ""),
+                    str(event.get("dsn_status") or ""),
+                    str(event.get("dsn_diag") or ""),
+                    str(event.get("source_file") or ""),
+                    str(event.get("source_offset_or_line") or ""),
+                    now_iso(),
+                    event.get("raw_json"),
+                ),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
         finally:
             conn.close()
 
@@ -7817,21 +7897,84 @@ def _push_outcome_bucket(job: SendJob, kind: str):
         pass
 
 
-def _apply_outcome_to_job(job: SendJob, rcpt: str, kind: str) -> None:
+
+
+def _transition_allowed(prev: str, new: str) -> bool:
+    p = (prev or "").strip().lower()
+    n = (new or "").strip().lower()
+    if not p:
+        return True
+    if p == n:
+        return True
+    if p == "deferred" and n in {"delivered", "bounced", "complained"}:
+        return True
+    if p == "delivered" and n == "complained":
+        return True
+    return False
+
+
+def _build_accounting_event_row(ev: dict, typ: str, rcpt: str, job_id: str) -> dict[str, str]:
+    source_file = _event_value(ev, "source_file", "source", "file", "path", "filename") or "bridge"
+    source_locator = _event_value(ev, "offset", "source_offset", "line", "line_number", "line_no", "lineno")
+    if not source_locator:
+        source_locator = "line:unknown"
+    time_logged = _event_value(ev, "time_logged", "log_time", "logged_at", "timestamp", "ts", "time", "date")
+    message_id = _event_value(ev, "msgid", "message-id", "message_id", "messageid", "header_message-id", "header_message_id")
+    dsn_status = _event_value(ev, "dsnStatus", "dsn_status", "enhanced-status", "enhanced_status")
+    dsn_diag = _event_value(ev, "dsnDiag", "dsn_diag", "diag", "diagnostic", "smtp-diagnostic", "response")
+
+    stable_key = "\x1f".join([
+        str(source_file or ""),
+        str(source_locator or ""),
+        str((rcpt or "").strip().lower()),
+        str((typ or "").strip().lower()),
+        str(time_logged or ""),
+        str(message_id or ""),
+    ])
+    event_id = hashlib.sha256(stable_key.encode("utf-8", "ignore")).hexdigest()
+
+    raw_json = ""
+    try:
+        raw_json = json.dumps(ev, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
+    except Exception:
+        raw_json = str(ev)
+
+    return {
+        "event_id": event_id,
+        "job_id": str(job_id or ""),
+        "rcpt": str((rcpt or "").strip().lower()),
+        "outcome": str((typ or "").strip().lower()),
+        "time_logged": str(time_logged or ""),
+        "message_id": str(message_id or ""),
+        "dsn_status": str(dsn_status or ""),
+        "dsn_diag": str(dsn_diag or ""),
+        "source_file": str(source_file or ""),
+        "source_offset_or_line": str(source_locator or ""),
+        "raw_json": raw_json,
+    }
+
+
+def _apply_outcome_to_job(job: SendJob, rcpt: str, kind: str, ev: Optional[dict] = None) -> None:
     """Update job counters in a 'unique per recipient' way using SQLite job_outcomes."""
     r = (rcpt or "").strip().lower()
     k = (kind or "").strip().lower()
     if not r or k not in {"delivered", "bounced", "deferred", "complained"}:
         return
 
-    prev = db_get_outcome(job.id, r)
+    prev_row = db_get_outcome(job.id, r) or {}
+    prev = str(prev_row.get("status") or "").strip().lower()
 
-    # Don't downgrade finals to deferred
-    if prev in {"delivered", "bounced", "complained"} and k == "deferred":
+    message_id = _event_value(ev or {}, "msgid", "message-id", "message_id", "messageid", "header_message-id", "header_message_id")
+    dsn_status = _event_value(ev or {}, "dsnStatus", "dsn_status", "enhanced-status", "enhanced_status")
+    dsn_diag = _event_value(ev or {}, "dsnDiag", "dsn_diag", "diag", "diagnostic", "smtp-diagnostic", "response")
+
+    if prev and not _transition_allowed(prev, k):
+        db_set_outcome(job.id, r, prev, message_id=message_id, dsn_status=dsn_status, dsn_diag=dsn_diag)
+        job.accounting_last_ts = now_iso()
         return
 
     if prev == k:
-        _push_outcome_bucket(job, k)
+        db_set_outcome(job.id, r, k, message_id=message_id, dsn_status=dsn_status, dsn_diag=dsn_diag)
         job.accounting_last_ts = now_iso()
         return
 
@@ -7859,7 +8002,7 @@ def _apply_outcome_to_job(job: SendJob, rcpt: str, kind: str) -> None:
         dec(prev)
     inc(k)
 
-    db_set_outcome(job.id, r, k)
+    db_set_outcome(job.id, r, k, message_id=message_id, dsn_status=dsn_status, dsn_diag=dsn_diag)
     _push_outcome_bucket(job, k)
     job.accounting_last_ts = now_iso()
 
@@ -7952,22 +8095,27 @@ def process_pmta_accounting_event(ev: dict) -> dict:
     )
     rcpt = str(rcpt or "").strip()
 
-    job_id = _event_value(ev, "x-job-id", "job-id", "job_id", "jobid").lower()
+    job_id = _event_value(ev, "header_x-job-id", "x-job-id", "job-id", "job_id", "jobid").lower()
     campaign_id = _event_value(ev, "x-campaign-id", "campaign-id", "campaign_id", "cid")
 
+    msgid = _event_value(ev, "msgid", "message-id", "message_id", "messageid", "header_message-id", "header_message_id")
+    if not msgid:
+        # Pick any field that looks like a Message-ID header (different acct-file schemas)
+        for k, v in (ev or {}).items():
+            kk = str(k or "").lower().replace("_", "-")
+            if "message-id" in kk:
+                msgid = v
+                break
+
     if not job_id:
-        msgid = _event_value(ev, "msgid", "message-id", "message_id", "messageid", "header_message-id", "header_message_id")
-        if not msgid:
-            # Pick any field that looks like a Message-ID header (different acct-file schemas)
-            for k, v in (ev or {}).items():
-                kk = str(k or "").lower().replace("_", "-")
-                if "message-id" in kk:
-                    msgid = v
-                    break
         job_id = _extract_job_id_from_text(str(msgid or ""))
 
     if not job_id:
         job_id = _extract_job_id_from_text(str(ev.get("raw") or ""))
+
+    event_row = _build_accounting_event_row(ev, typ, rcpt, job_id)
+    if not db_insert_accounting_event(event_row):
+        return {"ok": True, "duplicate": True, "event_id": event_row.get("event_id"), "job_id": job_id, "campaign_id": campaign_id, "rcpt": rcpt, "type": typ}
 
     if not rcpt or typ not in {"delivered", "bounced", "deferred", "complained"}:
         return {"ok": False, "reason": "missing_fields", "job_id": job_id, "campaign_id": campaign_id, "rcpt": rcpt, "type": typ}
@@ -7981,7 +8129,7 @@ def process_pmta_accounting_event(ev: dict) -> dict:
         if not job:
             return {"ok": False, "reason": "job_not_found", "job_id": job_id, "campaign_id": campaign_id, "rcpt": rcpt}
 
-        _apply_outcome_to_job(job, rcpt, typ)
+        _apply_outcome_to_job(job, rcpt, typ, ev)
         _record_accounting_error(job, rcpt, typ, ev)
         job.maybe_persist()
 
@@ -8024,13 +8172,20 @@ def process_campaign_accounting_payload(payload: dict) -> dict:
                 continue
 
             jid = str(item.get("job_id") or item.get("jobId") or "").strip().lower()
+            ev = dict(item)
+            ev.setdefault("source_file", "campaign_payload")
+            ev.setdefault("line", str(processed))
+            event_row = _build_accounting_event_row(ev, typ, rcpt, jid)
+            if not db_insert_accounting_event(event_row):
+                continue
+
             job = JOBS.get(jid) if jid else None
             if not job or (job.campaign_id or "") != campaign_id:
                 job = fallback_job
             if not job:
                 continue
 
-            _apply_outcome_to_job(job, rcpt, typ)
+            _apply_outcome_to_job(job, rcpt, typ, item)
             _record_accounting_error(job, rcpt, typ, item)
             job.maybe_persist()
             accepted += 1
