@@ -334,6 +334,9 @@ class SendJob:
     # Accounting error rollups (response classes from accounting rows)
     accounting_error_counts: dict[str, int] = field(default_factory=dict)
     accounting_last_errors: list[dict] = field(default_factory=list)  # {ts, email, type, kind, detail}
+    # Shiva internal errors (worker/queue/parser/etc)
+    internal_error_counts: dict[str, int] = field(default_factory=dict)
+    internal_last_errors: list[dict] = field(default_factory=list)  # {ts, job_id, type, detail, email}
 
     # Spam score gate (computed before sending)
     spam_threshold: float = 4.0
@@ -400,6 +403,24 @@ class SendJob:
         elif "connect" in msg or "connection" in msg:
             cat = "connection"
         self.error_counts[cat] = int(self.error_counts.get(cat, 0)) + 1
+        self.maybe_persist()
+    def record_internal_error(self, err_type: str, detail: str, *, email: str = ""):
+        """Record Shiva-side internal errors using a bounded rolling window."""
+        self.updated_at = now_iso()
+        t = str(err_type or "other").strip().lower() or "other"
+        d = str(detail or "").strip()[:300]
+        self.internal_error_counts[t] = int(self.internal_error_counts.get(t, 0) or 0) + 1
+        self.internal_last_errors.append(
+            {
+                "ts": now_iso(),
+                "job_id": self.id,
+                "type": t,
+                "detail": d,
+                "email": (email or "").strip(),
+            }
+        )
+        if len(self.internal_last_errors) > 80:
+            self.internal_last_errors = self.internal_last_errors[-40:]
         self.maybe_persist()
     def speed_epm(self) -> float:
         """Emails per minute based on last 60s of send events."""
@@ -818,6 +839,8 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "accounting_last_ts": job.accounting_last_ts or "",
         "accounting_error_counts": job.accounting_error_counts or {},
         "accounting_last_errors": (job.accounting_last_errors or [])[-50:],
+        "internal_error_counts": job.internal_error_counts or {},
+        "internal_last_errors": (job.internal_last_errors or [])[-50:],
         "spam_threshold": float(job.spam_threshold or 4.0),
         "spam_score": job.spam_score,
         "spam_detail": (job.spam_detail or "")[:2000],
@@ -1069,6 +1092,8 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job.accounting_last_ts = str(s.get("accounting_last_ts") or "")
         job.accounting_error_counts = dict(s.get("accounting_error_counts") or {})
         job.accounting_last_errors = list(s.get("accounting_last_errors") or [])
+        job.internal_error_counts = dict(s.get("internal_error_counts") or {})
+        job.internal_last_errors = list(s.get("internal_last_errors") or [])
 
         job.spam_threshold = float(s.get("spam_threshold") or 4.0)
         job.spam_score = s.get("spam_score")
@@ -3226,8 +3251,16 @@ PAGE_JOBS = r"""
 
               <div style="height:10px"></div>
 
-              <div class="mini"><b>Last errors (last 10)</b></div>
+              <div class="mini"><b>Last errors</b></div>
               <div class="mini" data-k="lastErrors">—</div>
+
+              <div style="height:10px"></div>
+              <div class="mini"><b>Last errors 2</b></div>
+              <div class="mini" data-k="lastErrors2">—</div>
+
+              <div style="height:10px"></div>
+              <div class="mini"><b>Internal errors (Shiva)</b></div>
+              <div class="mini" data-k="internalErrors">—</div>
             </div>
 
           </div>
@@ -3470,19 +3503,59 @@ This will remove it from Jobs history.`);
       el.innerHTML = parts.join('<br>');
     }
 
-    // last accounting errors (last 10) - errors only
-    const re = onlyErrors.slice().reverse().slice(0,10);
+    // last accounting errors - errors only (accepted is filtered out)
+    const re10 = onlyErrors.slice().reverse().slice(0,10);
     const el2 = qk(card,'lastErrors');
     if(el2){
-      if(!re.length){ el2.textContent = '—'; }
+      if(!re10.length){ el2.textContent = '—'; }
       else{
-        el2.innerHTML = re.map(x => {
+        el2.innerHTML = re10.map(x => {
           const kk = (x.kind === 'temporary_error') ? '4XX' : '5XX';
           return `• [${esc(kk)}] ${esc(x.email || '—')} — ${esc(x.detail || '')}`;
         }).join('<br>');
       }
     }
+
+    const re20 = onlyErrors.slice().reverse().slice(0,20);
+    const el3 = qk(card,'lastErrors2');
+    if(el3){
+      if(!re20.length){ el3.textContent = '—'; }
+      else{
+        el3.innerHTML = re20.map(x => {
+          const typ = (x.type || '').toString();
+          return `• ${esc(x.email || '—')} · ${esc(typ || 'unknown')} · ${esc(x.detail || '')}`;
+        }).join('<br>');
+      }
+    }
+
+    const ieCounts = j.internal_error_counts || {};
+    const ieRows = Array.isArray(j.internal_last_errors) ? j.internal_last_errors.slice().reverse().slice(0,10) : [];
+    const ie = qk(card,'internalErrors');
+    if(ie){
+      const topFixed = Object.entries(ieCounts).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0));
+      const countLine = topFixed.length
+        ? topFixed.map(([k,v]) => `${esc(k)}: <b>${Number(v||0)}</b>`).join(' · ')
+        : '';
+
+      if(!countLine && !ieRows.length){
+        ie.textContent = '—';
+      }else{
+        const lines = [];
+        if(countLine) lines.push(countLine);
+        if(ieRows.length){
+          lines.push(ieRows.map(x => {
+            const jid = (x.job_id || '').toString();
+            const em = (x.email || '').toString();
+            const ts = (x.ts || '').toString();
+            const extra = [jid ? `job=${jid}` : '', em ? `email=${em}` : ''].filter(Boolean).join(' · ');
+            return `• ${esc(ts)} · [${esc(x.type || 'other')}] ${esc(x.detail || '')}${extra ? ` · ${esc(extra)}` : ''}`;
+          }).join('<br>'));
+        }
+        ie.innerHTML = lines.join('<br>');
+      }
+    }
   }
+
 
 
   function renderChunkHist(card, j){
@@ -8515,6 +8588,7 @@ def smtp_send_job(
                             job.failed += 1
                             job.last_error = str(e)
                             job.record_error(str(e))
+                            job.record_internal_error("send_failed", str(e), email=rcpt)
                             if dom:
                                 job.domain_failed[dom] = job.domain_failed.get(dom, 0) + 1
 
@@ -8535,6 +8609,7 @@ def smtp_send_job(
                     job.failed += 1
                     job.last_error = str(e)
                     job.record_error(str(e))
+                    job.record_internal_error("exception", f"Worker error (chunk={chunk_idx} w={worker_idx}): {e}")
                     job.log("ERROR", f"Worker error (chunk={chunk_idx} w={worker_idx}): {e}")
             finally:
                 try:
@@ -9520,6 +9595,8 @@ def job_api(job_id: str):
                 "accounting_last_ts": job.accounting_last_ts,
                 "accounting_error_counts": job.accounting_error_counts,
                 "accounting_last_errors": (job.accounting_last_errors or [])[-20:],
+                "internal_error_counts": job.internal_error_counts,
+                "internal_last_errors": (job.internal_last_errors or [])[-20:],
                 "spam_threshold": job.spam_threshold,
                 "spam_score": job.spam_score,
                 "spam_detail": job.spam_detail,
