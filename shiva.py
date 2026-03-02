@@ -13,6 +13,7 @@ import subprocess
 import time
 import uuid
 import threading
+import queue
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email import policy as email_policy
@@ -556,6 +557,29 @@ def _resolve_db_path() -> str:
 DB_PATH = _resolve_db_path()
 DB_LOCK = threading.Lock()
 
+try:
+    DB_WRITE_BATCH_SIZE = max(50, min(1000, int((os.getenv("SHIVA_DB_WRITE_BATCH_SIZE", "500") or "500").strip())))
+except Exception:
+    DB_WRITE_BATCH_SIZE = 500
+try:
+    DB_WRITE_QUEUE_MAX = max(1000, int((os.getenv("SHIVA_DB_WRITE_QUEUE_MAX", "50000") or "50000").strip()))
+except Exception:
+    DB_WRITE_QUEUE_MAX = 50000
+
+_DB_WRITE_QUEUE: "queue.Queue[dict[str, Any]]" = queue.Queue(maxsize=DB_WRITE_QUEUE_MAX)
+_DB_WRITE_RETRY: list[dict[str, Any]] = []
+_DB_WRITE_LOCK = threading.Lock()
+_DB_WRITER_STARTED = False
+_DB_WRITER_LOCAL = threading.local()
+_DB_WRITER_STATUS: dict[str, Any] = {
+    "queued": 0,
+    "written": 0,
+    "failed": 0,
+    "last_error": "",
+    "last_error_ts": "",
+    "queue_full": 0,
+}
+
 BROWSER_COOKIE = "smtp_sender_bid"
 _DB_CLEAR_ON_START = (os.getenv("DB_CLEAR_ON_START", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -594,6 +618,10 @@ def _db_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15.0)
     try:
         conn.execute("PRAGMA busy_timeout = 15000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA foreign_keys=ON")
     except Exception:
         pass
     return conn
@@ -628,6 +656,188 @@ def _exec_upsert_compat(
     cur = conn.execute(update_sql, update_params)
     if (cur.rowcount or 0) <= 0:
         conn.execute(insert_sql, insert_params)
+
+
+def _db_writer_active() -> bool:
+    return bool(getattr(_DB_WRITER_LOCAL, "active", False))
+
+
+def _db_writer_enqueue(item: dict[str, Any]) -> bool:
+    if not isinstance(item, dict):
+        return False
+    item.setdefault("attempts", 0)
+    try:
+        _DB_WRITE_QUEUE.put(item, timeout=0.2)
+        with _DB_WRITE_LOCK:
+            _DB_WRITER_STATUS["queued"] = int(_DB_WRITER_STATUS.get("queued", 0) or 0) + 1
+        return True
+    except queue.Full:
+        with _DB_WRITE_LOCK:
+            _DB_WRITER_STATUS["queue_full"] = int(_DB_WRITER_STATUS.get("queue_full", 0) or 0) + 1
+            _DB_WRITER_STATUS["last_error"] = "db_write_queue_full"
+            _DB_WRITER_STATUS["last_error_ts"] = now_iso()
+            _DB_WRITE_RETRY.append(item)
+        return True
+
+
+def _db_upsert_job_payload(conn: sqlite3.Connection, payload: dict[str, Any]) -> None:
+    _exec_upsert_compat(
+        conn,
+        "INSERT INTO jobs(id, campaign_id, created_at, updated_at, status, snapshot) VALUES(?,?,?,?,?,?) "
+        "ON CONFLICT(id) DO UPDATE SET campaign_id=excluded.campaign_id, updated_at=excluded.updated_at, status=excluded.status, snapshot=excluded.snapshot",
+        (
+            str(payload.get("id") or ""),
+            str(payload.get("campaign_id") or ""),
+            str(payload.get("created_at") or now_iso()),
+            str(payload.get("updated_at") or now_iso()),
+            str(payload.get("status") or ""),
+            str(payload.get("snapshot") or ""),
+        ),
+        "UPDATE jobs SET campaign_id=?, updated_at=?, status=?, snapshot=? WHERE id=?",
+        (
+            str(payload.get("campaign_id") or ""),
+            str(payload.get("updated_at") or now_iso()),
+            str(payload.get("status") or ""),
+            str(payload.get("snapshot") or ""),
+            str(payload.get("id") or ""),
+        ),
+        "INSERT INTO jobs(id, campaign_id, created_at, updated_at, status, snapshot) VALUES(?,?,?,?,?,?)",
+        (
+            str(payload.get("id") or ""),
+            str(payload.get("campaign_id") or ""),
+            str(payload.get("created_at") or now_iso()),
+            str(payload.get("updated_at") or now_iso()),
+            str(payload.get("status") or ""),
+            str(payload.get("snapshot") or ""),
+        ),
+    )
+
+
+def _db_set_outcome_payload(conn: sqlite3.Connection, payload: dict[str, Any]) -> None:
+    _exec_upsert_compat(
+        conn,
+        "INSERT INTO job_outcomes(job_id, rcpt, status, last_message_id, last_dsn_status, last_dsn_diag, updated_at) "
+        "VALUES(?,?,?,?,?,?,?) "
+        "ON CONFLICT(job_id, rcpt) DO UPDATE SET "
+        "status=excluded.status, "
+        "last_message_id=excluded.last_message_id, "
+        "last_dsn_status=excluded.last_dsn_status, "
+        "last_dsn_diag=excluded.last_dsn_diag, "
+        "updated_at=excluded.updated_at",
+        (
+            str(payload.get("job_id") or ""),
+            str(payload.get("rcpt") or ""),
+            str(payload.get("status") or ""),
+            str(payload.get("message_id") or ""),
+            str(payload.get("dsn_status") or ""),
+            str(payload.get("dsn_diag") or ""),
+            str(payload.get("updated_at") or now_iso()),
+        ),
+        "UPDATE job_outcomes SET status=?, last_message_id=?, last_dsn_status=?, last_dsn_diag=?, updated_at=? WHERE job_id=? AND rcpt=?",
+        (
+            str(payload.get("status") or ""),
+            str(payload.get("message_id") or ""),
+            str(payload.get("dsn_status") or ""),
+            str(payload.get("dsn_diag") or ""),
+            str(payload.get("updated_at") or now_iso()),
+            str(payload.get("job_id") or ""),
+            str(payload.get("rcpt") or ""),
+        ),
+        "INSERT INTO job_outcomes(job_id, rcpt, status, last_message_id, last_dsn_status, last_dsn_diag, updated_at) VALUES(?,?,?,?,?,?,?)",
+        (
+            str(payload.get("job_id") or ""),
+            str(payload.get("rcpt") or ""),
+            str(payload.get("status") or ""),
+            str(payload.get("message_id") or ""),
+            str(payload.get("dsn_status") or ""),
+            str(payload.get("dsn_diag") or ""),
+            str(payload.get("updated_at") or now_iso()),
+        ),
+    )
+
+
+def _db_insert_accounting_event_payload(conn: sqlite3.Connection, event: dict[str, Any]) -> bool:
+    try:
+        conn.execute(
+            "INSERT INTO accounting_events(event_id, job_id, rcpt, outcome, time_logged, message_id, dsn_status, dsn_diag, "
+            "source_file, source_offset_or_line, created_at, raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                str(event.get("event_id") or ""),
+                str(event.get("job_id") or ""),
+                str(event.get("rcpt") or ""),
+                str(event.get("outcome") or ""),
+                str(event.get("time_logged") or ""),
+                str(event.get("message_id") or ""),
+                str(event.get("dsn_status") or ""),
+                str(event.get("dsn_diag") or ""),
+                str(event.get("source_file") or ""),
+                str(event.get("source_offset_or_line") or ""),
+                now_iso(),
+                event.get("raw_json"),
+            ),
+        )
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def _db_writer_thread() -> None:
+    _DB_WRITER_LOCAL.active = True
+    while True:
+        batch: list[dict[str, Any]] = []
+        if _DB_WRITE_RETRY:
+            batch.extend(_DB_WRITE_RETRY[:DB_WRITE_BATCH_SIZE])
+            del _DB_WRITE_RETRY[: len(batch)]
+        try:
+            item = _DB_WRITE_QUEUE.get(timeout=0.4)
+            batch.append(item)
+        except queue.Empty:
+            if not batch:
+                continue
+
+        while len(batch) < DB_WRITE_BATCH_SIZE:
+            try:
+                batch.append(_DB_WRITE_QUEUE.get_nowait())
+            except queue.Empty:
+                break
+
+        try:
+            with DB_LOCK:
+                conn = _db_conn()
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    for item in batch:
+                        kind = str(item.get("kind") or "")
+                        if kind == "job_snapshot":
+                            _db_upsert_job_payload(conn, dict(item.get("payload") or {}))
+                        elif kind == "job_outcome":
+                            _db_set_outcome_payload(conn, dict(item.get("payload") or {}))
+                        elif kind == "accounting_event":
+                            _db_insert_accounting_event_payload(conn, dict(item.get("payload") or {}))
+                    conn.commit()
+                finally:
+                    conn.close()
+            with _DB_WRITE_LOCK:
+                _DB_WRITER_STATUS["written"] = int(_DB_WRITER_STATUS.get("written", 0) or 0) + len(batch)
+        except Exception as e:
+            with _DB_WRITE_LOCK:
+                _DB_WRITER_STATUS["failed"] = int(_DB_WRITER_STATUS.get("failed", 0) or 0) + len(batch)
+                _DB_WRITER_STATUS["last_error"] = str(e)[:500]
+                _DB_WRITER_STATUS["last_error_ts"] = now_iso()
+            for item in batch:
+                item["attempts"] = int(item.get("attempts", 0) or 0) + 1
+                _DB_WRITE_RETRY.append(item)
+            time.sleep(0.2)
+
+
+def start_db_writer_if_needed() -> None:
+    global _DB_WRITER_STARTED
+    with _DB_WRITE_LOCK:
+        if _DB_WRITER_STARTED:
+            return
+        t = threading.Thread(target=_db_writer_thread, daemon=True, name="db-writer")
+        t.start()
+        _DB_WRITER_STARTED = True
 
 
 def db_init() -> None:
@@ -934,33 +1144,41 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
 
 def db_upsert_job(job: 'SendJob') -> None:
     """Upsert a job snapshot into SQLite."""
-    if not job or not job.id:
+    if not job or not job.id or job.deleted:
         return
-    if job.deleted:
-        return
-    snap = _job_snapshot_dict(job)
-    payload = json.dumps(snap, ensure_ascii=False)
-    if len(payload) > 900000:
-        payload = payload[:900000]
 
-    with DB_LOCK:
-        conn = _db_conn()
-        try:
-            created = job.created_at or now_iso()
-            updated = job.updated_at or now_iso()
-            _exec_upsert_compat(
-                conn,
-                "INSERT INTO jobs(id, campaign_id, created_at, updated_at, status, snapshot) VALUES(?,?,?,?,?,?) "
-                "ON CONFLICT(id) DO UPDATE SET campaign_id=excluded.campaign_id, updated_at=excluded.updated_at, status=excluded.status, snapshot=excluded.snapshot",
-                (job.id, job.campaign_id or "", created, updated, job.status or "", payload),
-                "UPDATE jobs SET campaign_id=?, updated_at=?, status=?, snapshot=? WHERE id=?",
-                (job.campaign_id or "", updated, job.status or "", payload, job.id),
-                "INSERT INTO jobs(id, campaign_id, created_at, updated_at, status, snapshot) VALUES(?,?,?,?,?,?)",
-                (job.id, job.campaign_id or "", created, updated, job.status or "", payload),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+    snap = _job_snapshot_dict(job)
+    snapshot = json.dumps(snap, ensure_ascii=False)
+    if len(snapshot) > 900000:
+        snapshot = snapshot[:900000]
+
+    payload = {
+        "id": str(job.id or ""),
+        "campaign_id": str(job.campaign_id or ""),
+        "created_at": str(job.created_at or now_iso()),
+        "updated_at": str(job.updated_at or now_iso()),
+        "status": str(job.status or ""),
+        "snapshot": snapshot,
+    }
+
+    if _db_writer_active():
+        with DB_LOCK:
+            conn = _db_conn()
+            try:
+                _db_upsert_job_payload(conn, payload)
+                conn.commit()
+            finally:
+                conn.close()
+        return
+
+    if not _db_writer_enqueue({"kind": "job_snapshot", "payload": payload}):
+        with DB_LOCK:
+            conn = _db_conn()
+            try:
+                _db_upsert_job_payload(conn, payload)
+                conn.commit()
+            finally:
+                conn.close()
 
 
 def db_delete_job(job_id: str) -> None:
@@ -1011,62 +1229,54 @@ def db_set_outcome(job_id: str, rcpt: str, status: str, message_id: str = "", ds
     st = (status or "").strip().lower()
     if not jid or not r or not st:
         return
-    with DB_LOCK:
-        conn = _db_conn()
-        try:
-            ts = now_iso()
-            _exec_upsert_compat(
-                conn,
-                "INSERT INTO job_outcomes(job_id, rcpt, status, last_message_id, last_dsn_status, last_dsn_diag, updated_at) "
-                "VALUES(?,?,?,?,?,?,?) "
-                "ON CONFLICT(job_id, rcpt) DO UPDATE SET "
-                "status=excluded.status, "
-                "last_message_id=excluded.last_message_id, "
-                "last_dsn_status=excluded.last_dsn_status, "
-                "last_dsn_diag=excluded.last_dsn_diag, "
-                "updated_at=excluded.updated_at",
-                (jid, r, st, str(message_id or ""), str(dsn_status or ""), str(dsn_diag or ""), ts),
-                "UPDATE job_outcomes SET status=?, last_message_id=?, last_dsn_status=?, last_dsn_diag=?, updated_at=? WHERE job_id=? AND rcpt=?",
-                (st, str(message_id or ""), str(dsn_status or ""), str(dsn_diag or ""), ts, jid, r),
-                "INSERT INTO job_outcomes(job_id, rcpt, status, last_message_id, last_dsn_status, last_dsn_diag, updated_at) VALUES(?,?,?,?,?,?,?)",
-                (jid, r, st, str(message_id or ""), str(dsn_status or ""), str(dsn_diag or ""), ts),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+
+    payload = {
+        "job_id": jid,
+        "rcpt": r,
+        "status": st,
+        "message_id": str(message_id or ""),
+        "dsn_status": str(dsn_status or ""),
+        "dsn_diag": str(dsn_diag or ""),
+        "updated_at": now_iso(),
+    }
+
+    if _db_writer_active():
+        with DB_LOCK:
+            conn = _db_conn()
+            try:
+                _db_set_outcome_payload(conn, payload)
+                conn.commit()
+            finally:
+                conn.close()
+        return
+
+    if not _db_writer_enqueue({"kind": "job_outcome", "payload": payload}):
+        with DB_LOCK:
+            conn = _db_conn()
+            try:
+                _db_set_outcome_payload(conn, payload)
+                conn.commit()
+            finally:
+                conn.close()
 
 
 def db_insert_accounting_event(event: dict[str, Any]) -> bool:
     eid = str((event or {}).get("event_id") or "").strip()
     if not eid:
         return False
-    with DB_LOCK:
-        conn = _db_conn()
-        try:
-            conn.execute(
-                "INSERT INTO accounting_events(event_id, job_id, rcpt, outcome, time_logged, message_id, dsn_status, dsn_diag, "
-                "source_file, source_offset_or_line, created_at, raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    eid,
-                    str(event.get("job_id") or ""),
-                    str(event.get("rcpt") or ""),
-                    str(event.get("outcome") or ""),
-                    str(event.get("time_logged") or ""),
-                    str(event.get("message_id") or ""),
-                    str(event.get("dsn_status") or ""),
-                    str(event.get("dsn_diag") or ""),
-                    str(event.get("source_file") or ""),
-                    str(event.get("source_offset_or_line") or ""),
-                    now_iso(),
-                    event.get("raw_json"),
-                ),
-            )
-            conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False
-        finally:
-            conn.close()
+
+    payload = dict(event or {})
+    if _db_writer_active():
+        with DB_LOCK:
+            conn = _db_conn()
+            try:
+                ok = _db_insert_accounting_event_payload(conn, payload)
+                conn.commit()
+                return ok
+            finally:
+                conn.close()
+
+    return _db_writer_enqueue({"kind": "accounting_event", "payload": payload})
 
 
 def db_get_app_config(key: str) -> Optional[str]:
@@ -1510,6 +1720,7 @@ def attach_browser_cookie(resp, bid: str, is_new: bool):
 
 
 db_init()
+start_db_writer_if_needed()
 # Load job history (so Jobs persist across page reloads / restarts)
 db_load_jobs_into_memory()
 
@@ -7688,6 +7899,9 @@ def _bridge_debug_update(**kwargs: Any) -> None:
 
 _PMTA_ACC_HEADERS: dict[str, list[str]] = {}
 
+_OUTCOME_CACHE_LOCK = threading.Lock()
+_OUTCOME_CACHE: dict[tuple[str, str], str] = {}
+
 # Extract job id from Message-ID we generate:
 #   <uuid.<job_id>.<campaign_id>.c<chunk>.w<worker>@local>
 _JOBID_RE_1 = re.compile(r"[.][a-f0-9]{8,64}[.]([a-f0-9]{12})[.]([a-f0-9]{8,64}|none)[.]c[0-9]+[.]w[0-9]+@local", re.IGNORECASE)
@@ -7961,19 +8175,26 @@ def _apply_outcome_to_job(job: SendJob, rcpt: str, kind: str, ev: Optional[dict]
     if not r or k not in {"delivered", "bounced", "deferred", "complained"}:
         return
 
-    prev_row = db_get_outcome(job.id, r) or {}
-    prev = str(prev_row.get("status") or "").strip().lower()
+    with _OUTCOME_CACHE_LOCK:
+        prev = str(_OUTCOME_CACHE.get((job.id, r)) or "").strip().lower()
+    if not prev:
+        prev_row = db_get_outcome(job.id, r) or {}
+        prev = str(prev_row.get("status") or "").strip().lower()
 
     message_id = _event_value(ev or {}, "msgid", "message-id", "message_id", "messageid", "header_message-id", "header_message_id")
     dsn_status = _event_value(ev or {}, "dsnStatus", "dsn_status", "enhanced-status", "enhanced_status")
     dsn_diag = _event_value(ev or {}, "dsnDiag", "dsn_diag", "diag", "diagnostic", "smtp-diagnostic", "response")
 
     if prev and not _transition_allowed(prev, k):
+        with _OUTCOME_CACHE_LOCK:
+            _OUTCOME_CACHE[(job.id, r)] = prev
         db_set_outcome(job.id, r, prev, message_id=message_id, dsn_status=dsn_status, dsn_diag=dsn_diag)
         job.accounting_last_ts = now_iso()
         return
 
     if prev == k:
+        with _OUTCOME_CACHE_LOCK:
+            _OUTCOME_CACHE[(job.id, r)] = k
         db_set_outcome(job.id, r, k, message_id=message_id, dsn_status=dsn_status, dsn_diag=dsn_diag)
         job.accounting_last_ts = now_iso()
         return
@@ -8002,6 +8223,8 @@ def _apply_outcome_to_job(job: SendJob, rcpt: str, kind: str, ev: Optional[dict]
         dec(prev)
     inc(k)
 
+    with _OUTCOME_CACHE_LOCK:
+        _OUTCOME_CACHE[(job.id, r)] = k
     db_set_outcome(job.id, r, k, message_id=message_id, dsn_status=dsn_status, dsn_diag=dsn_diag)
     _push_outcome_bucket(job, k)
     job.accounting_last_ts = now_iso()
@@ -10755,6 +10978,17 @@ def api_accounting_bridge_status():
         state["pull_url_masked"] = state["pull_url"].split("?", 1)[0]
     else:
         state["pull_url_masked"] = ""
+    with _DB_WRITE_LOCK:
+        state["db_writer"] = {
+            "queued_total": int(_DB_WRITER_STATUS.get("queued", 0) or 0),
+            "written_total": int(_DB_WRITER_STATUS.get("written", 0) or 0),
+            "failed_total": int(_DB_WRITER_STATUS.get("failed", 0) or 0),
+            "queue_full_total": int(_DB_WRITER_STATUS.get("queue_full", 0) or 0),
+            "last_error": str(_DB_WRITER_STATUS.get("last_error") or ""),
+            "last_error_ts": str(_DB_WRITER_STATUS.get("last_error_ts") or ""),
+            "queue_depth": int(_DB_WRITE_QUEUE.qsize()),
+            "retry_depth": int(len(_DB_WRITE_RETRY)),
+        }
     return jsonify({"ok": True, "bridge": state})
 
 
