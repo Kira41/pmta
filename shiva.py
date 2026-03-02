@@ -546,7 +546,12 @@ _ALLOWED_FORM_FIELDS = {
 
 
 def _db_conn() -> sqlite3.Connection:
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15.0)
+    try:
+        conn.execute("PRAGMA busy_timeout = 15000")
+    except Exception:
+        pass
+    return conn
 
 
 def db_init() -> None:
@@ -922,21 +927,30 @@ def db_set_app_config(key: str, value: str) -> bool:
     v = "" if value is None else str(value)
     if len(v) > 20000:
         v = v[:20000]
-    try:
-        with DB_LOCK:
-            conn = _db_conn()
-            try:
-                conn.execute(
-                    "INSERT INTO app_config(key, value, updated_at) VALUES(?,?,?) "
-                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-                    (k, v, now_iso()),
-                )
-                conn.commit()
-            finally:
-                conn.close()
-        return True
-    except Exception:
-        return False
+    for attempt in range(3):
+        try:
+            with DB_LOCK:
+                conn = _db_conn()
+                try:
+                    conn.execute(
+                        "INSERT INTO app_config(key, value, updated_at) VALUES(?,?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                        (k, v, now_iso()),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+            return True
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < 2:
+                time.sleep(0.15 * (attempt + 1))
+                continue
+            app.logger.exception("db_set_app_config failed for key=%s", k)
+            return False
+        except Exception:
+            app.logger.exception("db_set_app_config failed for key=%s", k)
+            return False
+    return False
 
 
 def db_delete_app_config(key: str) -> bool:
