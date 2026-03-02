@@ -7945,7 +7945,10 @@ def pmta_chunk_policy(*, smtp_host: str, chunk_domain_counts: dict[str, int]) ->
 # Single supported mode:
 # Shiva requests accounting from bridge API, and bridge only serves API responses.
 PMTA_BRIDGE_PULL_ENABLED = (os.getenv("PMTA_BRIDGE_PULL_ENABLED", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
-PMTA_BRIDGE_PULL_PORT = 8090
+try:
+    PMTA_BRIDGE_PULL_PORT = int((os.getenv("PMTA_BRIDGE_PULL_PORT", "8090") or "8090").strip())
+except Exception:
+    PMTA_BRIDGE_PULL_PORT = 8090
 PMTA_BRIDGE_PULL_PATH = "/api/v1/pull/latest?kind=acct&max_lines=2000"
 
 
@@ -8010,28 +8013,27 @@ _BRIDGE_POLLER_STARTED = False
 _BRIDGE_CURSOR_COMPAT_WARNED = False
 
 
-def _resolve_host_ip_for_bridge_pull() -> str:
+def _resolve_bridge_pull_host_from_campaign() -> str:
+    """Resolve bridge host from campaign SMTP host (latest job), not server IP."""
+    with JOBS_LOCK:
+        jobs = [j for j in JOBS.values() if not getattr(j, "deleted", False)]
+
+    if jobs:
+        jobs.sort(key=lambda x: x.created_at, reverse=True)
+        for job in jobs:
+            host = (getattr(job, "smtp_host", "") or "").strip()
+            if host:
+                return host
+
     host = (os.getenv("SHIVA_HOST", "") or "").strip()
     if host and host not in {"0.0.0.0", "::"}:
-        try:
-            return socket.gethostbyname(host)
-        except Exception:
-            return host
-
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            ip = (s.getsockname()[0] or "").strip()
-            if ip:
-                return ip
-    except Exception:
-        pass
+        return host
     return "127.0.0.1"
 
 
 def _resolve_bridge_pull_url_runtime() -> str:
-    host_ip = _resolve_host_ip_for_bridge_pull()
-    return f"http://{host_ip}:{PMTA_BRIDGE_PULL_PORT}{PMTA_BRIDGE_PULL_PATH}"
+    host = _resolve_bridge_pull_host_from_campaign()
+    return f"http://{host}:{PMTA_BRIDGE_PULL_PORT}{PMTA_BRIDGE_PULL_PATH}"
 
 
 def _bridge_debug_update(**kwargs: Any) -> None:
@@ -9961,6 +9963,8 @@ APP_CONFIG_SCHEMA: list[dict] = [
     # Accounting bridge pull mode (Shiva pull request -> bridge API response)
     {"key": "PMTA_BRIDGE_PULL_ENABLED", "type": "bool", "default": "1", "group": "Accounting", "restart_required": True,
      "desc": "Enable the only accounting flow: Shiva pulls accounting from bridge API."},
+    {"key": "PMTA_BRIDGE_PULL_PORT", "type": "int", "default": "8090", "group": "Accounting", "restart_required": False,
+     "desc": "Bridge port used by Shiva when building /api/v1/pull/latest URL from campaign SMTP host."},
     {"key": "PMTA_BRIDGE_PULL_S", "type": "float", "default": "5", "group": "Accounting", "restart_required": False,
      "desc": "Polling interval (seconds) for Shiva bridge pull thread."},
     {"key": "PMTA_BRIDGE_PULL_MAX_LINES", "type": "int", "default": "2000", "group": "Accounting", "restart_required": False,
@@ -10092,7 +10096,7 @@ def reload_runtime_config() -> dict:
         global PMTA_PRESSURE_CONTROL, PMTA_PRESSURE_POLL_S
         global PMTA_DOMAIN_STATS, PMTA_DOMAINS_POLL_S, PMTA_DOMAINS_TOP_N
         global OPENROUTER_ENDPOINT, OPENROUTER_MODEL, OPENROUTER_TIMEOUT_S
-        global PMTA_BRIDGE_PULL_ENABLED, PMTA_BRIDGE_PULL_TOKEN, PMTA_BRIDGE_PULL_S, PMTA_BRIDGE_PULL_MAX_LINES
+        global PMTA_BRIDGE_PULL_ENABLED, PMTA_BRIDGE_PULL_PORT, PMTA_BRIDGE_PULL_TOKEN, PMTA_BRIDGE_PULL_S, PMTA_BRIDGE_PULL_MAX_LINES
 
         # Spam
         SPAMCHECK_BACKEND = (cfg_get_str("SPAMCHECK_BACKEND", "spamd") or "spamd").strip().lower()
@@ -10150,6 +10154,7 @@ def reload_runtime_config() -> dict:
 
         # Bridge pull mode (Shiva -> Bridge)
         PMTA_BRIDGE_PULL_ENABLED = bool(cfg_get_bool("PMTA_BRIDGE_PULL_ENABLED", bool(PMTA_BRIDGE_PULL_ENABLED)))
+        PMTA_BRIDGE_PULL_PORT = int(cfg_get_int("PMTA_BRIDGE_PULL_PORT", int(PMTA_BRIDGE_PULL_PORT or 8090)))
         PMTA_BRIDGE_PULL_TOKEN = _normalize_bridge_pull_token(cfg_get_str("PMTA_BRIDGE_PULL_TOKEN", PMTA_BRIDGE_PULL_TOKEN))
         PMTA_BRIDGE_PULL_S = float(cfg_get_float("PMTA_BRIDGE_PULL_S", float(PMTA_BRIDGE_PULL_S or 5.0)))
         PMTA_BRIDGE_PULL_MAX_LINES = int(cfg_get_int("PMTA_BRIDGE_PULL_MAX_LINES", int(PMTA_BRIDGE_PULL_MAX_LINES or 2000)))

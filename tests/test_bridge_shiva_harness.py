@@ -93,16 +93,20 @@ class BridgeShivaHarnessTests(unittest.TestCase):
         self.assertLess(p95_ms, 50.0)
 
 
-    def test_bridge_url_resolution_uses_host_ip_and_fixed_path(self):
+    def test_bridge_url_resolution_uses_campaign_smtp_host_and_configured_port(self):
         old_host = os.environ.get("SHIVA_HOST")
+        old_port = shiva.PMTA_BRIDGE_PULL_PORT
         try:
             os.environ["SHIVA_HOST"] = "194.116.172.135"
+            shiva.PMTA_BRIDGE_PULL_PORT = 18090
+            self._prepare_job(job_id="abcabc123456").smtp_host = "smtp.campaign.local"
             resolved = shiva._resolve_bridge_pull_url_runtime()
             self.assertEqual(
                 resolved,
-                "http://194.116.172.135:8090/api/v1/pull/latest?kind=acct&max_lines=2000",
+                "http://smtp.campaign.local:18090/api/v1/pull/latest?kind=acct&max_lines=2000",
             )
         finally:
+            shiva.PMTA_BRIDGE_PULL_PORT = old_port
             if old_host is None:
                 os.environ.pop("SHIVA_HOST", None)
             else:
