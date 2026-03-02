@@ -8842,21 +8842,29 @@ def smtp_send_job(
                 blacklist_blocked = bool(bl_listed)
                 pmta_blocked = bool(pmta_reason)
                 blocked_reasons = []
+                blocked_signals: list[tuple[str, str]] = []
                 if spam_blocked:
-                    blocked_reasons.append(f"spam_score={sc:.2f}>{job.spam_threshold:.1f}")
+                    spam_detail = f"spam_score={sc:.2f}>{job.spam_threshold:.1f}"
+                    blocked_reasons.append(spam_detail)
+                    blocked_signals.append(("spam", spam_detail))
                 if blacklist_blocked:
-                    blocked_reasons.append(f"blacklist={bl_detail}")
+                    bl_text = f"blacklist={bl_detail}"
+                    blocked_reasons.append(bl_text)
+                    blocked_signals.append(("blacklist", bl_detail or "listed"))
                 if pmta_blocked:
-                    blocked_reasons.append(f"pmta={pmta_reason}")
+                    pmta_text = f"pmta={pmta_reason}"
+                    blocked_reasons.append(pmta_text)
+                    blocked_signals.append(("pmta", pmta_reason or "policy block"))
 
                 blocked = spam_blocked or blacklist_blocked or pmta_blocked
 
                 if blocked and SHIVA_DISABLE_BACKOFF:
                     with JOBS_LOCK:
-                        job.log(
-                            "WARN",
-                            f"Chunk {chunk_idx+1} [{target_domain}]: backoff bypassed (SHIVA_DISABLE_BACKOFF=1) ({' '.join(blocked_reasons)})",
-                        )
+                        for reason, details in blocked_signals:
+                            job.log(
+                                "WARN",
+                                f"Chunk {chunk_idx+1} [{target_domain}]: backoff disabled: bypassing block reason={reason} details={details}",
+                            )
                     blocked = False
 
                 with JOBS_LOCK:
@@ -9085,7 +9093,7 @@ APP_CONFIG_SCHEMA: list[dict] = [
     {"key": "PMTA_QUEUE_REQUIRED", "type": "bool", "default": "0", "group": "PMTA Backoff", "restart_required": False,
      "desc": "If true and PMTA detail endpoints are unreachable: block chunk (strict mode)."},
     {"key": "SHIVA_DISABLE_BACKOFF", "type": "bool", "default": "0", "group": "Backoff", "restart_required": False,
-     "desc": "If enabled: bypass PMTA/domain backoff checks and send chunks immediately."},
+     "desc": "If enabled: bypass all chunk backoff triggers (spam/blacklist/PMTA) and keep sending immediately."},
     {"key": "PMTA_LIVE_POLL_S", "type": "float", "default": "3", "group": "PMTA Live", "restart_required": False,
      "desc": "Polling interval for PMTA live panel (seconds)."},
     {"key": "PMTA_DOMAIN_CHECK_TOP_N", "type": "int", "default": "2", "group": "PMTA Backoff", "restart_required": False,
