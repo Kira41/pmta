@@ -590,6 +590,7 @@ def root():
         "endpoints": {
             "health": "/health",
             "files": "/api/v1/files?kind=acct",
+            "pull": "/api/v1/pull?kind=acct",
             "pull_latest": "/api/v1/pull/latest?kind=acct",
             "job_outcomes": "/api/v1/job/outcomes?job_id=<job_id>",
             "job_count": "/api/v1/job/count?job_id=<job_id>",
@@ -758,23 +759,42 @@ def get_files(
     }
 
 
-@app.get("/api/v1/pull/latest")
-def pull_latest_accounting(
+def _pull_accounting(
     request: Request,
     kind: str = "acct",
     max_lines: int = DEFAULT_PUSH_MAX_LINES,
     group_by_header: int = 1,
-    _: None = Depends(require_token),
 ):
-    """Return raw lines that contain the requested X-Job-ID across all accounting files.
+    """Pull accounting rows.
 
-    Bridge does not parse CSV/JSON rows here; it only filters text lines by job id.
+    - If X-Job-ID is provided, return only rows that belong to that job id.
+    - If missing, return latest general accounting rows (acct-*.csv only by default).
     """
     jid = _normalize_job_id(request.headers.get("x-job-id", ""))
-    if not jid:
-        raise HTTPException(status_code=400, detail="Missing required header: X-Job-ID")
+    safe_max = max(1, int(max_lines or 1))
 
-    patterns = ALLOWED_KINDS.get("acct") or ["acct-*.csv"]
+    patterns = ALLOWED_KINDS.get(kind) or ALLOWED_KINDS.get("acct") or ["acct-*.csv"]
+    # Default behavior is accounting-only, never diag/log unless explicitly requested.
+    if not kind:
+        patterns = ALLOWED_KINDS.get("acct") or ["acct-*.csv"]
+
+    if not jid:
+        latest_fp = _find_latest_file(patterns)
+        lines: List[str] = []
+        with latest_fp.open("r", encoding="utf-8", errors="replace") as f:
+            for raw_line in f:
+                line = str(raw_line or "").strip()
+                if line:
+                    lines.append(line)
+
+        return {
+            "ok": True,
+            "job_id": "",
+            "count": min(len(lines), safe_max),
+            "lines": lines[-safe_max:],
+            "source_file": latest_fp.name,
+        }
+
     files = _find_matching_files(patterns)
     rows: List[str] = []
 
@@ -784,8 +804,15 @@ def pull_latest_accounting(
                 line = str(raw_line or "").strip()
                 if not line:
                     continue
-                if jid in line.lower():
+                ev = _parse_accounting_line(line, source_file=fp.name)
+                if not ev:
+                    continue
+                if _event_job_id(ev) == jid:
                     rows.append(line)
+                if len(rows) >= safe_max:
+                    break
+        if len(rows) >= safe_max:
+            break
 
     return {
         "ok": True,
@@ -793,6 +820,29 @@ def pull_latest_accounting(
         "count": len(rows),
         "lines": rows,
     }
+
+
+@app.get("/api/v1/pull")
+def pull_accounting(
+    request: Request,
+    kind: str = "acct",
+    max_lines: int = DEFAULT_PUSH_MAX_LINES,
+    group_by_header: int = 1,
+    _: None = Depends(require_token),
+):
+    return _pull_accounting(request, kind=kind, max_lines=max_lines, group_by_header=group_by_header)
+
+
+@app.get("/api/v1/pull/latest")
+def pull_latest_accounting(
+    request: Request,
+    kind: str = "acct",
+    max_lines: int = DEFAULT_PUSH_MAX_LINES,
+    group_by_header: int = 1,
+    _: None = Depends(require_token),
+):
+    """Backward-compatible alias for /api/v1/pull."""
+    return _pull_accounting(request, kind=kind, max_lines=max_lines, group_by_header=group_by_header)
 
 
 if __name__ == "__main__":
