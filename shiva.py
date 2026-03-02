@@ -29,6 +29,22 @@ import sqlite3
 from pathlib import Path
 
 import smtplib
+
+# Flask 2.0 expects werkzeug.urls.url_quote; Werkzeug 3 removed it.
+try:  # pragma: no cover - import-time compatibility shim
+    import werkzeug.urls as _wz_urls
+    if not hasattr(_wz_urls, "url_quote"):
+        from urllib.parse import quote as _url_quote
+
+        def _compat_url_quote(value: str, safe: str = "/:", encoding: str | None = None, errors: str | None = None) -> str:
+            if isinstance(value, bytes):
+                value = value.decode(encoding or "utf-8", errors or "strict")
+            return _url_quote(value, safe=safe)
+
+        _wz_urls.url_quote = _compat_url_quote  # type: ignore[attr-defined]
+except Exception:
+    pass
+
 from flask import Flask, request, redirect, url_for, jsonify, render_template_string, abort, make_response, g
 
 # =========================
