@@ -949,16 +949,32 @@ def db_set_app_config(key: str, value: str) -> bool:
     v = "" if value is None else str(value)
     if len(v) > 20000:
         v = v[:20000]
+    upsert_sql = (
+        "INSERT INTO app_config(key, value, updated_at) VALUES(?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at"
+    )
     for attempt in range(3):
         try:
             with DB_LOCK:
                 conn = _db_conn()
                 try:
-                    conn.execute(
-                        "INSERT INTO app_config(key, value, updated_at) VALUES(?,?,?) "
-                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-                        (k, v, now_iso()),
-                    )
+                    ts = now_iso()
+                    try:
+                        conn.execute(upsert_sql, (k, v, ts))
+                    except sqlite3.OperationalError as e:
+                        # Legacy DBs might have app_config without a UNIQUE/PRIMARY KEY on `key`.
+                        # In that case ON CONFLICT(...) is rejected; fall back to update+insert.
+                        if "on conflict clause" not in str(e).lower():
+                            raise
+                        cur = conn.execute(
+                            "UPDATE app_config SET value=?, updated_at=? WHERE key=?",
+                            (v, ts, k),
+                        )
+                        if (cur.rowcount or 0) <= 0:
+                            conn.execute(
+                                "INSERT INTO app_config(key, value, updated_at) VALUES(?,?,?)",
+                                (k, v, ts),
+                            )
                     conn.commit()
                 finally:
                     conn.close()
