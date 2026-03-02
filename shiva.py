@@ -597,6 +597,37 @@ def _db_conn() -> sqlite3.Connection:
     return conn
 
 
+def _is_sqlite_upsert_unsupported(err: Exception) -> bool:
+    msg = str(err).lower()
+    return (
+        "near \"on\": syntax error" in msg
+        or "near 'on': syntax error" in msg
+        or "on conflict clause" in msg
+    )
+
+
+def _exec_upsert_compat(
+    conn: sqlite3.Connection,
+    upsert_sql: str,
+    upsert_params: tuple,
+    update_sql: str,
+    update_params: tuple,
+    insert_sql: str,
+    insert_params: tuple,
+) -> None:
+    """Execute UPSERT and transparently fall back for legacy SQLite builds/schemas."""
+    try:
+        conn.execute(upsert_sql, upsert_params)
+        return
+    except sqlite3.OperationalError as e:
+        if not _is_sqlite_upsert_unsupported(e):
+            raise
+
+    cur = conn.execute(update_sql, update_params)
+    if (cur.rowcount or 0) <= 0:
+        conn.execute(insert_sql, insert_params)
+
+
 def db_init() -> None:
     with DB_LOCK:
         conn = _db_conn()
@@ -750,10 +781,16 @@ def db_save_form(browser_id: str, data: dict) -> None:
     with DB_LOCK:
         conn = _db_conn()
         try:
-            conn.execute(
+            ts = now_iso()
+            _exec_upsert_compat(
+                conn,
                 "INSERT INTO form_state(browser_id, data, updated_at) VALUES(?, ?, ?) "
                 "ON CONFLICT(browser_id) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at",
-                (browser_id, payload, now_iso()),
+                (browser_id, payload, ts),
+                "UPDATE form_state SET data=?, updated_at=? WHERE browser_id=?",
+                (payload, ts, browser_id),
+                "INSERT INTO form_state(browser_id, data, updated_at) VALUES(?, ?, ?)",
+                (browser_id, payload, ts),
             )
             conn.commit()
         finally:
@@ -866,10 +903,17 @@ def db_upsert_job(job: 'SendJob') -> None:
     with DB_LOCK:
         conn = _db_conn()
         try:
-            conn.execute(
+            created = job.created_at or now_iso()
+            updated = job.updated_at or now_iso()
+            _exec_upsert_compat(
+                conn,
                 "INSERT INTO jobs(id, campaign_id, created_at, updated_at, status, snapshot) VALUES(?,?,?,?,?,?) "
                 "ON CONFLICT(id) DO UPDATE SET campaign_id=excluded.campaign_id, updated_at=excluded.updated_at, status=excluded.status, snapshot=excluded.snapshot",
-                (job.id, job.campaign_id or "", job.created_at or now_iso(), job.updated_at or now_iso(), job.status or "", payload),
+                (job.id, job.campaign_id or "", created, updated, job.status or "", payload),
+                "UPDATE jobs SET campaign_id=?, updated_at=?, status=?, snapshot=? WHERE id=?",
+                (job.campaign_id or "", updated, job.status or "", payload, job.id),
+                "INSERT INTO jobs(id, campaign_id, created_at, updated_at, status, snapshot) VALUES(?,?,?,?,?,?)",
+                (job.id, job.campaign_id or "", created, updated, job.status or "", payload),
             )
             conn.commit()
         finally:
@@ -919,10 +963,16 @@ def db_set_outcome(job_id: str, rcpt: str, status: str) -> None:
     with DB_LOCK:
         conn = _db_conn()
         try:
-            conn.execute(
+            ts = now_iso()
+            _exec_upsert_compat(
+                conn,
                 "INSERT INTO job_outcomes(job_id, rcpt, status, updated_at) VALUES(?,?,?,?) "
                 "ON CONFLICT(job_id, rcpt) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at",
-                (jid, r, st, now_iso()),
+                (jid, r, st, ts),
+                "UPDATE job_outcomes SET status=?, updated_at=? WHERE job_id=? AND rcpt=?",
+                (st, ts, jid, r),
+                "INSERT INTO job_outcomes(job_id, rcpt, status, updated_at) VALUES(?,?,?,?)",
+                (jid, r, st, ts),
             )
             conn.commit()
         finally:
@@ -972,39 +1022,22 @@ def db_set_app_config(key: str, value: str) -> bool:
     v = "" if value is None else str(value)
     if len(v) > 20000:
         v = v[:20000]
-    upsert_sql = (
-        "INSERT INTO app_config(key, value, updated_at) VALUES(?,?,?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at"
-    )
+    upsert_sql = "INSERT INTO app_config(key, value, updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at"
     for attempt in range(3):
         try:
             with DB_LOCK:
                 conn = _db_conn()
                 try:
                     ts = now_iso()
-                    try:
-                        conn.execute(upsert_sql, (k, v, ts))
-                    except sqlite3.OperationalError as e:
-                        # Legacy SQLite builds can reject UPSERT syntax entirely (`near "ON": syntax error`),
-                        # and legacy DB schemas might have app_config without a UNIQUE/PRIMARY KEY on `key`
-                        # (`ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint`).
-                        # Fall back to update+insert for both cases.
-                        err = str(e).lower()
-                        if (
-                            "on conflict clause" not in err
-                            and "near \"on\": syntax error" not in err
-                            and "near 'on': syntax error" not in err
-                        ):
-                            raise
-                        cur = conn.execute(
-                            "UPDATE app_config SET value=?, updated_at=? WHERE key=?",
-                            (v, ts, k),
-                        )
-                        if (cur.rowcount or 0) <= 0:
-                            conn.execute(
-                                "INSERT INTO app_config(key, value, updated_at) VALUES(?,?,?)",
-                                (k, v, ts),
-                            )
+                    _exec_upsert_compat(
+                        conn,
+                        upsert_sql,
+                        (k, v, ts),
+                        "UPDATE app_config SET value=?, updated_at=? WHERE key=?",
+                        (v, ts, k),
+                        "INSERT INTO app_config(key, value, updated_at) VALUES(?,?,?)",
+                        (k, v, ts),
+                    )
                     conn.commit()
                 finally:
                     conn.close()
@@ -1319,9 +1352,14 @@ def db_save_campaign_form(browser_id: str, campaign_id: str, data: dict) -> bool
     with DB_LOCK:
         conn = _db_conn()
         try:
-            conn.execute(
+            _exec_upsert_compat(
+                conn,
                 "INSERT INTO campaign_form(campaign_id, data, updated_at) VALUES(?,?,?) "
                 "ON CONFLICT(campaign_id) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at",
+                (campaign_id, payload, ts),
+                "UPDATE campaign_form SET data=?, updated_at=? WHERE campaign_id=?",
+                (payload, ts, campaign_id),
+                "INSERT INTO campaign_form(campaign_id, data, updated_at) VALUES(?,?,?)",
                 (campaign_id, payload, ts),
             )
             conn.execute(
@@ -5960,9 +5998,14 @@ def db_mark_job_recipient(job_id: str, campaign_id: str, rcpt: str) -> None:
     with DB_LOCK:
         conn = _db_conn()
         try:
-            conn.execute(
+            _exec_upsert_compat(
+                conn,
                 "INSERT INTO job_recipients(job_id, campaign_id, rcpt, first_seen_at, last_seen_at) VALUES(?,?,?,?,?) "
                 "ON CONFLICT(job_id, rcpt) DO UPDATE SET campaign_id=excluded.campaign_id, last_seen_at=excluded.last_seen_at",
+                (jid, cid, em, ts, ts),
+                "UPDATE job_recipients SET campaign_id=?, last_seen_at=? WHERE job_id=? AND rcpt=?",
+                (cid, ts, jid, em),
+                "INSERT INTO job_recipients(job_id, campaign_id, rcpt, first_seen_at, last_seen_at) VALUES(?,?,?,?,?)",
                 (jid, cid, em, ts, ts),
             )
             conn.commit()
