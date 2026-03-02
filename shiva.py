@@ -1240,24 +1240,15 @@ def db_set_outcome(job_id: str, rcpt: str, status: str, message_id: str = "", ds
         "updated_at": now_iso(),
     }
 
-    if _db_writer_active():
-        with DB_LOCK:
-            conn = _db_conn()
-            try:
-                _db_set_outcome_payload(conn, payload)
-                conn.commit()
-            finally:
-                conn.close()
-        return
-
-    if not _db_writer_enqueue({"kind": "job_outcome", "payload": payload}):
-        with DB_LOCK:
-            conn = _db_conn()
-            try:
-                _db_set_outcome_payload(conn, payload)
-                conn.commit()
-            finally:
-                conn.close()
+    # Keep outcome writes synchronous so job counters remain immediately consistent
+    # with /api/job reads (source of truth is SQLite).
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            _db_set_outcome_payload(conn, payload)
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def db_get_job_outcome_counts(job_id: str) -> dict[str, int]:
@@ -1309,17 +1300,16 @@ def db_insert_accounting_event(event: dict[str, Any]) -> bool:
         return False
 
     payload = dict(event or {})
-    if _db_writer_active():
-        with DB_LOCK:
-            conn = _db_conn()
-            try:
-                ok = _db_insert_accounting_event_payload(conn, payload)
-                conn.commit()
-                return ok
-            finally:
-                conn.close()
-
-    return _db_writer_enqueue({"kind": "accounting_event", "payload": payload})
+    # Insert synchronously to guarantee deduplication decisions are made against
+    # the current DB state before we update in-memory job counters.
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            ok = _db_insert_accounting_event_payload(conn, payload)
+            conn.commit()
+            return ok
+        finally:
+            conn.close()
 
 
 def db_get_app_config(key: str) -> Optional[str]:
