@@ -7992,6 +7992,33 @@ _BRIDGE_POLLER_STARTED = False
 _BRIDGE_CURSOR_COMPAT_WARNED = False
 
 
+def _resolve_bridge_pull_url_runtime() -> str:
+    """Resolve bridge pull URL from runtime config/env aliases and normalize wrapper quotes."""
+    candidates = [
+        PMTA_BRIDGE_PULL_URL,
+        os.getenv("PMTA_BRIDGE_PULL_URL", ""),
+        os.getenv("PMTA_ACCOUNTING_BRIDGE_PULL_URL", ""),
+        os.getenv("PMTA_BRIDGE_URL", ""),
+    ]
+
+    # When app config helpers are available, prefer them as they include DB/UI overrides.
+    try:
+        candidates.insert(0, cfg_get_first_str(["PMTA_BRIDGE_PULL_URL", "PMTA_ACCOUNTING_BRIDGE_PULL_URL", "PMTA_BRIDGE_URL"], PMTA_BRIDGE_PULL_URL))
+    except Exception:
+        pass
+
+    for raw in candidates:
+        url = (raw or "").strip()
+        if not url:
+            continue
+        # Defensive: support values accidentally saved with shell/JSON wrapper quotes.
+        if len(url) >= 2 and ((url[0] == '"' and url[-1] == '"') or (url[0] == "'" and url[-1] == "'")):
+            url = url[1:-1].strip()
+        if url:
+            return url
+    return ""
+
+
 def _bridge_debug_update(**kwargs: Any) -> None:
     with _BRIDGE_DEBUG_LOCK:
         _BRIDGE_DEBUG_STATE.update(kwargs)
@@ -8569,7 +8596,9 @@ def _poll_accounting_bridge_once() -> dict:
     t0 = time.time()
     poll_ts = now_iso()
     _bridge_debug_update(last_poll_time=poll_ts)
-    raw_url = (PMTA_BRIDGE_PULL_URL or "").strip()
+    raw_url = _resolve_bridge_pull_url_runtime()
+    if raw_url and raw_url != (PMTA_BRIDGE_PULL_URL or "").strip():
+        globals()["PMTA_BRIDGE_PULL_URL"] = raw_url
     if not raw_url:
         _bridge_debug_update(
             last_attempt_ts=now_iso(),
@@ -11110,7 +11139,8 @@ def api_accounting_bridge_status():
     state["pull_enabled"] = bool(PMTA_BRIDGE_PULL_ENABLED)
     state["pull_interval_s"] = float(PMTA_BRIDGE_PULL_S or 0)
     state["pull_max_lines"] = int(PMTA_BRIDGE_PULL_MAX_LINES or 0)
-    state["pull_url"] = (PMTA_BRIDGE_PULL_URL or "").strip()
+    runtime_url = _resolve_bridge_pull_url_runtime()
+    state["pull_url"] = runtime_url
     state["pull_url_configured"] = bool(state["pull_url"])
     if state["pull_url"]:
         state["pull_url_masked"] = state["pull_url"].split("?", 1)[0]
@@ -11133,7 +11163,7 @@ def api_accounting_bridge_status():
 @app.post("/api/accounting/bridge/pull")
 def api_accounting_bridge_pull_once():
     """Manual pull from bridge endpoint (same processing path as periodic poller)."""
-    if not PMTA_BRIDGE_PULL_URL:
+    if not _resolve_bridge_pull_url_runtime():
         return jsonify({"ok": False, "error": "bridge pull URL is not configured"}), 400
     return jsonify(_poll_accounting_bridge_once())
 
