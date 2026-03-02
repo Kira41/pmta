@@ -829,6 +829,18 @@ def _read_from_cursor(files: List[Dict[str, Any]], cursor_payload: Optional[Dict
             continue
 
         with fp.open("r", encoding="utf-8", errors="replace") as fh:
+            # Cursor pulls can resume mid-file (after the CSV header row was already consumed
+            # in a previous request). Prime header state from line 1 so subsequent rows keep
+            # structured keys (header_x-job-id, header_message-id, ...).
+            source_name = str(f.get("name") or fp.name)
+            if current_off and source_name.lower().endswith(".csv"):
+                with _CSV_HEADER_STATE_LOCK:
+                    have_header = bool(_CSV_HEADER_STATE.get(source_name))
+                if not have_header:
+                    first_line = fh.readline()
+                    if first_line:
+                        _parse_accounting_line(first_line.strip(), source_file=source_name, line_no_or_offset=1)
+                    fh.seek(current_off)
             if current_off:
                 fh.seek(current_off)
             while len(items) < limit:
@@ -854,7 +866,10 @@ def _read_from_cursor(files: List[Dict[str, Any]], cursor_payload: Optional[Dict
         if len(items) >= limit:
             break
         idx += 1
-        current_off = 0
+        if idx >= len(files):
+            current_off = int(f["size"])
+        else:
+            current_off = 0
 
     if not files:
         raise HTTPException(status_code=404, detail="No accounting/log files matched")
