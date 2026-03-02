@@ -4,6 +4,7 @@ import fnmatch
 import json
 import csv
 import re
+import base64
 import threading
 from pathlib import Path
 from datetime import datetime, timezone
@@ -23,6 +24,10 @@ API_TOKEN = "mxft0zDIEHkdoTHF94jhxtKe1hdXSjVW5hHskfmuFXEdwzHtt9foI7ZZCz303Jyx"
 ALLOW_NO_AUTH = os.getenv("ALLOW_NO_AUTH", "0") == "1"
 DEBUG_ALLOW_QUERY_TOKEN = os.getenv("DEBUG_ALLOW_QUERY_TOKEN", "0") == "1"
 DEFAULT_PUSH_MAX_LINES = int(os.getenv("DEFAULT_PUSH_MAX_LINES", "5000"))
+DEFAULT_PULL_LIMIT = int(os.getenv("DEFAULT_PULL_LIMIT", "500"))
+MAX_PULL_LIMIT = int(os.getenv("MAX_PULL_LIMIT", "2000"))
+RECENT_PULL_MAX_FILES = int(os.getenv("RECENT_PULL_MAX_FILES", "32"))
+RECENT_PULL_MAX_AGE_HOURS = int(os.getenv("RECENT_PULL_MAX_AGE_HOURS", "48"))
 
 # CORS (for browser access)
 # Examples:
@@ -701,6 +706,179 @@ def _request_filters(request: Request) -> Dict[str, str]:
     }
 
 
+def _encode_cursor(payload: Dict[str, Any]) -> str:
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_cursor(cursor: str) -> Dict[str, Any]:
+    try:
+        data = base64.urlsafe_b64decode(str(cursor or "").encode("ascii"))
+        decoded = json.loads(data.decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail={"error": "invalid_cursor", "message": str(exc)})
+
+    if not isinstance(decoded, dict):
+        raise HTTPException(status_code=400, detail={"error": "invalid_cursor", "message": "Cursor must decode to object"})
+    return decoded
+
+
+def _recent_matching_files(patterns: List[str]) -> List[Dict[str, Any]]:
+    now = datetime.now(timezone.utc).timestamp()
+    min_mtime = now - max(1, RECENT_PULL_MAX_AGE_HOURS) * 3600
+    files: List[Dict[str, Any]] = []
+    for p in PMTA_LOG_DIR.iterdir():
+        if not p.is_file() or p.is_symlink() or not _file_matches(p.name, patterns):
+            continue
+        try:
+            st = p.stat()
+        except FileNotFoundError:
+            continue
+        if st.st_mtime < min_mtime:
+            continue
+        files.append(
+            {
+                "path": str(p.resolve()),
+                "name": p.name,
+                "inode": int(st.st_ino),
+                "size": int(st.st_size),
+                "mtime": float(st.st_mtime),
+            }
+        )
+
+    if not files:
+        raise HTTPException(status_code=404, detail="No accounting/log files matched")
+
+    files.sort(key=lambda x: (x["mtime"], x["name"]))
+    return files[-max(1, RECENT_PULL_MAX_FILES):]
+
+
+def _read_from_cursor(files: List[Dict[str, Any]], cursor_payload: Optional[Dict[str, Any]], limit: int) -> Dict[str, Any]:
+    items: List[Dict[str, Any]] = []
+    parsed = 0
+    skipped = 0
+    unknown_outcome = 0
+
+    start_idx = 0
+    start_off = 0
+    if cursor_payload:
+        cursor_path = str(cursor_payload.get("path") or "")
+        cursor_inode = int(cursor_payload.get("inode") or 0)
+        cursor_offset = max(0, int(cursor_payload.get("offset") or 0))
+        cursor_mtime = float(cursor_payload.get("mtime") or 0)
+
+        match_idx = None
+        for idx, f in enumerate(files):
+            if int(f["inode"]) == cursor_inode and str(f["path"]) == cursor_path:
+                match_idx = idx
+                break
+
+        if match_idx is not None:
+            current = files[match_idx]
+            start_idx = match_idx
+            start_off = cursor_offset if int(current["size"]) >= cursor_offset else 0
+        else:
+            start_idx = len(files)
+            for idx, f in enumerate(files):
+                if (float(f["mtime"]), str(f["name"])) > (cursor_mtime, Path(cursor_path).name):
+                    start_idx = idx
+                    break
+            start_off = 0
+
+    if start_idx >= len(files):
+        tail = files[-1]
+        return {
+            "items": [],
+            "next_cursor": _encode_cursor(
+                {
+                    "v": 1,
+                    "path": tail["path"],
+                    "inode": int(tail["inode"]),
+                    "offset": int(tail["size"]),
+                    "mtime": float(tail["mtime"]),
+                }
+            ),
+            "has_more": False,
+            "stats": {"parsed": 0, "skipped": 0, "unknown_outcome": 0},
+        }
+
+    idx = start_idx
+    current_off = start_off
+    consumed_up_to_idx = idx
+
+    while 0 <= idx < len(files) and len(items) < limit:
+        f = files[idx]
+        fp = Path(f["path"])
+        if not fp.exists():
+            idx += 1
+            current_off = 0
+            continue
+
+        with fp.open("r", encoding="utf-8", errors="replace") as fh:
+            if current_off:
+                fh.seek(current_off)
+            while len(items) < limit:
+                line = fh.readline()
+                if not line:
+                    break
+                current_off = fh.tell()
+                s = str(line or "").strip()
+                if not s:
+                    skipped += 1
+                    continue
+                ev = _parse_accounting_line(s, source_file=f["name"], line_no_or_offset=current_off)
+                if not ev:
+                    skipped += 1
+                    continue
+                structured = _structured_event(ev)
+                if structured.get("outcome") == "unknown":
+                    unknown_outcome += 1
+                items.append(structured)
+                parsed += 1
+
+        consumed_up_to_idx = idx
+        if len(items) >= limit:
+            break
+        idx += 1
+        current_off = 0
+
+    if not files:
+        raise HTTPException(status_code=404, detail="No accounting/log files matched")
+
+    if consumed_up_to_idx >= len(files):
+        consumed_up_to_idx = len(files) - 1
+        current_off = int(files[-1]["size"])
+
+    cursor_file = files[consumed_up_to_idx]
+    next_cursor = _encode_cursor(
+        {
+            "v": 1,
+            "path": cursor_file["path"],
+            "inode": int(cursor_file["inode"]),
+            "offset": int(current_off),
+            "mtime": float(cursor_file["mtime"]),
+        }
+    )
+
+    has_more = False
+    if consumed_up_to_idx < len(files):
+        if int(files[consumed_up_to_idx]["size"]) > int(current_off):
+            has_more = True
+        elif consumed_up_to_idx + 1 < len(files):
+            has_more = True
+
+    return {
+        "items": items,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "stats": {
+            "parsed": parsed,
+            "skipped": skipped,
+            "unknown_outcome": unknown_outcome,
+        },
+    }
+
+
 @app.get("/health")
 def health():
     return {
@@ -948,12 +1126,36 @@ def _pull_accounting(
 @app.get("/api/v1/pull")
 def pull_accounting(
     request: Request,
-    kind: str = "acct",
+    kinds: str = "acct",
+    cursor: str = "",
+    limit: int = DEFAULT_PULL_LIMIT,
+    kind: str = "",
     max_lines: int = DEFAULT_PUSH_MAX_LINES,
     group_by_header: int = 1,
     _: None = Depends(require_token),
 ):
-    return _pull_accounting(request, kind=kind, max_lines=max_lines, group_by_header=group_by_header)
+    del request, max_lines, group_by_header
+    requested_kinds = [x.strip() for x in (kinds or "").split(",") if x.strip()]
+    if not requested_kinds:
+        requested_kinds = [kind.strip() or "acct"]
+
+    patterns: List[str] = []
+    for k in requested_kinds:
+        p = ALLOWED_KINDS.get(k)
+        if not p:
+            raise HTTPException(status_code=400, detail=f"Invalid kind: {k}. Use one of: {list(ALLOWED_KINDS.keys())}")
+        patterns.extend(p)
+
+    safe_limit = max(1, min(MAX_PULL_LIMIT, int(limit or DEFAULT_PULL_LIMIT)))
+    files = _recent_matching_files(patterns)
+    payload = _decode_cursor(cursor) if cursor else None
+    result = _read_from_cursor(files, payload, safe_limit)
+    return {
+        "ok": True,
+        "kinds": requested_kinds,
+        "count": len(result["items"]),
+        **result,
+    }
 
 
 @app.get("/api/v1/pull/latest")
