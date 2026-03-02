@@ -36,7 +36,7 @@ try:  # pragma: no cover - import-time compatibility shim
     if not hasattr(_wz_urls, "url_quote"):
         from urllib.parse import quote as _url_quote
 
-        def _compat_url_quote(value: str, safe: str = "/:", encoding: str | None = None, errors: str | None = None) -> str:
+        def _compat_url_quote(value: str, safe: str = "/:", encoding: Optional[str] = None, errors: Optional[str] = None) -> str:
             if isinstance(value, bytes):
                 value = value.decode(encoding or "utf-8", errors or "strict")
             return _url_quote(value, safe=safe)
