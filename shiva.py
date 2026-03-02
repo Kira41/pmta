@@ -949,16 +949,58 @@ def db_set_app_config(key: str, value: str) -> bool:
     v = "" if value is None else str(value)
     if len(v) > 20000:
         v = v[:20000]
+
     for attempt in range(3):
         try:
             with DB_LOCK:
                 conn = _db_conn()
                 try:
-                    conn.execute(
-                        "INSERT INTO app_config(key, value, updated_at) VALUES(?,?,?) "
-                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-                        (k, v, now_iso()),
+                    ts = now_iso()
+
+                    # Legacy DB compatibility: older app_config tables may miss
+                    # updated_at and/or key uniqueness constraints.
+                    cols = {
+                        str(r[1] or "").strip().lower()
+                        for r in (conn.execute("PRAGMA table_info(app_config)").fetchall() or [])
+                    }
+                    if not cols:
+                        conn.execute(
+                            "CREATE TABLE IF NOT EXISTS app_config("
+                            "key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)"
+                        )
+                        cols = {"key", "value", "updated_at"}
+                    else:
+                        if "updated_at" not in cols:
+                            conn.execute("ALTER TABLE app_config ADD COLUMN updated_at TEXT")
+                            cols.add("updated_at")
+                        if "value" not in cols:
+                            conn.execute("ALTER TABLE app_config ADD COLUMN value TEXT")
+                            cols.add("value")
+
+                    if "key" not in cols or "value" not in cols:
+                        raise sqlite3.OperationalError("app_config schema missing required columns")
+
+                    update_sql = (
+                        "UPDATE app_config SET value=?, updated_at=? WHERE key=?"
+                        if "updated_at" in cols
+                        else "UPDATE app_config SET value=? WHERE key=?"
                     )
+                    update_args = (v, ts, k) if "updated_at" in cols else (v, k)
+                    cur = conn.execute(update_sql, update_args)
+
+                    if (cur.rowcount or 0) <= 0:
+                        insert_sql = (
+                            "INSERT INTO app_config(key, value, updated_at) VALUES(?,?,?)"
+                            if "updated_at" in cols
+                            else "INSERT INTO app_config(key, value) VALUES(?,?)"
+                        )
+                        insert_args = (k, v, ts) if "updated_at" in cols else (k, v)
+                        try:
+                            conn.execute(insert_sql, insert_args)
+                        except sqlite3.IntegrityError:
+                            # Row appeared between UPDATE and INSERT; retry as UPDATE.
+                            conn.execute(update_sql, update_args)
+
                     conn.commit()
                 finally:
                     conn.close()
