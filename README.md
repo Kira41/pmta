@@ -19,8 +19,8 @@ This project now uses a simplified accounting ingestion flow.
 
 ### Bridge (`pmta_accounting_bridge.py`)
 
-- `GET /api/v1/pull?kinds=acct&limit=<n>&cursor=<token>` (token protected)
-- `GET /api/v1/status` (token protected):
+- `GET /api/v1/pull?kinds=acct&limit=<n>&cursor=<token>` (no auth token required)
+- `GET /api/v1/status` (no auth token required):
   - `last_processed_file`, `last_cursor`, `parsed`, `skipped`, `unknown_outcome`, `last_error`, `server_time`
 
 ### Shiva (`shiva.py`)

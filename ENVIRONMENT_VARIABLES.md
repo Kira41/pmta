@@ -47,18 +47,6 @@
 - **أفضل ممارسة:**
   - استخدم مسارًا ثابتًا ومقروءًا من user تشغيل الخدمة، وتأكد من rotation policy.
 
-### `ALLOW_NO_AUTH`
-- **الافتراضي:** `0`
-- **النوع:** `bool` (فعليًا في الكود: `== "1"` فقط)
-- **الخلفية البرمجية:** يفعّل/يعطل اشتراط Bearer token على API.
-- **السلوك الدقيق:**
-  - `1` → إلغاء التحقق الأمني (API مفتوح).
-  - أي قيمة أخرى → التوكن مطلوب.
-- **إذا غيّرته:**
-  - `0 -> 1`: مناسب فقط في dev/local debugging.
-  - `1 -> 0`: يجب التأكد أن المستهلك (Shiva) يرسل `PMTA_BRIDGE_PULL_TOKEN`.
-- **تحذير أمني:** لا تستخدم `1` في الإنتاج نهائيًا.
-
 ### `DEFAULT_PUSH_MAX_LINES`
 - **الافتراضي:** `5000`
 - **النوع:** `int`
@@ -429,12 +417,6 @@
 - **الخلفية:** بورت Bridge الذي يستخدمه Shiva لبناء endpoint السحب.
 - **مهم:** Shiva يبني الـ host من `SMTP Host` داخل الحملة (campaign)، وليس من IP السيرفر.
 
-### `PMTA_BRIDGE_PULL_TOKEN`
-- **الافتراضي:** فارغ
-- **الخلفية:** Bearer token في طلبات السحب عند تفعيل auth بالـ bridge.
-- **حالة شائعة:**
-  - `ALLOW_NO_AUTH=0` وtoken فارغ → طلبات السحب سترفض (401/403).
-
 ### `PMTA_BRIDGE_PULL_S`
 - **الافتراضي:** `5`
 - **الخلفية:** polling interval بالثواني.
@@ -508,7 +490,6 @@
 ```env
 # --- Bridge ---
 PMTA_LOG_DIR=/var/log/pmta
-ALLOW_NO_AUTH=0
 DEFAULT_PUSH_MAX_LINES=5000
 CORS_ORIGINS=https://panel.example.com
 BIND_ADDR=0.0.0.0
@@ -600,7 +581,6 @@ PMTA_PRESSURE_L3_SLEEP_MIN=4.0
 # --- Accounting pull in Shiva ---
 PMTA_BRIDGE_PULL_ENABLED=1
 PMTA_BRIDGE_PULL_PORT=8090
-PMTA_BRIDGE_PULL_TOKEN=
 PMTA_BRIDGE_PULL_S=5
 PMTA_BRIDGE_PULL_MAX_LINES=2000
 
@@ -636,11 +616,8 @@ OPENROUTER_TIMEOUT_S=40
   - **ماذا يعطي:** مصدر البيانات الأساسي للسحب.
   - **سيناريو الاستخدام:** تغييره عند وضع Logs في مسار غير قياسي مثل `/opt/pmta/logs`.
 
-- `ALLOW_NO_AUTH`
   - **الدالة المستخدمة:** `require_token`.
-  - **وظيفته داخل الدالة:** إذا كانت قيمته `1` تتجاوز الدالة التحقق من التوكن؛ وإذا `0` تُلزم الطلبات بالمصادقة.
-  - **ماذا يعطي:** نمط أمني `Strict` أو `Bypass`.
-  - **سيناريو الاستخدام:** Debug محلي مؤقت فقط.
+  - **وظيفته داخل الدالة:** لم يعد مستخدمًا بعد إزالة المصادقة بالتوكن من Bridge API.
 
 - `DEFAULT_PUSH_MAX_LINES`
   - **الدالة المستخدمة:** `pull_latest_accounting` (قيمة افتراضية للوسيط `max_lines`).
@@ -838,10 +815,8 @@ OPENROUTER_TIMEOUT_S=40
   - **وظيفته:** endpoint الذي تسحب منه Shiva أحداث accounting.
   - **سيناريو الاستخدام:** تغيير IP/Port bridge أو المسار.
 
-- `PMTA_BRIDGE_PULL_TOKEN`
   - **الدالة المستخدمة:** `_poll_accounting_bridge_once`.
-  - **وظيفته:** إضافة `Authorization: Bearer` عند السحب.
-  - **سيناريو الاستخدام:** عندما bridge يعمل بمصادقة إلزامية.
+  - **وظيفته:** لم يعد مستخدمًا بعد اعتماد السحب عبر URL فقط بدون توكن.
 
 - `PMTA_BRIDGE_PULL_S`
   - **الدوال المستخدمة:** `_accounting_bridge_poller_thread`, `api_accounting_bridge_status`.
@@ -887,7 +862,6 @@ OPENROUTER_TIMEOUT_S=40
 
 ### Bridge endpoint visibility
 
-- `GET /api/v1/status` (token protected)
   - `last_processed_file`
   - `last_cursor`
   - `parsed`

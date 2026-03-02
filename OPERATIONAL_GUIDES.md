@@ -18,7 +18,7 @@
 ### Bridge API endpoint
 
 - `GET /api/v1/pull/latest?kind=acct&max_lines=<N>`
-- المصادقة: `Authorization: Bearer <API_TOKEN>` (أو `?token=` كخيار بديل)
+- المصادقة: غير مطلوبة (Bridge API يعمل الآن بدون توكن).
 
 ### مثال استجابة
 
@@ -40,7 +40,6 @@
 ```bash
 export PMTA_BRIDGE_PULL_ENABLED=1
 export PMTA_BRIDGE_PULL_URL="http://194.116.172.135:8090/api/v1/pull/latest?kind=acct"
-export PMTA_BRIDGE_PULL_TOKEN="<API_TOKEN>"
 export PMTA_BRIDGE_PULL_S=5
 export PMTA_BRIDGE_PULL_MAX_LINES=2000
 ```
@@ -48,7 +47,6 @@ export PMTA_BRIDGE_PULL_MAX_LINES=2000
 ### إعدادات Bridge
 
 ```bash
-export API_TOKEN="<API_TOKEN>"
 export PMTA_LOG_DIR="/var/log/pmta"
 python3 pmta_accounting_bridge.py
 ```
@@ -57,7 +55,7 @@ python3 pmta_accounting_bridge.py
 
 ```bash
 # 1) اختبار endpoint على bridge
-curl -i -H "Authorization: Bearer <API_TOKEN>" \
+curl -i \
   "http://194.116.172.135:8090/api/v1/pull/latest?kind=acct&max_lines=5"
 
 # 2) حالة إعدادات bridge داخل Shiva
@@ -154,9 +152,9 @@ curl -s -X POST "http://127.0.0.1:5000/api/accounting/bridge/pull"
    - راجع: `PMTA_LOG_DIR`, `PMTA_BRIDGE_PULL_URL`, `PMTA_BRIDGE_PULL_MAX_LINES`.
    - الدوال المؤثرة: `list_dir_files`, `_find_latest_file`, `_poll_accounting_bridge_once`.
 
-2. **401/403 بين Shiva وBridge**
-   - راجع: `ALLOW_NO_AUTH`, `PMTA_BRIDGE_PULL_TOKEN`.
-   - الدوال المؤثرة: `require_token`, `_poll_accounting_bridge_once`.
+2. **فشل الاتصال بين Shiva وBridge**
+   - راجع: `PMTA_BRIDGE_PULL_PORT`, `PMTA_BRIDGE_PULL_ENABLED`, ومسار/بورت الـ bridge.
+   - الدوال المؤثرة: `_poll_accounting_bridge_once`.
 
 3. **تباطؤ شديد مع ضغط على PMTA**
    - راجع: `PMTA_PRESSURE_*`, `PMTA_QUEUE_BACKOFF`, `PMTA_DOMAIN_*`.
@@ -281,7 +279,7 @@ curl -s "http://127.0.0.1:5000/api/config/runtime" | jq '.PMTA_MONITOR_BASE_URL,
 
 1. **تأكد من أن endpoint صحيح ويُرجع بيانات فعلية**
    ```bash
-   curl -s -H "Authorization: Bearer <TOKEN>" \
+   curl -s \
      "http://194.116.172.135:8090/api/v1/pull/latest?kind=acct&max_lines=5"
    ```
    يجب أن ترى `ok=true` و`count>0` و`lines` غير فارغة.
@@ -290,10 +288,8 @@ curl -s "http://127.0.0.1:5000/api/config/runtime" | jq '.PMTA_MONITOR_BASE_URL,
    - المتغير الحاسم: `PMTA_BRIDGE_PULL_URL`
    - خطأ شائع: بورت مختلف، أو حذف `kind=acct`، أو endpoint آخر غير `pull/latest`.
 
-3. **تأكد من التوكن على الطرفين**
-   - Bridge: `API_TOKEN`
-   - Shiva: `PMTA_BRIDGE_PULL_TOKEN`
-   - لو Bridge يتطلب توكن وShiva يرسل قيمة خاطئة/فارغة ستحصل على سحب صفري فعليًا (أو 401/403 في logs).
+3. **لا حاجة لأي توكن بين Shiva وBridge**
+   - السحب يتم مباشرة عبر URL فقط.
 
 4. **تأكد أن Polling مفعّل فعلًا في Shiva**
    - `PMTA_BRIDGE_PULL_ENABLED=1`
@@ -327,7 +323,7 @@ curl -s "http://127.0.0.1:5000/api/config/runtime" | jq '.PMTA_MONITOR_BASE_URL,
 
 عند اجتماع: `in/out` موجود + accounting يحتوي delivery + كل عدادات Shiva صفر، فأقوى احتمالين:
 
-1. **Shiva لا يسحب أصلًا** (URL/token/polling/PMTA_LOG_DIR).
+1. **Shiva لا يسحب أصلًا** (URL/polling/PMTA_LOG_DIR).
 2. **Shiva يسحب لكن لا يربط الأحداث بجوب** (`job_not_found` مرتفع ⇒ `accepted=0`).
 
 ابدأ دائمًا بـ `/api/accounting/bridge/status` لأنه يعطيك الحكم الفوري: هل المشكلة `events_received=0` (سحب) أم `job_not_found>0` (ربط).
