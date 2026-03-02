@@ -5519,6 +5519,11 @@ def compute_spam_score(*, subject: str, body: str, body_format: str, from_email:
 
 _RBL_ZONES_RAW = (os.getenv("RBL_ZONES") or "zen.spamhaus.org,bl.spamcop.net,cbl.abuseat.org").strip()
 _DBL_ZONES_RAW = (os.getenv("DBL_ZONES") or "dbl.spamhaus.org").strip()
+_SHIVA_DISABLE_BLACKLIST_RAW = os.getenv("SHIVA_DISABLE_BLACKLIST")
+if _SHIVA_DISABLE_BLACKLIST_RAW is None:
+    _SHIVA_DISABLE_BLACKLIST_RAW = os.getenv("DISABLE_BLACKLIST")
+SHIVA_DISABLE_BLACKLIST = (_SHIVA_DISABLE_BLACKLIST_RAW or "0").strip().lower() in {"1", "true", "yes", "on"}
+_BLACKLIST_DISABLE_LOGGED = False
 
 
 def _parse_zones(raw: str) -> list[str]:
@@ -5534,6 +5539,17 @@ def _parse_zones(raw: str) -> list[str]:
 
 RBL_ZONES_LIST = _parse_zones(_RBL_ZONES_RAW)
 DBL_ZONES_LIST = _parse_zones(_DBL_ZONES_RAW)
+
+
+def _log_blacklist_disabled_once() -> None:
+    global _BLACKLIST_DISABLE_LOGGED
+    if SHIVA_DISABLE_BLACKLIST and not _BLACKLIST_DISABLE_LOGGED:
+        _BLACKLIST_DISABLE_LOGGED = True
+        logging.getLogger("shiva").warning("Blacklist checks are disabled via SHIVA_DISABLE_BLACKLIST=1")
+
+
+if SHIVA_DISABLE_BLACKLIST:
+    _log_blacklist_disabled_once()
 
 
 def _is_ipv4(s: str) -> bool:
@@ -8243,6 +8259,10 @@ def smtp_send_job(
         return out
 
     def _blacklist_check(from_email: str) -> tuple[bool, str]:
+        if SHIVA_DISABLE_BLACKLIST:
+            _log_blacklist_disabled_once()
+            return False, ""
+
         parts: list[str] = []
         listed = False
 
@@ -9049,6 +9069,8 @@ APP_CONFIG_SCHEMA: list[dict] = [
      "desc": "Comma-separated IP DNSBL zones (RBL). Empty disables IP blacklist checks."},
     {"key": "DBL_ZONES", "type": "str", "default": "dbl.spamhaus.org", "group": "DNSBL", "restart_required": False,
      "desc": "Comma-separated domain DBL zones. Empty disables domain blacklist checks."},
+    {"key": "SHIVA_DISABLE_BLACKLIST", "type": "bool", "default": "0", "group": "DNSBL", "restart_required": False,
+     "desc": "If enabled: disable all DNSBL/DBL blacklist checks (alias env: DISABLE_BLACKLIST)."},
 
     # PMTA monitor
     {"key": "PMTA_MONITOR_TIMEOUT_S", "type": "float", "default": "3", "group": "PMTA Monitor", "restart_required": False,
@@ -9255,7 +9277,7 @@ def reload_runtime_config() -> dict:
     """
     try:
         global SPAMCHECK_BACKEND, SPAMD_HOST, SPAMD_PORT, SPAMD_TIMEOUT
-        global _RBL_ZONES_RAW, _DBL_ZONES_RAW, RBL_ZONES_LIST, DBL_ZONES_LIST
+        global _RBL_ZONES_RAW, _DBL_ZONES_RAW, RBL_ZONES_LIST, DBL_ZONES_LIST, SHIVA_DISABLE_BLACKLIST
         global PMTA_MONITOR_TIMEOUT_S, PMTA_MONITOR_BASE_URL, PMTA_MONITOR_SCHEME, PMTA_MONITOR_API_KEY, PMTA_HEALTH_REQUIRED
         global PMTA_DIAG_ON_ERROR, PMTA_DIAG_RATE_S, PMTA_QUEUE_TOP_N
         global PMTA_QUEUE_BACKOFF, PMTA_QUEUE_REQUIRED, SHIVA_DISABLE_BACKOFF
@@ -9278,6 +9300,9 @@ def reload_runtime_config() -> dict:
         _DBL_ZONES_RAW = (cfg_get_str("DBL_ZONES", "dbl.spamhaus.org") or "").strip()
         RBL_ZONES_LIST = _parse_zones(_RBL_ZONES_RAW)
         DBL_ZONES_LIST = _parse_zones(_DBL_ZONES_RAW)
+        SHIVA_DISABLE_BLACKLIST = bool(cfg_get_bool("SHIVA_DISABLE_BLACKLIST", SHIVA_DISABLE_BLACKLIST))
+        if SHIVA_DISABLE_BLACKLIST:
+            _log_blacklist_disabled_once()
 
         # PMTA monitor
         PMTA_MONITOR_TIMEOUT_S = float(cfg_get_float("PMTA_MONITOR_TIMEOUT_S", 3.0))
@@ -9732,14 +9757,17 @@ def api_campaign_domains_stats(campaign_id: str):
             any_listed = False
 
             if idx < MAX_CHECKS:
-                mail_ips = resolve_sender_domain_ips(dom)
-                dbl = check_domain_dnsbl(dom)
-                if dbl:
-                    any_listed = True
-                for ip in mail_ips:
-                    if check_ip_dnsbl(ip):
+                if SHIVA_DISABLE_BLACKLIST:
+                    _log_blacklist_disabled_once()
+                else:
+                    mail_ips = resolve_sender_domain_ips(dom)
+                    dbl = check_domain_dnsbl(dom)
+                    if dbl:
                         any_listed = True
-                        break
+                    for ip in mail_ips:
+                        if check_ip_dnsbl(ip):
+                            any_listed = True
+                            break
 
             out_items.append(
                 {
@@ -10136,15 +10164,18 @@ def api_domains_stats():
             any_listed = False
 
             if idx < MAX_CHECKS:
-                mail_ips = resolve_sender_domain_ips(dom)
-                dbl = check_domain_dnsbl(dom)
-                if dbl:
-                    any_listed = True
-                # IP DNSBL
-                for ip in mail_ips:
-                    if check_ip_dnsbl(ip):
+                if SHIVA_DISABLE_BLACKLIST:
+                    _log_blacklist_disabled_once()
+                else:
+                    mail_ips = resolve_sender_domain_ips(dom)
+                    dbl = check_domain_dnsbl(dom)
+                    if dbl:
                         any_listed = True
-                        break
+                    # IP DNSBL
+                    for ip in mail_ips:
+                        if check_ip_dnsbl(ip):
+                            any_listed = True
+                            break
             else:
                 # skip heavy checks
                 mail_ips = []
@@ -10217,10 +10248,15 @@ def api_preflight():
 
     # Reputation checks
     ips = _resolve_ipv4(smtp_host) if smtp_host else []
-    ip_listings = {ip: check_ip_dnsbl(ip) for ip in ips}
-
     domain = _extract_domain_from_email(from_email)
-    domain_listings = check_domain_dnsbl(domain) if domain else []
+
+    if SHIVA_DISABLE_BLACKLIST:
+        _log_blacklist_disabled_once()
+        ip_listings = {ip: [] for ip in ips}
+        domain_listings = []
+    else:
+        ip_listings = {ip: check_ip_dnsbl(ip) for ip in ips}
+        domain_listings = check_domain_dnsbl(domain) if domain else []
 
     # NEW: Check ALL sender domains (from the textarea list)
     sender_domains: list[str] = []
@@ -10234,12 +10270,17 @@ def api_preflight():
         _seen_dom.add(d)
         sender_domains.append(d)
 
-    sender_domain_ips = {d: resolve_sender_domain_ips(d) for d in sender_domains}
-    sender_domain_ip_listings = {
-        d: {ip: check_ip_dnsbl(ip) for ip in ips}
-        for d, ips in sender_domain_ips.items()
-    }
-    sender_domain_dbl_listings = {d: check_domain_dnsbl(d) for d in sender_domains}
+    if SHIVA_DISABLE_BLACKLIST:
+        sender_domain_ips = {d: [] for d in sender_domains}
+        sender_domain_ip_listings = {d: {} for d in sender_domains}
+        sender_domain_dbl_listings = {d: [] for d in sender_domains}
+    else:
+        sender_domain_ips = {d: resolve_sender_domain_ips(d) for d in sender_domains}
+        sender_domain_ip_listings = {
+            d: {ip: check_ip_dnsbl(ip) for ip in ips}
+            for d, ips in sender_domain_ips.items()
+        }
+        sender_domain_dbl_listings = {d: check_domain_dnsbl(d) for d in sender_domains}
 
     # NEW: Spam score per sender domain (build email using the domain)
     domain_to_sender_email: dict[str, str] = {}
@@ -10284,8 +10325,9 @@ def api_preflight():
             "sender_domain_dbl_listings": sender_domain_dbl_listings,
             "sender_domain_spam_scores": sender_domain_spam_scores,
             "sender_domain_spam_backends": sender_domain_spam_backends,
-            "rbl_zones": RBL_ZONES_LIST,
-            "dbl_zones": DBL_ZONES_LIST,
+            "rbl_zones": ([] if SHIVA_DISABLE_BLACKLIST else RBL_ZONES_LIST),
+            "dbl_zones": ([] if SHIVA_DISABLE_BLACKLIST else DBL_ZONES_LIST),
+            "blacklist_check_disabled": bool(SHIVA_DISABLE_BLACKLIST),
         }
     )
 
