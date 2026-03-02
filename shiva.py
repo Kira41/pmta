@@ -7955,8 +7955,24 @@ def _get_bridge_pull_url_compat(default: str = "") -> str:
         "PMTA_ACCOUNTING_BRIDGE_PULL_URL",
         "PMTA_BRIDGE_URL",
     ]
+
+    def _get_env_compat(name: str) -> str:
+        # Prefer exact env key lookup first.
+        v = (os.getenv(name, "") or "").strip()
+        if v:
+            return v
+        # Compatibility: tolerate accidental whitespace around key names,
+        # e.g. `PMTA_BRIDGE_PULL_URL = http://...` parsed literally.
+        wanted = (name or "").strip().upper()
+        for raw_k, raw_v in os.environ.items():
+            if (raw_k or "").strip().upper() == wanted:
+                vv = (raw_v or "").strip()
+                if vv:
+                    return vv
+        return ""
+
     for k in aliases:
-        v = (os.getenv(k, "") or "").strip()
+        v = _get_env_compat(k)
         if v:
             return v
     return (default or "").strip()
