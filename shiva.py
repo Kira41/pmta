@@ -1260,6 +1260,49 @@ def db_set_outcome(job_id: str, rcpt: str, status: str, message_id: str = "", ds
                 conn.close()
 
 
+def db_get_job_outcome_counts(job_id: str) -> dict[str, int]:
+    """Return persisted outcome counters for a job from SQLite."""
+    jid = (job_id or "").strip()
+    empty = {"delivered": 0, "bounced": 0, "deferred": 0, "complained": 0}
+    if not jid:
+        return empty
+
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            row = conn.execute(
+                "SELECT "
+                "SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) AS delivered, "
+                "SUM(CASE WHEN status='bounced' THEN 1 ELSE 0 END) AS bounced, "
+                "SUM(CASE WHEN status='deferred' THEN 1 ELSE 0 END) AS deferred, "
+                "SUM(CASE WHEN status='complained' THEN 1 ELSE 0 END) AS complained "
+                "FROM job_outcomes WHERE job_id=?",
+                (jid,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+    if not row:
+        return empty
+    return {
+        "delivered": int(row[0] or 0),
+        "bounced": int(row[1] or 0),
+        "deferred": int(row[2] or 0),
+        "complained": int(row[3] or 0),
+    }
+
+
+def _sync_job_outcome_counters_from_db(job: 'SendJob') -> None:
+    """Refresh in-memory outcome counters from SQLite for consistency after restarts."""
+    if not job or not job.id:
+        return
+    counts = db_get_job_outcome_counts(job.id)
+    job.delivered = int(counts.get("delivered") or 0)
+    job.bounced = int(counts.get("bounced") or 0)
+    job.deferred = int(counts.get("deferred") or 0)
+    job.complained = int(counts.get("complained") or 0)
+
+
 def db_insert_accounting_event(event: dict[str, Any]) -> bool:
     eid = str((event or {}).get("event_id") or "").strip()
     if not eid:
@@ -1476,6 +1519,7 @@ def db_load_jobs_into_memory() -> None:
             continue
         job = _sendjob_from_snapshot(s)
         if job and job.id and not job.deleted:
+            _sync_job_outcome_counters_from_db(job)
             loaded[job.id] = job
 
     with JOBS_LOCK:
@@ -10109,6 +10153,9 @@ def job_api(job_id: str):
         job = JOBS.get(job_id)
         if (not job) or getattr(job, 'deleted', False):
             return jsonify({"error": "not found"}), 404
+
+        # Dashboard/API outcome counters must come from SQLite (source of truth).
+        _sync_job_outcome_counters_from_db(job)
 
         total_recent = len(job.recent_results or [])
         recent_total_pages = max(1, math.ceil(total_recent / recent_page_size))
