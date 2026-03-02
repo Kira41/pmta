@@ -23,7 +23,7 @@ from typing import Optional, Any, Tuple, Dict, List
 from concurrent.futures import ThreadPoolExecutor
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse, urlunparse
 
 import sqlite3
 from pathlib import Path
@@ -8050,6 +8050,28 @@ def _resolve_bridge_pull_url_runtime() -> str:
             url = url[1:-1].strip()
         if url:
             return url
+
+    # Compatibility fallback: if runtime config became empty but we still have
+    # a previously used request URL in diagnostics, recover its base URL.
+    # This helps long-running instances continue pulling after transient
+    # config source glitches.
+    with _BRIDGE_DEBUG_LOCK:
+        last_req_url = str(_BRIDGE_DEBUG_STATE.get("last_req_url") or "").strip()
+    if last_req_url:
+        parsed = urlparse(last_req_url)
+        if parsed.scheme and parsed.netloc:
+            pairs = []
+            for part in (parsed.query or "").split("&"):
+                if not part:
+                    continue
+                name = part.split("=", 1)[0].strip().lower()
+                if name in {"cursor", "max_lines"}:
+                    continue
+                pairs.append(part)
+            recovered_qs = "&".join(pairs)
+            recovered = urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", recovered_qs, "")).strip()
+            if recovered:
+                return recovered
     return ""
 
 
