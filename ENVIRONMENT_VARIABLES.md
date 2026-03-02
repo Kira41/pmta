@@ -558,6 +558,7 @@ PMTA_DIAG_RATE_S=1.0
 PMTA_QUEUE_TOP_N=6
 PMTA_QUEUE_BACKOFF=1
 PMTA_QUEUE_REQUIRED=0
+SHIVA_DISABLE_BACKOFF=0
 PMTA_LIVE_POLL_S=3
 PMTA_DOMAIN_CHECK_TOP_N=2
 PMTA_DETAIL_CACHE_TTL_S=3
@@ -768,7 +769,7 @@ OPENROUTER_TIMEOUT_S=40
   - **وظيفته:** عدد أهم الصفوف المعروضة/المحللة.
   - **سيناريو الاستخدام:** رفعه عند تحليل تفصيلي متعدد المزودات.
 
-- `PMTA_QUEUE_BACKOFF`, `PMTA_QUEUE_REQUIRED`
+- `PMTA_QUEUE_BACKOFF`, `PMTA_QUEUE_REQUIRED`, `SHIVA_DISABLE_BACKOFF`
   - **الدالة المستخدمة:** `pmta_chunk_policy`.
   - **وظيفتهما:** تفعيل backoff المعتمد على queue/domain وجعل التفاصيل شرطًا إلزاميًا أو اختياريًا.
   - **سيناريو الاستخدام:** `REQUIRED=1` في بيئات حساسة لا تقبل الإرسال الأعمى.

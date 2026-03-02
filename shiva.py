@@ -9025,6 +9025,8 @@ APP_CONFIG_SCHEMA: list[dict] = [
      "desc": "If enabled: use /domainDetail + /queueDetail to slow down or backoff based on PMTA errors/deferrals."},
     {"key": "PMTA_QUEUE_REQUIRED", "type": "bool", "default": "0", "group": "PMTA Backoff", "restart_required": False,
      "desc": "If true and PMTA detail endpoints are unreachable: block chunk (strict mode)."},
+    {"key": "SHIVA_DISABLE_BACKOFF", "type": "bool", "default": "0", "group": "Backoff", "restart_required": False,
+     "desc": "If enabled: bypass PMTA/domain backoff checks and send chunks immediately."},
     {"key": "PMTA_LIVE_POLL_S", "type": "float", "default": "3", "group": "PMTA Live", "restart_required": False,
      "desc": "Polling interval for PMTA live panel (seconds)."},
     {"key": "PMTA_DOMAIN_CHECK_TOP_N", "type": "int", "default": "2", "group": "PMTA Backoff", "restart_required": False,
@@ -9181,7 +9183,7 @@ def reload_runtime_config() -> dict:
         global _RBL_ZONES_RAW, _DBL_ZONES_RAW, RBL_ZONES_LIST, DBL_ZONES_LIST
         global PMTA_MONITOR_TIMEOUT_S, PMTA_MONITOR_BASE_URL, PMTA_MONITOR_SCHEME, PMTA_MONITOR_API_KEY, PMTA_HEALTH_REQUIRED
         global PMTA_DIAG_ON_ERROR, PMTA_DIAG_RATE_S, PMTA_QUEUE_TOP_N
-        global PMTA_QUEUE_BACKOFF, PMTA_QUEUE_REQUIRED
+        global PMTA_QUEUE_BACKOFF, PMTA_QUEUE_REQUIRED, SHIVA_DISABLE_BACKOFF
         global PMTA_LIVE_POLL_S, PMTA_DOMAIN_CHECK_TOP_N, PMTA_DETAIL_CACHE_TTL_S
         global PMTA_DOMAIN_DEFERRALS_BACKOFF, PMTA_DOMAIN_ERRORS_BACKOFF, PMTA_DOMAIN_DEFERRALS_SLOW, PMTA_DOMAIN_ERRORS_SLOW
         global PMTA_SLOW_DELAY_S, PMTA_SLOW_WORKERS_MAX
@@ -9218,6 +9220,7 @@ def reload_runtime_config() -> dict:
 
         PMTA_QUEUE_BACKOFF = bool(cfg_get_bool("PMTA_QUEUE_BACKOFF", True))
         PMTA_QUEUE_REQUIRED = bool(cfg_get_bool("PMTA_QUEUE_REQUIRED", False))
+        SHIVA_DISABLE_BACKOFF = bool(cfg_get_bool("SHIVA_DISABLE_BACKOFF", False))
         PMTA_LIVE_POLL_S = float(cfg_get_float("PMTA_LIVE_POLL_S", 3.0))
         PMTA_DOMAIN_CHECK_TOP_N = int(cfg_get_int("PMTA_DOMAIN_CHECK_TOP_N", 2))
         PMTA_DETAIL_CACHE_TTL_S = float(cfg_get_float("PMTA_DETAIL_CACHE_TTL_S", 3.0))
