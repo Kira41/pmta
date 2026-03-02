@@ -141,6 +141,28 @@ class BridgeShivaHarnessTests(unittest.TestCase):
             "abc123",
         )
 
+    def test_bridge_url_resolution_accepts_whitespace_around_env_key(self):
+        old_cfg = shiva.PMTA_BRIDGE_PULL_URL
+        old_env = os.environ.get("PMTA_BRIDGE_PULL_URL")
+        old_env_spaced = os.environ.get(" PMTA_BRIDGE_PULL_URL ")
+        try:
+            shiva.PMTA_BRIDGE_PULL_URL = ""
+            os.environ.pop("PMTA_BRIDGE_PULL_URL", None)
+            os.environ[" PMTA_BRIDGE_PULL_URL "] = "http://194.116.172.135:8090/api/v1/pull/latest?kind=acct"
+
+            resolved = shiva._get_bridge_pull_url_compat("")
+            self.assertEqual(resolved, "http://194.116.172.135:8090/api/v1/pull/latest?kind=acct")
+        finally:
+            shiva.PMTA_BRIDGE_PULL_URL = old_cfg
+            if old_env is None:
+                os.environ.pop("PMTA_BRIDGE_PULL_URL", None)
+            else:
+                os.environ["PMTA_BRIDGE_PULL_URL"] = old_env
+            if old_env_spaced is None:
+                os.environ.pop(" PMTA_BRIDGE_PULL_URL ", None)
+            else:
+                os.environ[" PMTA_BRIDGE_PULL_URL "] = old_env_spaced
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
