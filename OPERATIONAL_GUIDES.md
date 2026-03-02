@@ -263,3 +263,71 @@ curl -s "http://127.0.0.1:5000/api/config/runtime" | jq '.PMTA_MONITOR_BASE_URL,
 
 لو (1) أو (2) فشلوا، المشكلة من PMTA monitor access / scheme / api-key.  
 لو نجحوا لكن dashboard لا يعكس الأخطاء، المشكلة غالبًا من قيم backoff أو من runtime config غير معمولة لها reload.
+
+---
+
+## 5) Troubleshooting: "Internal Error Receiver (Shiva ← Bridge.py)" مع عدادات صفر
+
+إذا كانت لوحة PMTA فيها `in/out` وتجد سطور `delivery` داخل `accounting` لكن Shiva يعرض:
+
+- `Bridge rows: 0`
+- `Processed by Shiva: 0`
+- `Accepted: 0`
+- وعدادات (`delivery/bounces/deferred/complained`) كلها صفر
+
+فالمشكلة غالبًا ليست في الإرسال نفسه، بل في **حلقة السحب والربط** بين Shiva وBridge أو في **مطابقة الحدث مع job**.
+
+### Checklist عملي (بالترتيب)
+
+1. **تأكد من أن endpoint صحيح ويُرجع بيانات فعلية**
+   ```bash
+   curl -s -H "Authorization: Bearer <TOKEN>" \
+     "http://194.116.172.135:8090/api/v1/pull/latest?kind=acct&max_lines=5"
+   ```
+   يجب أن ترى `ok=true` و`count>0` و`lines` غير فارغة.
+
+2. **تأكد أن Shiva يشير لنفس الرابط حرفيًا (kind=acct + نفس البورت)**
+   - المتغير الحاسم: `PMTA_BRIDGE_PULL_URL`
+   - خطأ شائع: بورت مختلف، أو حذف `kind=acct`، أو endpoint آخر غير `pull/latest`.
+
+3. **تأكد من التوكن على الطرفين**
+   - Bridge: `API_TOKEN`
+   - Shiva: `PMTA_BRIDGE_PULL_TOKEN`
+   - لو Bridge يتطلب توكن وShiva يرسل قيمة خاطئة/فارغة ستحصل على سحب صفري فعليًا (أو 401/403 في logs).
+
+4. **تأكد أن Polling مفعّل فعلًا في Shiva**
+   - `PMTA_BRIDGE_PULL_ENABLED=1`
+   - افحص:
+     ```bash
+     curl -s "http://127.0.0.1:5000/api/accounting/bridge/status"
+     ```
+   - تأكد من `pull_enabled=true` و`pull_url` مضبوط.
+
+5. **افحص المسار الذي يقرأ منه Bridge ملفات PMTA**
+   - `PMTA_LOG_DIR` يجب أن يحتوي ملفات accounting الفعلية.
+   - إن كان PMTA يكتب في مسار آخر (أو صلاحيات القراءة ناقصة) سيرجع Bridge بيانات فارغة.
+
+6. **تحقق من مشكلة job_not_found (الأكثر شيوعًا عند وجود rows لكن Accepted=0)**
+   - إذا كانت الأحداث تصل لكن لا ترتبط بـ job داخل Shiva، سترتفع `job_not_found` بينما `accepted` يبقى صفر.
+   - السبب عادة: mismatch في معرف الربط (header/id) بين الإرسال والأحداث الواردة من PMTA.
+
+7. **افحص cursor العالق أو المتقدم أكثر من اللازم**
+   - إذا cursor أصبح في نهاية الملف ولا توجد أحداث جديدة، `Bridge rows` سيبقى صفر حتى وصول سطور جديدة.
+   - جرّب سحبًا يدويًا:
+     ```bash
+     curl -s -X POST "http://127.0.0.1:5000/api/accounting/bridge/pull"
+     ```
+   - وراقب هل يتحرك `last_cursor` في status.
+
+8. **تأكد من تنسيق outcome قابل للتفسير**
+   - Bridge يتوقع outcomes مثل: `delivered`, `bounced`, `deferred`, `complained` أو مرادفاتها.
+   - إذا السطر لا يحتوي outcome مفهوم، سيُتجاهل ضمن `unknown_outcome`.
+
+### خلاصة تشخيص سريعة للحالة المذكورة
+
+عند اجتماع: `in/out` موجود + accounting يحتوي delivery + كل عدادات Shiva صفر، فأقوى احتمالين:
+
+1. **Shiva لا يسحب أصلًا** (URL/token/polling/PMTA_LOG_DIR).
+2. **Shiva يسحب لكن لا يربط الأحداث بجوب** (`job_not_found` مرتفع ⇒ `accepted=0`).
+
+ابدأ دائمًا بـ `/api/accounting/bridge/status` لأنه يعطيك الحكم الفوري: هل المشكلة `events_received=0` (سحب) أم `job_not_found>0` (ربط).
