@@ -122,6 +122,16 @@ class BridgeShivaHarnessTests(unittest.TestCase):
             "abc123",
         )
 
+    def test_bridge_auth_normalization_accepts_bearer_and_quotes(self):
+        self.assertEqual(
+            bridge._normalize_auth_token('"Bearer abc123"'),
+            "abc123",
+        )
+        self.assertEqual(
+            bridge._normalize_auth_token("'abc123'"),
+            "abc123",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
