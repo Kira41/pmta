@@ -8657,7 +8657,7 @@ def _poll_accounting_bridge_once() -> dict:
         if isinstance(lines, list):
             bridge_rows = list(lines)
         elif isinstance(obj, dict):
-            for key in ("outcomes", "results", "messages", "items", "rows", "data"):
+            for key in ("events", "outcomes", "results", "messages", "items", "rows", "data"):
                 v = obj.get(key)
                 if isinstance(v, list):
                     bridge_rows = v
