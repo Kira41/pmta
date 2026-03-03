@@ -7977,7 +7977,7 @@ except Exception:
 PMTA_BRIDGE_PULL_PATH = "/api/v1/pull"
 PMTA_BRIDGE_JOB_COUNT_PATH = "/api/v1/job/count"
 PMTA_BRIDGE_JOB_OUTCOMES_PATH = "/api/v1/job/outcomes"
-BRIDGE_BASE_URL = ""
+BRIDGE_BASE_URL = (os.getenv("BRIDGE_BASE_URL", "") or "").strip()
 try:
     BRIDGE_TIMEOUT_S = float((os.getenv("BRIDGE_TIMEOUT_S", "20") or "20").strip())
 except Exception:
@@ -7992,7 +7992,11 @@ try:
     BRIDGE_POLL_INTERVAL_S = float((os.getenv("BRIDGE_POLL_INTERVAL_S", str(PMTA_BRIDGE_PULL_S)) or str(PMTA_BRIDGE_PULL_S)).strip())
 except Exception:
     BRIDGE_POLL_INTERVAL_S = float(PMTA_BRIDGE_PULL_S or 5.0)
-BRIDGE_POLL_FETCH_OUTCOMES = (os.getenv("BRIDGE_POLL_FETCH_OUTCOMES", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+_OUTCOMES_SYNC_RAW = os.getenv("OUTCOMES_SYNC")
+if _OUTCOMES_SYNC_RAW is None:
+    _OUTCOMES_SYNC_RAW = os.getenv("BRIDGE_POLL_FETCH_OUTCOMES", "1")
+OUTCOMES_SYNC = (_OUTCOMES_SYNC_RAW or "1").strip().lower() in {"1", "true", "yes", "on"}
+BRIDGE_POLL_FETCH_OUTCOMES = bool(OUTCOMES_SYNC)
 try:
     PMTA_BRIDGE_PULL_MAX_LINES = int((os.getenv("PMTA_BRIDGE_PULL_MAX_LINES", "2000") or "2000").strip())
 except Exception:
@@ -8094,6 +8098,9 @@ def _resolve_bridge_pull_url_runtime() -> str:
 
 
 def _resolve_bridge_base_url_runtime() -> str:
+    configured = (BRIDGE_BASE_URL or "").strip().rstrip("/")
+    if configured:
+        return configured
     host = _normalize_bridge_host(_resolve_bridge_pull_host_from_campaign())
     return f"http://{host}:{PMTA_BRIDGE_PULL_PORT}"
 
@@ -10149,14 +10156,18 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "Enable the only accounting flow: Shiva pulls accounting from bridge API."},
     {"key": "BRIDGE_MODE", "type": "str", "default": "counts", "group": "Accounting", "restart_required": False,
      "desc": "Bridge ingestion mode. Use 'counts' to enforce /api/v1/job/count (+ optional /job/outcomes) and disable legacy cursor /pull ingestion."},
+    {"key": "BRIDGE_BASE_URL", "type": "str", "default": "", "group": "Accounting", "restart_required": False,
+     "desc": "Optional explicit Bridge base URL (example: http://bridge-host:8090). If empty, Shiva derives host from campaign SMTP host."},
     {"key": "PMTA_BRIDGE_PULL_PORT", "type": "int", "default": "8090", "group": "Accounting", "restart_required": False,
      "desc": "Bridge port used by Shiva when building count/outcomes API URLs from campaign SMTP host."},
     {"key": "PMTA_BRIDGE_PULL_S", "type": "float", "default": "5", "group": "Accounting", "restart_required": False,
      "desc": "Legacy polling interval (seconds) for Shiva bridge pull thread."},
     {"key": "BRIDGE_POLL_INTERVAL_S", "type": "float", "default": "5", "group": "Accounting", "restart_required": False,
      "desc": "Polling interval (seconds) for Shiva bridge job poller loop."},
-    {"key": "BRIDGE_POLL_FETCH_OUTCOMES", "type": "bool", "default": "1", "group": "Accounting", "restart_required": False,
+    {"key": "OUTCOMES_SYNC", "type": "bool", "default": "1", "group": "Accounting", "restart_required": False,
      "desc": "If enabled, Shiva also fetches /api/v1/job/outcomes for each active job poll cycle."},
+    {"key": "BRIDGE_POLL_FETCH_OUTCOMES", "type": "bool", "default": "1", "group": "Accounting", "restart_required": False,
+     "desc": "Legacy alias for OUTCOMES_SYNC. If enabled, Shiva also fetches /api/v1/job/outcomes for each active job poll cycle."},
     {"key": "PMTA_BRIDGE_PULL_MAX_LINES", "type": "int", "default": "2000", "group": "Accounting", "restart_required": False,
      "desc": "max_lines query used when Shiva pulls from bridge endpoint."},
 
@@ -10287,7 +10298,7 @@ def reload_runtime_config() -> dict:
         global PMTA_DOMAIN_STATS, PMTA_DOMAINS_POLL_S, PMTA_DOMAINS_TOP_N
         global OPENROUTER_ENDPOINT, OPENROUTER_MODEL, OPENROUTER_TIMEOUT_S
         global PMTA_BRIDGE_PULL_ENABLED, BRIDGE_MODE, PMTA_BRIDGE_PULL_PORT, PMTA_BRIDGE_PULL_S, PMTA_BRIDGE_PULL_MAX_LINES
-        global BRIDGE_POLL_INTERVAL_S, BRIDGE_POLL_FETCH_OUTCOMES
+        global BRIDGE_BASE_URL, BRIDGE_POLL_INTERVAL_S, BRIDGE_POLL_FETCH_OUTCOMES, OUTCOMES_SYNC
 
         # Spam
         SPAMCHECK_BACKEND = (cfg_get_str("SPAMCHECK_BACKEND", "spamd") or "spamd").strip().lower()
@@ -10350,8 +10361,11 @@ def reload_runtime_config() -> dict:
             BRIDGE_MODE = "counts"
         PMTA_BRIDGE_PULL_PORT = int(cfg_get_int("PMTA_BRIDGE_PULL_PORT", int(PMTA_BRIDGE_PULL_PORT or 8090)))
         PMTA_BRIDGE_PULL_S = float(cfg_get_float("PMTA_BRIDGE_PULL_S", float(PMTA_BRIDGE_PULL_S or 5.0)))
+        BRIDGE_BASE_URL = (cfg_get_str("BRIDGE_BASE_URL", BRIDGE_BASE_URL) or BRIDGE_BASE_URL).strip()
         BRIDGE_POLL_INTERVAL_S = float(cfg_get_float("BRIDGE_POLL_INTERVAL_S", float(PMTA_BRIDGE_PULL_S or BRIDGE_POLL_INTERVAL_S or 5.0)))
-        BRIDGE_POLL_FETCH_OUTCOMES = bool(cfg_get_bool("BRIDGE_POLL_FETCH_OUTCOMES", bool(BRIDGE_POLL_FETCH_OUTCOMES)))
+        OUTCOMES_SYNC = bool(cfg_get_bool("OUTCOMES_SYNC", bool(OUTCOMES_SYNC)))
+        BRIDGE_POLL_FETCH_OUTCOMES = bool(cfg_get_bool("BRIDGE_POLL_FETCH_OUTCOMES", bool(OUTCOMES_SYNC)))
+        OUTCOMES_SYNC = bool(BRIDGE_POLL_FETCH_OUTCOMES)
         PMTA_BRIDGE_PULL_MAX_LINES = int(cfg_get_int("PMTA_BRIDGE_PULL_MAX_LINES", int(PMTA_BRIDGE_PULL_MAX_LINES or 2000)))
 
         # If bridge pull gets enabled/configured from UI after startup, ensure poller thread is running.
