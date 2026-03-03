@@ -115,6 +115,18 @@ class BridgeShivaHarnessTests(unittest.TestCase):
             else:
                 os.environ["SHIVA_HOST"] = old_host
 
+
+    def test_bridge_row_parser_accepts_json_and_rejects_csv_strings(self):
+        self.assertEqual(
+            shiva._parse_bridge_json_row({"type": "d", "rcpt": "x@example.com"}),
+            {"type": "d", "rcpt": "x@example.com"},
+        )
+        self.assertEqual(
+            shiva._parse_bridge_json_row('{"type":"d","rcpt":"x@example.com"}'),
+            {"type": "d", "rcpt": "x@example.com"},
+        )
+        self.assertIsNone(shiva._parse_bridge_json_row('d,2026-01-01,mailfrom,x@example.com'))
+
     def test_bridge_host_normalization_strips_scheme_and_port(self):
         self.assertEqual(shiva._normalize_bridge_host("http://194.116.172.135:2525"), "194.116.172.135")
         self.assertEqual(shiva._normalize_bridge_host("smtp.campaign.local:2525"), "smtp.campaign.local")

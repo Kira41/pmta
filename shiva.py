@@ -3,7 +3,6 @@ import os
 import json
 import hashlib
 import math
-import csv
 import logging
 import random
 import re
@@ -8050,8 +8049,6 @@ def _bridge_debug_update(**kwargs: Any) -> None:
     with _BRIDGE_DEBUG_LOCK:
         _BRIDGE_DEBUG_STATE.update(kwargs)
 
-_PMTA_ACC_HEADERS: Dict[str, List[str]] = {}
-
 _OUTCOME_CACHE_LOCK = threading.Lock()
 _OUTCOME_CACHE: Dict[Tuple[str, str], str] = {}
 
@@ -8169,83 +8166,25 @@ def _find_job_by_recipient(rcpt: str) -> Optional[SendJob]:
     return pool[0]
 
 
-def _parse_accounting_line(line: str, *, path: str = "") -> Optional[dict]:
-    """Parse one accounting line.
+def _parse_bridge_json_row(row: Any) -> Optional[dict]:
+    """Parse one bridge row as JSON-only payload.
 
-    Supports:
-    - NDJSON: one JSON object per line
-    - CSV (with or without header)
-
-    Output is best-effort.
+    Bridge is the source of truth and already returns normalized JSON.
+    Shiva intentionally ignores legacy CSV/plaintext rows to keep this flow
+    deterministic and to avoid PMTA log parsing on the Shiva side.
     """
-    s = (line or "").strip()
-    if not s:
+    if isinstance(row, dict):
+        return row
+
+    s = str(row or "").strip()
+    if not s or not (s.startswith("{") and s.endswith("}")):
         return None
-
-    # NDJSON
-    if s.startswith("{") and s.endswith("}"):
-        try:
-            ev = json.loads(s)
-            if isinstance(ev, dict):
-                return ev
-        except Exception:
-            return None
-
-    # CSV
-    delim = ","
-    if "\t" in s and s.count("\t") >= s.count(","):
-        delim = "\t"
-    elif ";" in s and s.count(";") > s.count(","):
-        delim = ";"
 
     try:
-        fields = next(csv.reader([s], delimiter=delim))
-        fields = [x.strip() for x in fields]
+        ev = json.loads(s)
     except Exception:
         return None
-
-    # Header detection
-    if fields and any(x.lower() in {"type", "event", "rcpt", "recipient", "msgid", "message-id", "message_id"} for x in fields):
-        _PMTA_ACC_HEADERS[path or ""] = [x.strip().lower() for x in fields]
-        return None
-
-    hdr = _PMTA_ACC_HEADERS.get(path or "") or []
-    ev: Dict[str, Any] = {"raw": s}
-
-    if hdr and len(hdr) == len(fields):
-        for k, v in zip(hdr, fields):
-            if k:
-                ev[k] = v
-        return ev
-
-    # Heuristic fallback
-    if fields:
-        ev["type"] = fields[0]
-
-    # Common PMTA acct CSV fallback mapping (no header).
-    # Example:
-    # b,<time>,<time>,mailfrom,rcpt,,failed,5.1.1 (...),"smtp;550 ...",...
-    if len(fields) >= 9:
-        ev["mailfrom"] = fields[3]
-        ev["rcpt"] = fields[4]
-        ev["status"] = fields[6]
-        ev["dsnStatus"] = fields[7]
-        ev["dsnDiag"] = fields[8]
-
-    # Recipient fallback: prefer 2nd email-looking token (mailfrom is usually first).
-    em_pos = [(i, (f or "").strip()) for i, f in enumerate(fields) if EMAIL_RE.match((f or "").strip())]
-    if em_pos:
-        if len(em_pos) >= 2:
-            ev["rcpt"] = em_pos[1][1]
-        elif "rcpt" not in ev:
-            ev["rcpt"] = em_pos[0][1]
-
-    for f in fields:
-        if "@local" in f or "<" in f:
-            ev["msgid"] = f
-            break
-
-    return ev
+    return ev if isinstance(ev, dict) else None
 
 
 def _push_outcome_bucket(job: SendJob, kind: str):
@@ -8748,14 +8687,7 @@ def _poll_accounting_bridge_once() -> dict:
         duplicates = 0
         job_not_found = 0
         for row in bridge_rows:
-            ev: Optional[dict] = None
-            if isinstance(row, dict):
-                ev = row
-            else:
-                s2 = str(row or "").strip()
-                if not s2:
-                    continue
-                ev = _parse_accounting_line(s2, path="bridge")
+            ev = _parse_bridge_json_row(row)
             if not ev:
                 continue
             res = process_pmta_accounting_event(ev)
