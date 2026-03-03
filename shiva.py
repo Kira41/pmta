@@ -8009,6 +8009,7 @@ _BRIDGE_DEBUG_STATE: Dict[str, Any] = {
 _BRIDGE_POLLER_LOCK = threading.Lock()
 _BRIDGE_POLLER_STARTED = False
 _BRIDGE_CURSOR_COMPAT_WARNED = False
+_BRIDGE_POLL_CYCLE_LOCK = threading.Lock()
 
 
 def _resolve_bridge_pull_host_from_campaign() -> str:
@@ -8815,109 +8816,123 @@ def _job_pmta_job_id(job: 'SendJob') -> str:
 
 
 def _poll_accounting_bridge_once() -> dict:
+    if not _BRIDGE_POLL_CYCLE_LOCK.acquire(blocking=False):
+        return {
+            "ok": False,
+            "error": "busy",
+            "reason": "busy",
+            "processed": 0,
+            "accepted": 0,
+            "count": 0,
+            "batches": 0,
+            "cursor": "",
+        }
+
     logger = logging.getLogger("shiva")
-    t0 = time.time()
-    poll_ts = now_iso()
-    _bridge_debug_update(last_poll_time=poll_ts)
-    base_url = _resolve_bridge_base_url_runtime()
-    global BRIDGE_BASE_URL
-    BRIDGE_BASE_URL = base_url
-    if not base_url:
+    try:
+        t0 = time.time()
+        poll_ts = now_iso()
+        _bridge_debug_update(last_poll_time=poll_ts)
+        base_url = _resolve_bridge_base_url_runtime()
+        global BRIDGE_BASE_URL
+        BRIDGE_BASE_URL = base_url
+        if not base_url:
+            _bridge_debug_update(
+                last_attempt_ts=now_iso(),
+                attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
+                last_ok=False,
+                connected=False,
+                failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + 1,
+                last_error_ts=now_iso(),
+                last_error="bridge_base_url_not_configured",
+                last_duration_ms=int((time.time() - t0) * 1000),
+            )
+            return {"ok": False, "error": "bridge_base_url_not_configured", "processed": 0, "accepted": 0}
+
+        headers = {"Accept": "application/json"}
+        jobs = _active_jobs_for_bridge_poll()
+
+        total_processed = 0
+        total_accepted = 0
+        total_count = 0
+        last_obj: Any = {}
+        last_error = ""
+
+        for job in jobs:
+            jid = _job_pmta_job_id(job)
+            if not jid:
+                continue
+
+            total_processed += 1
+            count_url = f"{base_url}{PMTA_BRIDGE_JOB_COUNT_PATH}?job_id={quote_plus(jid)}"
+            count_obj, count_error = _bridge_fetch_json(count_url, headers)
+            if count_error is not None or not isinstance(count_obj, dict):
+                err_msg = f"bridge_count_failed job_id={jid} error={count_error}"
+                logger.exception(err_msg) if count_error is not None else logger.error(err_msg)
+                last_error = err_msg
+                continue
+
+            outcomes_obj: Optional[dict] = None
+            outcomes_error: Optional[Exception] = None
+            if BRIDGE_POLL_FETCH_OUTCOMES:
+                outcomes_url = f"{base_url}{PMTA_BRIDGE_JOB_OUTCOMES_PATH}?job_id={quote_plus(jid)}"
+                outcomes_obj, outcomes_error = _bridge_fetch_json(outcomes_url, headers)
+                if outcomes_error is not None:
+                    logger.warning("Bridge outcomes fetch failed for job_id=%s: %s", jid, outcomes_error)
+
+            if BRIDGE_POLL_FETCH_OUTCOMES and outcomes_obj and outcomes_error is None:
+                try:
+                    _bridge_sync_job_outcomes(jid, outcomes_obj)
+                except Exception:
+                    logger.exception("Bridge outcome sync failed for job_id=%s", jid)
+
+            linked_count = int(count_obj.get("linked_emails_count") or 0)
+            with JOBS_LOCK:
+                live_job = JOBS.get(str(getattr(job, "id", "") or "").strip().lower())
+                if live_job and not getattr(live_job, "deleted", False):
+                    linked_count = _replace_job_accounting_from_bridge_count(live_job, count_obj)
+                    live_job.maybe_persist()
+
+            total_accepted += 1
+            total_count += int(linked_count)
+            last_obj = count_obj
+
+        ok = (last_error == "")
         _bridge_debug_update(
             last_attempt_ts=now_iso(),
+            last_success_ts=now_iso() if ok else str(_BRIDGE_DEBUG_STATE.get("last_success_ts") or ""),
             attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
-            last_ok=False,
-            connected=False,
-            failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + 1,
-            last_error_ts=now_iso(),
-            last_error="bridge_base_url_not_configured",
+            success_count=int(_BRIDGE_DEBUG_STATE.get("success_count", 0)) + (1 if ok else 0),
+            failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + (0 if ok else 1),
+            last_ok=ok,
+            connected=ok,
+            last_error=last_error,
+            last_error_ts=now_iso() if not ok else str(_BRIDGE_DEBUG_STATE.get("last_error_ts") or ""),
+            last_bridge_count=total_count,
+            last_processed=total_processed,
+            last_accepted=total_accepted,
+            last_response_keys=list(last_obj.keys()) if isinstance(last_obj, dict) else [],
+            last_lines_sample=[],
             last_duration_ms=int((time.time() - t0) * 1000),
+            last_cursor="",
+            has_more=False,
+            events_received=int(_BRIDGE_DEBUG_STATE.get("events_received", 0) or 0) + total_processed,
+            events_ingested=int(_BRIDGE_DEBUG_STATE.get("events_ingested", 0) or 0) + total_accepted,
+            duplicates_dropped=int(_BRIDGE_DEBUG_STATE.get("duplicates_dropped", 0) or 0),
+            job_not_found=int(_BRIDGE_DEBUG_STATE.get("job_not_found", 0) or 0),
+            db_write_failures=int(_DB_WRITER_STATUS.get("failed", 0) or 0) + int(_DB_WRITER_STATUS.get("queue_full", 0) or 0),
         )
-        return {"ok": False, "error": "bridge_base_url_not_configured", "processed": 0, "accepted": 0}
-
-    headers = {"Accept": "application/json"}
-    jobs = _active_jobs_for_bridge_poll()
-
-    total_processed = 0
-    total_accepted = 0
-    total_count = 0
-    last_obj: Any = {}
-    last_error = ""
-
-    for job in jobs:
-        jid = _job_pmta_job_id(job)
-        if not jid:
-            continue
-
-        total_processed += 1
-        count_url = f"{base_url}{PMTA_BRIDGE_JOB_COUNT_PATH}?job_id={quote_plus(jid)}"
-        count_obj, count_error = _bridge_fetch_json(count_url, headers)
-        if count_error is not None or not isinstance(count_obj, dict):
-            err_msg = f"bridge_count_failed job_id={jid} error={count_error}"
-            logger.exception(err_msg) if count_error is not None else logger.error(err_msg)
-            last_error = err_msg
-            continue
-
-        outcomes_obj: Optional[dict] = None
-        outcomes_error: Optional[Exception] = None
-        if BRIDGE_POLL_FETCH_OUTCOMES:
-            outcomes_url = f"{base_url}{PMTA_BRIDGE_JOB_OUTCOMES_PATH}?job_id={quote_plus(jid)}"
-            outcomes_obj, outcomes_error = _bridge_fetch_json(outcomes_url, headers)
-            if outcomes_error is not None:
-                logger.warning("Bridge outcomes fetch failed for job_id=%s: %s", jid, outcomes_error)
-
-        if BRIDGE_POLL_FETCH_OUTCOMES and outcomes_obj and outcomes_error is None:
-            try:
-                _bridge_sync_job_outcomes(jid, outcomes_obj)
-            except Exception:
-                logger.exception("Bridge outcome sync failed for job_id=%s", jid)
-
-        linked_count = int(count_obj.get("linked_emails_count") or 0)
-        with JOBS_LOCK:
-            live_job = JOBS.get(str(getattr(job, "id", "") or "").strip().lower())
-            if live_job and not getattr(live_job, "deleted", False):
-                linked_count = _replace_job_accounting_from_bridge_count(live_job, count_obj)
-                live_job.maybe_persist()
-
-        total_accepted += 1
-        total_count += int(linked_count)
-        last_obj = count_obj
-
-    ok = (last_error == "")
-    _bridge_debug_update(
-        last_poll_time=poll_ts,
-        last_attempt_ts=now_iso(),
-        last_success_ts=now_iso() if ok else str(_BRIDGE_DEBUG_STATE.get("last_success_ts") or ""),
-        attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
-        success_count=int(_BRIDGE_DEBUG_STATE.get("success_count", 0)) + (1 if ok else 0),
-        failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + (0 if ok else 1),
-        last_ok=ok,
-        connected=ok,
-        last_error=last_error,
-        last_error_ts=now_iso() if not ok else str(_BRIDGE_DEBUG_STATE.get("last_error_ts") or ""),
-        last_bridge_count=total_count,
-        last_processed=total_processed,
-        last_accepted=total_accepted,
-        last_response_keys=list(last_obj.keys()) if isinstance(last_obj, dict) else [],
-        last_lines_sample=[],
-        last_duration_ms=int((time.time() - t0) * 1000),
-        last_cursor="",
-        has_more=False,
-        events_received=int(_BRIDGE_DEBUG_STATE.get("events_received", 0) or 0) + total_processed,
-        events_ingested=int(_BRIDGE_DEBUG_STATE.get("events_ingested", 0) or 0) + total_accepted,
-        duplicates_dropped=int(_BRIDGE_DEBUG_STATE.get("duplicates_dropped", 0) or 0),
-        job_not_found=int(_BRIDGE_DEBUG_STATE.get("job_not_found", 0) or 0),
-        db_write_failures=int(_DB_WRITER_STATUS.get("failed", 0) or 0) + int(_DB_WRITER_STATUS.get("queue_full", 0) or 0),
-    )
-    return {
-        "ok": ok,
-        "processed": total_processed,
-        "accepted": total_accepted,
-        "count": total_count,
-        "batches": len(jobs),
-        "cursor": "",
-        "error": last_error,
-    }
+        return {
+            "ok": ok,
+            "processed": total_processed,
+            "accepted": total_accepted,
+            "count": total_count,
+            "batches": len(jobs),
+            "cursor": "",
+            "error": last_error,
+        }
+    finally:
+        _BRIDGE_POLL_CYCLE_LOCK.release()
 
 
 def _accounting_bridge_poller_thread():
@@ -11265,7 +11280,10 @@ def api_accounting_bridge_pull_once():
     """Manual pull from bridge endpoint (same processing path as periodic poller)."""
     if not _resolve_bridge_pull_url_runtime():
         return jsonify({"ok": False, "error": "bridge pull URL is not configured"}), 400
-    return jsonify(_poll_accounting_bridge_once())
+    result = _poll_accounting_bridge_once()
+    if not result.get("ok") and str(result.get("reason") or "") == "busy":
+        return jsonify(result), 409
+    return jsonify(result)
 
 
 @app.post("/start")

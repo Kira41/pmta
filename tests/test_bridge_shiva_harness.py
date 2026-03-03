@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -351,6 +352,100 @@ class BridgeShivaHarnessTests(unittest.TestCase):
             self.assertEqual(job.complained, 4)
         finally:
             shiva.bridge_get_json = old_bridge_get_json
+            shiva.PMTA_BRIDGE_PULL_PORT = old_port
+            if old_host is None:
+                os.environ.pop("SHIVA_HOST", None)
+            else:
+                os.environ["SHIVA_HOST"] = old_host
+
+    def test_poll_cycle_returns_busy_when_lock_is_held(self):
+        acquired = shiva._BRIDGE_POLL_CYCLE_LOCK.acquire(timeout=1.0)
+        self.assertTrue(acquired)
+        try:
+            result = shiva._poll_accounting_bridge_once()
+        finally:
+            shiva._BRIDGE_POLL_CYCLE_LOCK.release()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result.get("reason"), "busy")
+        self.assertEqual(result.get("error"), "busy")
+
+    def test_manual_bridge_pull_returns_busy_when_cycle_is_running(self):
+        client = shiva.app.test_client()
+        acquired = shiva._BRIDGE_POLL_CYCLE_LOCK.acquire(timeout=1.0)
+        self.assertTrue(acquired)
+        try:
+            resp = client.post("/api/accounting/bridge/pull")
+        finally:
+            shiva._BRIDGE_POLL_CYCLE_LOCK.release()
+
+        self.assertEqual(resp.status_code, 409)
+        body = resp.get_json()
+        self.assertEqual(body.get("ok"), False)
+        self.assertEqual(body.get("reason"), "busy")
+
+    def test_no_overlapping_poll_cycles(self):
+        old_fetch_outcomes = shiva.BRIDGE_POLL_FETCH_OUTCOMES
+        old_timeout = shiva.BRIDGE_TIMEOUT_S
+        old_host = os.environ.get("SHIVA_HOST")
+        old_port = shiva.PMTA_BRIDGE_PULL_PORT
+
+        active_calls = 0
+        max_active = 0
+        gate = threading.Event()
+        lock = threading.Lock()
+
+        def _fake_bridge_get_json(path, params):
+            nonlocal active_calls, max_active
+            with lock:
+                active_calls += 1
+                max_active = max(max_active, active_calls)
+            gate.wait(timeout=2.0)
+            with lock:
+                active_calls -= 1
+            return {
+                "ok": True,
+                "job_id": "abcdef123456",
+                "linked_emails_count": 1,
+                "delivered_count": 1,
+                "deferred_count": 0,
+                "bounced_count": 0,
+                "complained_count": 0,
+            }
+
+        try:
+            shiva.BRIDGE_POLL_FETCH_OUTCOMES = False
+            shiva.BRIDGE_TIMEOUT_S = 1.0
+            os.environ["SHIVA_HOST"] = "194.116.172.135"
+            shiva.PMTA_BRIDGE_PULL_PORT = 18090
+            self._prepare_job().smtp_host = "smtp.campaign.local"
+
+            old_bridge_get_json = shiva.bridge_get_json
+            shiva.bridge_get_json = _fake_bridge_get_json
+
+            results = []
+
+            def _run_poll():
+                results.append(shiva._poll_accounting_bridge_once())
+
+            t1 = threading.Thread(target=_run_poll)
+            t2 = threading.Thread(target=_run_poll)
+            t1.start()
+            time.sleep(0.05)
+            t2.start()
+            time.sleep(0.05)
+            gate.set()
+            t1.join(timeout=3.0)
+            t2.join(timeout=3.0)
+
+            self.assertEqual(len(results), 2)
+            busy = [r for r in results if r.get("reason") == "busy"]
+            self.assertEqual(len(busy), 1)
+            self.assertLessEqual(max_active, 1)
+        finally:
+            shiva.bridge_get_json = old_bridge_get_json
+            shiva.BRIDGE_POLL_FETCH_OUTCOMES = old_fetch_outcomes
+            shiva.BRIDGE_TIMEOUT_S = old_timeout
             shiva.PMTA_BRIDGE_PULL_PORT = old_port
             if old_host is None:
                 os.environ.pop("SHIVA_HOST", None)
