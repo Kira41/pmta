@@ -279,6 +279,7 @@ class SendJob:
     id: str
     created_at: str
     campaign_id: str = ""
+    pmta_job_id: str = ""
 
     # SMTP host used for this job (also used to derive PMTA monitor base URL)
     smtp_host: str = ""
@@ -1102,6 +1103,7 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
     return {
         "id": job.id,
         "campaign_id": job.campaign_id,
+        "pmta_job_id": job.pmta_job_id or "",
         "smtp_host": job.smtp_host or "",
         "pmta_live": job.pmta_live or {},
         "pmta_live_ts": job.pmta_live_ts or "",
@@ -1428,6 +1430,7 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
             return None
         job = SendJob(id=jid, created_at=str(s.get("created_at") or now_iso()))
         job.campaign_id = str(s.get("campaign_id") or "")
+        job.pmta_job_id = str(s.get("pmta_job_id") or jid)
         job.smtp_host = str(s.get("smtp_host") or "")
         job.pmta_live = (s.get("pmta_live") if isinstance(s.get("pmta_live"), dict) else {}) or {}
         job.pmta_live_ts = str(s.get("pmta_live_ts") or "")
@@ -7964,6 +7967,11 @@ try:
 except Exception:
     PMTA_BRIDGE_PULL_S = 5.0
 try:
+    BRIDGE_POLL_INTERVAL_S = float((os.getenv("BRIDGE_POLL_INTERVAL_S", str(PMTA_BRIDGE_PULL_S)) or str(PMTA_BRIDGE_PULL_S)).strip())
+except Exception:
+    BRIDGE_POLL_INTERVAL_S = float(PMTA_BRIDGE_PULL_S or 5.0)
+BRIDGE_POLL_FETCH_OUTCOMES = (os.getenv("BRIDGE_POLL_FETCH_OUTCOMES", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+try:
     PMTA_BRIDGE_PULL_MAX_LINES = int((os.getenv("PMTA_BRIDGE_PULL_MAX_LINES", "2000") or "2000").strip())
 except Exception:
     PMTA_BRIDGE_PULL_MAX_LINES = 2000
@@ -8693,7 +8701,28 @@ def _bridge_sync_job_outcomes(job_id: str, obj: dict) -> Dict[str, int]:
     return counts
 
 
+def _active_jobs_for_bridge_poll() -> List['SendJob']:
+    active_statuses = {"queued", "running", "backoff", "paused"}
+    with JOBS_LOCK:
+        jobs = [
+            j for j in JOBS.values()
+            if not getattr(j, "deleted", False)
+            and str(getattr(j, "status", "") or "").strip().lower() in active_statuses
+        ]
+    jobs.sort(key=lambda x: str(x.created_at or ""), reverse=True)
+    return jobs
+
+
+def _job_pmta_job_id(job: 'SendJob') -> str:
+    pmta_job_id = str(getattr(job, "pmta_job_id", "") or "").strip().lower()
+    if pmta_job_id:
+        return pmta_job_id
+    fallback = str(getattr(job, "id", "") or "").strip().lower()
+    return fallback
+
+
 def _poll_accounting_bridge_once() -> dict:
+    logger = logging.getLogger("shiva")
     t0 = time.time()
     poll_ts = now_iso()
     _bridge_debug_update(last_poll_time=poll_ts)
@@ -8706,51 +8735,50 @@ def _poll_accounting_bridge_once() -> dict:
             attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
             last_ok=False,
             connected=False,
+            failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + 1,
+            last_error_ts=now_iso(),
             last_error="bridge_base_url_not_configured",
             last_duration_ms=int((time.time() - t0) * 1000),
         )
         return {"ok": False, "error": "bridge_base_url_not_configured", "processed": 0, "accepted": 0}
 
     headers = {"Accept": "application/json"}
-
-    with JOBS_LOCK:
-        jobs = [j for j in JOBS.values() if not getattr(j, "deleted", False)]
-    jobs.sort(key=lambda x: str(x.created_at or ""), reverse=True)
+    jobs = _active_jobs_for_bridge_poll()
 
     total_processed = 0
     total_accepted = 0
     total_count = 0
-    batches = len(jobs)
     last_obj: Any = {}
+    last_error = ""
+
     for job in jobs:
-        jid = str(getattr(job, "id", "") or "").strip().lower()
+        jid = _job_pmta_job_id(job)
         if not jid:
             continue
 
+        total_processed += 1
         count_url = f"{base_url}{PMTA_BRIDGE_JOB_COUNT_PATH}?job_id={quote_plus(jid)}"
         count_obj, count_error = _bridge_fetch_json(count_url, headers)
-        if count_error is not None or not count_obj:
-            _bridge_debug_update(
-                last_attempt_ts=now_iso(),
-                attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
-                last_ok=False,
-                connected=False,
-                failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + 1,
-                last_error_ts=now_iso(),
-                last_error=f"bridge_request_failed: {count_error} (url={count_url})",
-                last_duration_ms=int((time.time() - t0) * 1000),
-            )
-            return {"ok": False, "error": f"bridge_request_failed: {count_error} (url={count_url})", "processed": total_processed, "accepted": total_accepted}
+        if count_error is not None or not isinstance(count_obj, dict):
+            err_msg = f"bridge_count_failed job_id={jid} error={count_error}"
+            logger.exception(err_msg) if count_error is not None else logger.error(err_msg)
+            last_error = err_msg
+            continue
 
-        outcomes_url = f"{base_url}{PMTA_BRIDGE_JOB_OUTCOMES_PATH}?job_id={quote_plus(jid)}"
-        outcomes_obj, outcomes_error = _bridge_fetch_json(outcomes_url, headers)
+        outcomes_obj: Optional[dict] = None
+        outcomes_error: Optional[Exception] = None
+        if BRIDGE_POLL_FETCH_OUTCOMES:
+            outcomes_url = f"{base_url}{PMTA_BRIDGE_JOB_OUTCOMES_PATH}?job_id={quote_plus(jid)}"
+            outcomes_obj, outcomes_error = _bridge_fetch_json(outcomes_url, headers)
+            if outcomes_error is not None:
+                logger.warning("Bridge outcomes fetch failed for job_id=%s: %s", jid, outcomes_error)
 
         delivered = int(count_obj.get("delivered_count") or 0)
         deferred = int(count_obj.get("deferred_count") or 0)
         bounced = int(count_obj.get("bounced_count") or 0)
         complained = int(count_obj.get("complained_count") or 0)
 
-        if outcomes_obj and outcomes_error is None:
+        if BRIDGE_POLL_FETCH_OUTCOMES and outcomes_obj and outcomes_error is None:
             try:
                 synced = _bridge_sync_job_outcomes(jid, outcomes_obj)
                 delivered = int(synced.get("delivered") or delivered)
@@ -8758,10 +8786,10 @@ def _poll_accounting_bridge_once() -> dict:
                 bounced = int(synced.get("bounced") or bounced)
                 complained = int(synced.get("complained") or complained)
             except Exception:
-                pass
+                logger.exception("Bridge outcome sync failed for job_id=%s", jid)
 
         with JOBS_LOCK:
-            live_job = JOBS.get(jid)
+            live_job = JOBS.get(str(getattr(job, "id", "") or "").strip().lower())
             if live_job and not getattr(live_job, "deleted", False):
                 live_job.delivered = delivered
                 live_job.deferred = deferred
@@ -8770,25 +8798,22 @@ def _poll_accounting_bridge_once() -> dict:
                 live_job.accounting_last_ts = now_iso()
                 live_job.maybe_persist()
 
-        total_processed += 1
         total_accepted += 1
         total_count += int(count_obj.get("linked_emails_count") or 0)
         last_obj = count_obj
 
-        if outcomes_error is not None:
-            logging.getLogger("shiva").warning(
-                "Bridge outcomes fetch failed for job_id=%s: %s", jid, outcomes_error
-            )
-
+    ok = (last_error == "")
     _bridge_debug_update(
         last_poll_time=poll_ts,
         last_attempt_ts=now_iso(),
-        last_success_ts=now_iso(),
+        last_success_ts=now_iso() if ok else str(_BRIDGE_DEBUG_STATE.get("last_success_ts") or ""),
         attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
-        success_count=int(_BRIDGE_DEBUG_STATE.get("success_count", 0)) + 1,
-        last_ok=True,
-        connected=True,
-        last_error="",
+        success_count=int(_BRIDGE_DEBUG_STATE.get("success_count", 0)) + (1 if ok else 0),
+        failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + (0 if ok else 1),
+        last_ok=ok,
+        connected=ok,
+        last_error=last_error,
+        last_error_ts=now_iso() if not ok else str(_BRIDGE_DEBUG_STATE.get("last_error_ts") or ""),
         last_bridge_count=total_count,
         last_processed=total_processed,
         last_accepted=total_accepted,
@@ -8804,22 +8829,24 @@ def _poll_accounting_bridge_once() -> dict:
         db_write_failures=int(_DB_WRITER_STATUS.get("failed", 0) or 0) + int(_DB_WRITER_STATUS.get("queue_full", 0) or 0),
     )
     return {
-        "ok": True,
+        "ok": ok,
         "processed": total_processed,
         "accepted": total_accepted,
         "count": total_count,
-        "batches": batches,
+        "batches": len(jobs),
         "cursor": "",
+        "error": last_error,
     }
 
 
 def _accounting_bridge_poller_thread():
+    logger = logging.getLogger("shiva")
     while True:
         try:
             _poll_accounting_bridge_once()
         except Exception:
-            pass
-        time.sleep(max(1.0, float(PMTA_BRIDGE_PULL_S or 5.0)))
+            logger.exception("Bridge polling loop failed; continuing")
+        time.sleep(max(1.0, float(BRIDGE_POLL_INTERVAL_S or PMTA_BRIDGE_PULL_S or 5.0)))
 
 
 def start_accounting_bridge_poller_if_needed():
@@ -9937,7 +9964,11 @@ APP_CONFIG_SCHEMA: List[dict] = [
     {"key": "PMTA_BRIDGE_PULL_PORT", "type": "int", "default": "8090", "group": "Accounting", "restart_required": False,
      "desc": "Bridge port used by Shiva when building /api/v1/pull/latest URL from campaign SMTP host."},
     {"key": "PMTA_BRIDGE_PULL_S", "type": "float", "default": "5", "group": "Accounting", "restart_required": False,
-     "desc": "Polling interval (seconds) for Shiva bridge pull thread."},
+     "desc": "Legacy polling interval (seconds) for Shiva bridge pull thread."},
+    {"key": "BRIDGE_POLL_INTERVAL_S", "type": "float", "default": "5", "group": "Accounting", "restart_required": False,
+     "desc": "Polling interval (seconds) for Shiva bridge job poller loop."},
+    {"key": "BRIDGE_POLL_FETCH_OUTCOMES", "type": "bool", "default": "1", "group": "Accounting", "restart_required": False,
+     "desc": "If enabled, Shiva also fetches /api/v1/job/outcomes for each active job poll cycle."},
     {"key": "PMTA_BRIDGE_PULL_MAX_LINES", "type": "int", "default": "2000", "group": "Accounting", "restart_required": False,
      "desc": "max_lines query used when Shiva pulls from bridge endpoint."},
 
@@ -10068,6 +10099,7 @@ def reload_runtime_config() -> dict:
         global PMTA_DOMAIN_STATS, PMTA_DOMAINS_POLL_S, PMTA_DOMAINS_TOP_N
         global OPENROUTER_ENDPOINT, OPENROUTER_MODEL, OPENROUTER_TIMEOUT_S
         global PMTA_BRIDGE_PULL_ENABLED, PMTA_BRIDGE_PULL_PORT, PMTA_BRIDGE_PULL_S, PMTA_BRIDGE_PULL_MAX_LINES
+        global BRIDGE_POLL_INTERVAL_S, BRIDGE_POLL_FETCH_OUTCOMES
 
         # Spam
         SPAMCHECK_BACKEND = (cfg_get_str("SPAMCHECK_BACKEND", "spamd") or "spamd").strip().lower()
@@ -10127,6 +10159,8 @@ def reload_runtime_config() -> dict:
         PMTA_BRIDGE_PULL_ENABLED = bool(cfg_get_bool("PMTA_BRIDGE_PULL_ENABLED", bool(PMTA_BRIDGE_PULL_ENABLED)))
         PMTA_BRIDGE_PULL_PORT = int(cfg_get_int("PMTA_BRIDGE_PULL_PORT", int(PMTA_BRIDGE_PULL_PORT or 8090)))
         PMTA_BRIDGE_PULL_S = float(cfg_get_float("PMTA_BRIDGE_PULL_S", float(PMTA_BRIDGE_PULL_S or 5.0)))
+        BRIDGE_POLL_INTERVAL_S = float(cfg_get_float("BRIDGE_POLL_INTERVAL_S", float(PMTA_BRIDGE_PULL_S or BRIDGE_POLL_INTERVAL_S or 5.0)))
+        BRIDGE_POLL_FETCH_OUTCOMES = bool(cfg_get_bool("BRIDGE_POLL_FETCH_OUTCOMES", bool(BRIDGE_POLL_FETCH_OUTCOMES)))
         PMTA_BRIDGE_PULL_MAX_LINES = int(cfg_get_int("PMTA_BRIDGE_PULL_MAX_LINES", int(PMTA_BRIDGE_PULL_MAX_LINES or 2000)))
 
         # If bridge pull gets enabled/configured from UI after startup, ensure poller thread is running.
@@ -11122,7 +11156,7 @@ def api_accounting_bridge_status():
     with _BRIDGE_DEBUG_LOCK:
         state = dict(_BRIDGE_DEBUG_STATE)
     state["pull_enabled"] = bool(PMTA_BRIDGE_PULL_ENABLED)
-    state["pull_interval_s"] = float(PMTA_BRIDGE_PULL_S or 0)
+    state["pull_interval_s"] = float(BRIDGE_POLL_INTERVAL_S or PMTA_BRIDGE_PULL_S or 0)
     state["pull_max_lines"] = int(PMTA_BRIDGE_PULL_MAX_LINES or 0)
     runtime_url = _resolve_bridge_pull_url_runtime()
     state["pull_url"] = runtime_url
@@ -11410,6 +11444,7 @@ def start():
         created_at=now_iso(),
         updated_at=now_iso(),
         campaign_id=campaign_id,
+        pmta_job_id=job_id,
         smtp_host=smtp_host,
         total=len(valid),
         invalid=len(invalid),
