@@ -259,6 +259,117 @@ curl -sk "https://<PMTA_IP>:8080/queues?format=json"
 curl -s "http://127.0.0.1:5000/api/config/runtime" | jq '.PMTA_MONITOR_BASE_URL,.PMTA_MONITOR_SCHEME,.PMTA_HEALTH_REQUIRED,.PMTA_QUEUE_BACKOFF,.ENABLE_BACKOFF'
 ```
 
+---
+
+## 5) Bridge ↔ Shiva Count Verification Procedure (No Duplication)
+
+هذا الإجراء يثبت أن العدّادات بين Bridge وShiva متطابقة 1:1، وأن إعادة التشغيل لا تسبب تضخّم بسبب polling المتكرر.
+
+### متطلبات قبل التنفيذ
+
+- عيّن القيم التالية حسب بيئتك:
+
+```bash
+export BRIDGE_BASE_URL="http://<bridge-host>:<bridge-port>"
+export PMTA_JOB_ID="<pmta_job_id>"
+export SHIVA_STATUS_URL="http://<shiva-host>:<shiva-port>/api/accounting/bridge/status"
+```
+
+### 1) استدعاء Bridge مباشرةً (source of truth)
+
+```bash
+curl -s "${BRIDGE_BASE_URL}/api/v1/job/count?job_id=${PMTA_JOB_ID}" | jq
+```
+
+المتوقّع:
+- الاستجابة تنجح (`ok=true` أو HTTP 200).
+- استخرج قيم العدّ الأساسية من Bridge (مثل totals/linked_emails_count/outcomes per status).
+
+### 2) استدعاء Shiva bridge status
+
+```bash
+curl -s "${SHIVA_STATUS_URL}" | jq
+```
+
+المتوقّع:
+- endpoint يعمل بدون أخطاء.
+- توجد حقول العدّ لنفس job/نفس outcomes المراد مقارنتها مع Bridge.
+
+### 3) مقارنة العدّادات (1:1)
+
+نفّذ نفس الاستعلامين أكثر من مرة وقارن يدويًا أو عبر سكربت:
+
+```bash
+BRIDGE_JSON="$(curl -s "${BRIDGE_BASE_URL}/api/v1/job/count?job_id=${PMTA_JOB_ID}")"
+SHIVA_JSON="$(curl -s "${SHIVA_STATUS_URL}")"
+
+echo "Bridge:" && echo "$BRIDGE_JSON" | jq
+echo "Shiva :" && echo "$SHIVA_JSON" | jq
+```
+
+المقارنة المطلوبة:
+- كل count يقابله نفس الرقم في Shiva (تطابق كامل 1:1).
+- لا يوجد فرق موجب/سالب بين أي عدّادين متناظرين.
+
+### 4) إذا outcomes sync مفعّل
+
+تحقّق من القواعد التالية:
+
+1. **Unique recipients في Shiva outcomes** = `linked_emails_count` في Bridge.
+2. عند اكتمال المزامنة بالكامل:
+   - `Delivered + Bounced + Deferred + Complained = linked_emails_count`.
+
+مثال تحقق سريع (استبدل المسارات حسب شكل JSON الفعلي):
+
+```bash
+# مثال pseudo-check: عدّل jq paths حسب شكل الاستجابة
+echo "$BRIDGE_JSON" | jq '{linked_emails_count: .linked_emails_count, delivered: .delivered, bounced: .bounced, deferred: .deferred, complained: .complained}'
+echo "$SHIVA_JSON"  | jq '{unique_recipients: .unique_recipients, delivered: .delivered, bounced: .bounced, deferred: .deferred, complained: .complained}'
+```
+
+### 5) إعادة تشغيل Shiva ثم التحقق مجددًا
+
+```bash
+# systemd مثال
+sudo systemctl restart shiva
+sleep 5
+
+# أو docker مثال
+# docker restart shiva
+# sleep 5
+
+curl -s "${SHIVA_STATUS_URL}" | jq
+curl -s "${BRIDGE_BASE_URL}/api/v1/job/count?job_id=${PMTA_JOB_ID}" | jq
+```
+
+المتوقّع بعد إعادة التشغيل:
+- القيم تبقى صحيحة ومتطابقة مع Bridge.
+- الاستهلاك يستكمل بشكل طبيعي بدون تضخيم أرقام.
+
+### 6) اختبار عدم التضخيم بسبب polling المتكرر
+
+نفّذ polling متكرر ثم أعد المقارنة:
+
+```bash
+for i in {1..10}; do
+  curl -s "${SHIVA_STATUS_URL}" >/dev/null
+  sleep 1
+done
+
+curl -s "${SHIVA_STATUS_URL}" | jq
+curl -s "${BRIDGE_BASE_URL}/api/v1/job/count?job_id=${PMTA_JOB_ID}" | jq
+```
+
+المعيار المقبول:
+- **No duplication inflation**: لا زيادة غير منطقية في counts بسبب تكرار polling فقط.
+- الفروقات الوحيدة المقبولة هي وصول أحداث جديدة فعلية من PMTA، وليس إعادة احتساب لنفس الأحداث.
+
+### Acceptance Criteria
+
+- Counts متطابقة تمامًا بين Shiva وBridge.
+- التطابق يستمر بعد إعادة التشغيل.
+- لا يوجد تضخيم في الأرقام نتيجة polling المتكرر.
+
 لو (1) أو (2) فشلوا، المشكلة من PMTA monitor access / scheme / api-key.  
 لو نجحوا لكن dashboard لا يعكس الأخطاء، المشكلة غالبًا من قيم backoff أو من runtime config غير معمولة لها reload.
 
