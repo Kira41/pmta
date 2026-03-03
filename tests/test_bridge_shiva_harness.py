@@ -326,9 +326,20 @@ class BridgeShivaHarnessTests(unittest.TestCase):
         old_port = shiva.PMTA_BRIDGE_PULL_PORT
         old_host = os.environ.get("SHIVA_HOST")
 
+        ok_payload = {
+            "linked_emails_count": 22,
+            "delivered_count": 7,
+            "deferred_count": 6,
+            "bounced_count": 5,
+            "complained_count": 4,
+        }
+        mode = {"fail": False}
+
         def _fake_bridge_get_json(path, params):
             if path == "/api/v1/job/count":
-                raise RuntimeError("bridge unreachable")
+                if mode["fail"]:
+                    raise RuntimeError("bridge unreachable")
+                return dict(ok_payload)
             raise AssertionError("unexpected path: {}".format(path))
 
         try:
@@ -336,13 +347,23 @@ class BridgeShivaHarnessTests(unittest.TestCase):
             shiva.PMTA_BRIDGE_PULL_PORT = 18090
             job = self._prepare_job()
             job.smtp_host = "smtp.campaign.local"
-            job.delivered = 7
-            job.deferred = 6
-            job.bounced = 5
-            job.complained = 4
 
             old_bridge_get_json = shiva.bridge_get_json
             shiva.bridge_get_json = _fake_bridge_get_json
+
+            first = shiva._poll_accounting_bridge_once()
+            self.assertTrue(first["ok"])
+            self.assertEqual(job.delivered, 7)
+            self.assertEqual(job.deferred, 6)
+            self.assertEqual(job.bounced, 5)
+            self.assertEqual(job.complained, 4)
+
+            first_debug_count = int(shiva._BRIDGE_DEBUG_STATE.get("last_bridge_count") or 0)
+            first_ok_ts = str(shiva._BRIDGE_DEBUG_STATE.get("last_ok_ts") or "")
+            self.assertEqual(first_debug_count, 22)
+            self.assertTrue(first_ok_ts)
+
+            mode["fail"] = True
             result = shiva._poll_accounting_bridge_once()
 
             self.assertFalse(result["ok"])
@@ -350,6 +371,10 @@ class BridgeShivaHarnessTests(unittest.TestCase):
             self.assertEqual(job.deferred, 6)
             self.assertEqual(job.bounced, 5)
             self.assertEqual(job.complained, 4)
+            self.assertEqual(int(shiva._BRIDGE_DEBUG_STATE.get("last_bridge_count") or 0), 22)
+            self.assertEqual(str(shiva._BRIDGE_DEBUG_STATE.get("last_ok_ts") or ""), first_ok_ts)
+            self.assertTrue(str(shiva._BRIDGE_DEBUG_STATE.get("last_error_ts") or ""))
+            self.assertIn("bridge unreachable", str(shiva._BRIDGE_DEBUG_STATE.get("last_error_message") or ""))
         finally:
             shiva.bridge_get_json = old_bridge_get_json
             shiva.PMTA_BRIDGE_PULL_PORT = old_port

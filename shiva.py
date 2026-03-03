@@ -7992,6 +7992,9 @@ _BRIDGE_DEBUG_STATE: Dict[str, Any] = {
     "last_http_ok": False,
     "last_http_status": None,
     "last_duration_ms": 0,
+    "last_latency_ms": 0,
+    "last_ok_ts": "",
+    "last_error_message": "",
     "last_response_keys": [],
     "last_bridge_count": 0,
     "last_processed": 0,
@@ -8632,6 +8635,7 @@ def _bridge_fetch_json(req_url: str, headers: Dict[str, str], max_request_attemp
     request_error: Optional[Exception] = None
     for attempt in range(1, max_request_attempts + 1):
         _bridge_debug_update(last_req_url=req_url)
+        req_t0 = time.time()
         try:
             parsed = urlsplit(req_url)
             if parsed.scheme and parsed.scheme.lower() != "http":
@@ -8652,12 +8656,20 @@ def _bridge_fetch_json(req_url: str, headers: Dict[str, str], max_request_attemp
                 else:
                     params[k] = v
             obj = bridge_get_json(parsed.path or "/", params)
-            _bridge_debug_update(last_http_ok=True, last_http_status=200)
+            _bridge_debug_update(
+                last_http_ok=True,
+                last_http_status=200,
+                last_latency_ms=int((time.time() - req_t0) * 1000),
+            )
             request_error = None
             return obj, None
         except Exception as e:
             request_error = e
-            _bridge_debug_update(last_http_ok=False)
+            _bridge_debug_update(
+                last_http_ok=False,
+                last_error_message=str(e),
+                last_error_ts=now_iso(),
+            )
         if attempt < max_request_attempts:
             time.sleep(min(1.0 * attempt, 2.0))
     return None, request_error
@@ -8898,30 +8910,45 @@ def _poll_accounting_bridge_once() -> dict:
             last_obj = count_obj
 
         ok = (last_error == "")
-        _bridge_debug_update(
-            last_attempt_ts=now_iso(),
-            last_success_ts=now_iso() if ok else str(_BRIDGE_DEBUG_STATE.get("last_success_ts") or ""),
-            attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
-            success_count=int(_BRIDGE_DEBUG_STATE.get("success_count", 0)) + (1 if ok else 0),
-            failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + (0 if ok else 1),
-            last_ok=ok,
-            connected=ok,
-            last_error=last_error,
-            last_error_ts=now_iso() if not ok else str(_BRIDGE_DEBUG_STATE.get("last_error_ts") or ""),
-            last_bridge_count=total_count,
-            last_processed=total_processed,
-            last_accepted=total_accepted,
-            last_response_keys=list(last_obj.keys()) if isinstance(last_obj, dict) else [],
-            last_lines_sample=[],
-            last_duration_ms=int((time.time() - t0) * 1000),
-            last_cursor="",
-            has_more=False,
-            events_received=int(_BRIDGE_DEBUG_STATE.get("events_received", 0) or 0) + total_processed,
-            events_ingested=int(_BRIDGE_DEBUG_STATE.get("events_ingested", 0) or 0) + total_accepted,
-            duplicates_dropped=int(_BRIDGE_DEBUG_STATE.get("duplicates_dropped", 0) or 0),
-            job_not_found=int(_BRIDGE_DEBUG_STATE.get("job_not_found", 0) or 0),
-            db_write_failures=int(_DB_WRITER_STATUS.get("failed", 0) or 0) + int(_DB_WRITER_STATUS.get("queue_full", 0) or 0),
-        )
+        prev_state = dict(_BRIDGE_DEBUG_STATE)
+        debug_payload: Dict[str, Any] = {
+            "last_attempt_ts": now_iso(),
+            "last_success_ts": now_iso() if ok else str(_BRIDGE_DEBUG_STATE.get("last_success_ts") or ""),
+            "attempts": int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
+            "success_count": int(_BRIDGE_DEBUG_STATE.get("success_count", 0)) + (1 if ok else 0),
+            "failure_count": int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + (0 if ok else 1),
+            "last_ok": ok,
+            "connected": ok,
+            "last_error": last_error,
+            "last_error_message": last_error,
+            "last_error_ts": now_iso() if not ok else str(_BRIDGE_DEBUG_STATE.get("last_error_ts") or ""),
+            "last_ok_ts": now_iso() if ok else str(_BRIDGE_DEBUG_STATE.get("last_ok_ts") or ""),
+            "last_lines_sample": [],
+            "last_duration_ms": int((time.time() - t0) * 1000),
+            "last_cursor": "",
+            "has_more": False,
+            "events_received": int(_BRIDGE_DEBUG_STATE.get("events_received", 0) or 0) + total_processed,
+            "events_ingested": int(_BRIDGE_DEBUG_STATE.get("events_ingested", 0) or 0) + total_accepted,
+            "duplicates_dropped": int(_BRIDGE_DEBUG_STATE.get("duplicates_dropped", 0) or 0),
+            "job_not_found": int(_BRIDGE_DEBUG_STATE.get("job_not_found", 0) or 0),
+            "db_write_failures": int(_DB_WRITER_STATUS.get("failed", 0) or 0) + int(_DB_WRITER_STATUS.get("queue_full", 0) or 0),
+        }
+        if ok:
+            debug_payload.update(
+                last_bridge_count=total_count,
+                last_processed=total_processed,
+                last_accepted=total_accepted,
+                last_response_keys=list(last_obj.keys()) if isinstance(last_obj, dict) else [],
+            )
+        else:
+            debug_payload.update(
+                last_bridge_count=int(prev_state.get("last_bridge_count", 0) or 0),
+                last_processed=int(prev_state.get("last_processed", 0) or 0),
+                last_accepted=int(prev_state.get("last_accepted", 0) or 0),
+                last_response_keys=list(prev_state.get("last_response_keys") or []),
+            )
+
+        _bridge_debug_update(**debug_payload)
         return {
             "ok": ok,
             "processed": total_processed,
