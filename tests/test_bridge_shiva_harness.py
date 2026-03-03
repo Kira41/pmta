@@ -98,8 +98,10 @@ class BridgeShivaHarnessTests(unittest.TestCase):
         old_host = os.environ.get("SHIVA_HOST")
         old_port = shiva.PMTA_BRIDGE_PULL_PORT
         old_limit = shiva.PMTA_BRIDGE_PULL_MAX_LINES
+        old_mode = shiva.BRIDGE_MODE
         try:
             os.environ["SHIVA_HOST"] = "194.116.172.135"
+            shiva.BRIDGE_MODE = "legacy"
             shiva.PMTA_BRIDGE_PULL_PORT = 18090
             shiva.PMTA_BRIDGE_PULL_MAX_LINES = 1234
             self._prepare_job(job_id="abcabc123456").smtp_host = "smtp.campaign.local"
@@ -109,12 +111,25 @@ class BridgeShivaHarnessTests(unittest.TestCase):
                 "http://smtp.campaign.local:18090/api/v1/pull?kinds=acct&limit=1234",
             )
         finally:
+            shiva.BRIDGE_MODE = old_mode
             shiva.PMTA_BRIDGE_PULL_PORT = old_port
             shiva.PMTA_BRIDGE_PULL_MAX_LINES = old_limit
             if old_host is None:
                 os.environ.pop("SHIVA_HOST", None)
             else:
                 os.environ["SHIVA_HOST"] = old_host
+
+    def test_bridge_counts_mode_disables_legacy_pull_components(self):
+        old_mode = shiva.BRIDGE_MODE
+        try:
+            shiva.BRIDGE_MODE = "counts"
+            self.assertEqual(shiva._resolve_bridge_pull_url_runtime(), "")
+            self.assertEqual(shiva._normalize_bridge_pull_urls("http://bridge/api/v1/pull"), [])
+            self.assertEqual(shiva._db_get_bridge_cursor(), "")
+            shiva._db_set_bridge_cursor("cursor-will-be-ignored")
+            self.assertEqual(shiva._db_get_bridge_cursor(), "")
+        finally:
+            shiva.BRIDGE_MODE = old_mode
 
 
 
@@ -396,12 +411,15 @@ class BridgeShivaHarnessTests(unittest.TestCase):
         self.assertEqual(result.get("error"), "busy")
 
     def test_manual_bridge_pull_returns_busy_when_cycle_is_running(self):
+        old_mode = shiva.BRIDGE_MODE
         client = shiva.app.test_client()
         acquired = shiva._BRIDGE_POLL_CYCLE_LOCK.acquire(timeout=1.0)
         self.assertTrue(acquired)
         try:
+            shiva.BRIDGE_MODE = "counts"
             resp = client.post("/api/accounting/bridge/pull")
         finally:
+            shiva.BRIDGE_MODE = old_mode
             shiva._BRIDGE_POLL_CYCLE_LOCK.release()
 
         self.assertEqual(resp.status_code, 409)
