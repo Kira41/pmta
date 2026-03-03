@@ -477,6 +477,94 @@ class BridgeShivaHarnessTests(unittest.TestCase):
             else:
                 os.environ["SHIVA_HOST"] = old_host
 
+    def test_bridge_status_endpoint_exposes_lightweight_fields(self):
+        client = shiva.app.test_client()
+        job = self._prepare_job()
+        job.smtp_host = "smtp.campaign.local"
+        job.delivered = 2
+        job.deferred = 1
+        job.bounced = 1
+        job.complained = 0
+        job.accounting_last_ts = "2026-01-01T00:00:00Z"
+
+        with shiva._BRIDGE_DEBUG_LOCK:
+            shiva._BRIDGE_DEBUG_STATE["last_ok_ts"] = "2026-01-01T01:00:00Z"
+            shiva._BRIDGE_DEBUG_STATE["last_error_ts"] = "2026-01-01T01:05:00Z"
+            shiva._BRIDGE_DEBUG_STATE["last_error_message"] = "sample-error"
+
+        resp = client.get("/api/accounting/bridge/status")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+
+        self.assertTrue(body.get("ok"))
+        self.assertIn("bridge_base_url", body)
+        self.assertIn("poll_interval", body)
+        self.assertIn("timeout", body)
+        self.assertEqual(body.get("last_ok_ts"), "2026-01-01T01:00:00Z")
+        self.assertEqual(body.get("last_error_ts"), "2026-01-01T01:05:00Z")
+        self.assertEqual(body.get("last_error_message"), "sample-error")
+
+        jobs = body.get("jobs") or []
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].get("pmta_job_id"), "abcdef123456")
+        self.assertEqual(jobs[0].get("counts", {}).get("delivered_count"), 2)
+        self.assertEqual(jobs[0].get("last_update_time"), "2026-01-01T00:00:00Z")
+        self.assertIn("outcomes_sync_enabled", jobs[0])
+
+    def test_manual_bridge_pull_response_has_job_totals_and_per_job_details(self):
+        old_port = shiva.PMTA_BRIDGE_PULL_PORT
+        old_host = os.environ.get("SHIVA_HOST")
+        old_fetch_outcomes = shiva.BRIDGE_POLL_FETCH_OUTCOMES
+
+        def _fake_bridge_get_json(path, params):
+            job_id = str((params or {}).get("job_id") or "")
+            if path == "/api/v1/job/count" and job_id == "abcdef123456":
+                return {
+                    "ok": True,
+                    "job_id": job_id,
+                    "linked_emails_count": 2,
+                    "delivered_count": 1,
+                    "deferred_count": 1,
+                    "bounced_count": 0,
+                    "complained_count": 0,
+                }
+            if path == "/api/v1/job/count" and job_id == "deadbeef0001":
+                raise RuntimeError("boom")
+            raise AssertionError("unexpected path: {} params={}".format(path, params))
+
+        try:
+            os.environ["SHIVA_HOST"] = "194.116.172.135"
+            shiva.PMTA_BRIDGE_PULL_PORT = 18090
+            shiva.BRIDGE_POLL_FETCH_OUTCOMES = False
+            self._prepare_job("abcdef123456").smtp_host = "smtp.campaign.local"
+            self._prepare_job("deadbeef0001").smtp_host = "smtp.campaign.local"
+
+            old_bridge_get_json = shiva.bridge_get_json
+            shiva.bridge_get_json = _fake_bridge_get_json
+
+            client = shiva.app.test_client()
+            resp = client.post("/api/accounting/bridge/pull")
+
+            self.assertEqual(resp.status_code, 200)
+            body = resp.get_json()
+            self.assertEqual(body.get("jobs_total"), 2)
+            self.assertEqual(body.get("jobs_success"), 1)
+            self.assertEqual(body.get("jobs_failed"), 1)
+            self.assertEqual(len(body.get("jobs") or []), 2)
+
+            ok_rows = [r for r in (body.get("jobs") or []) if r.get("pmta_job_id") == "abcdef123456"]
+            fail_rows = [r for r in (body.get("jobs") or []) if r.get("pmta_job_id") == "deadbeef0001"]
+            self.assertEqual(ok_rows[0].get("counts", {}).get("linked_emails_count"), 2)
+            self.assertIn("error", fail_rows[0])
+        finally:
+            shiva.bridge_get_json = old_bridge_get_json
+            shiva.BRIDGE_POLL_FETCH_OUTCOMES = old_fetch_outcomes
+            shiva.PMTA_BRIDGE_PULL_PORT = old_port
+            if old_host is None:
+                os.environ.pop("SHIVA_HOST", None)
+            else:
+                os.environ["SHIVA_HOST"] = old_host
+
     def test_bridge_row_parser_accepts_json_and_rejects_csv_strings(self):
         self.assertEqual(
             shiva._parse_bridge_json_row({"type": "d", "rcpt": "x@example.com"}),

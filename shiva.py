@@ -8837,6 +8837,10 @@ def _poll_accounting_bridge_once() -> dict:
             "accepted": 0,
             "count": 0,
             "batches": 0,
+            "jobs_total": 0,
+            "jobs_success": 0,
+            "jobs_failed": 0,
+            "jobs": [],
             "cursor": "",
         }
 
@@ -8869,6 +8873,9 @@ def _poll_accounting_bridge_once() -> dict:
         total_count = 0
         last_obj: Any = {}
         last_error = ""
+        job_results: List[Dict[str, Any]] = []
+        jobs_success = 0
+        jobs_failed = 0
 
         for job in jobs:
             jid = _job_pmta_job_id(job)
@@ -8876,12 +8883,19 @@ def _poll_accounting_bridge_once() -> dict:
                 continue
 
             total_processed += 1
+            job_result: Dict[str, Any] = {
+                "pmta_job_id": jid,
+                "outcomes_sync_enabled": bool(BRIDGE_POLL_FETCH_OUTCOMES),
+            }
             count_url = f"{base_url}{PMTA_BRIDGE_JOB_COUNT_PATH}?job_id={quote_plus(jid)}"
             count_obj, count_error = _bridge_fetch_json(count_url, headers)
             if count_error is not None or not isinstance(count_obj, dict):
                 err_msg = f"bridge_count_failed job_id={jid} error={count_error}"
                 logger.exception(err_msg) if count_error is not None else logger.error(err_msg)
                 last_error = err_msg
+                jobs_failed += 1
+                job_result["error"] = str(count_error or "bridge_count_failed")
+                job_results.append(job_result)
                 continue
 
             outcomes_obj: Optional[dict] = None
@@ -8891,6 +8905,7 @@ def _poll_accounting_bridge_once() -> dict:
                 outcomes_obj, outcomes_error = _bridge_fetch_json(outcomes_url, headers)
                 if outcomes_error is not None:
                     logger.warning("Bridge outcomes fetch failed for job_id=%s: %s", jid, outcomes_error)
+                    job_result["outcomes_sync_error"] = str(outcomes_error)
 
             if BRIDGE_POLL_FETCH_OUTCOMES and outcomes_obj and outcomes_error is None:
                 try:
@@ -8908,6 +8923,16 @@ def _poll_accounting_bridge_once() -> dict:
             total_accepted += 1
             total_count += int(linked_count)
             last_obj = count_obj
+            jobs_success += 1
+            job_result["counts"] = {
+                "linked_emails_count": int(linked_count),
+                "delivered_count": int(count_obj.get("delivered_count") or 0),
+                "deferred_count": int(count_obj.get("deferred_count") or 0),
+                "bounced_count": int(count_obj.get("bounced_count") or 0),
+                "complained_count": int(count_obj.get("complained_count") or 0),
+            }
+            job_result["updated_at"] = now_iso()
+            job_results.append(job_result)
 
         ok = (last_error == "")
         prev_state = dict(_BRIDGE_DEBUG_STATE)
@@ -8955,6 +8980,10 @@ def _poll_accounting_bridge_once() -> dict:
             "accepted": total_accepted,
             "count": total_count,
             "batches": len(jobs),
+            "jobs_total": len(jobs),
+            "jobs_success": jobs_success,
+            "jobs_failed": jobs_failed,
+            "jobs": job_results,
             "cursor": "",
             "error": last_error,
         }
@@ -11275,31 +11304,50 @@ def api_preflight():
 
 @app.get("/api/accounting/bridge/status")
 def api_accounting_bridge_status():
-    """Expose latest bridge polling diagnostics for browser console debugging."""
+    """Expose lightweight bridge polling health and per-job accounting snapshots."""
     with _BRIDGE_DEBUG_LOCK:
         state = dict(_BRIDGE_DEBUG_STATE)
+    base_url = _resolve_bridge_base_url_runtime()
+    poll_interval = float(BRIDGE_POLL_INTERVAL_S or PMTA_BRIDGE_PULL_S or 0)
+    timeout = float(BRIDGE_TIMEOUT_S or 0)
+
+    jobs: List[Dict[str, Any]] = []
+    active_jobs = _active_jobs_for_bridge_poll()
+    for job in active_jobs:
+        delivered = int(getattr(job, "delivered", 0) or 0)
+        deferred = int(getattr(job, "deferred", 0) or 0)
+        bounced = int(getattr(job, "bounced", 0) or 0)
+        complained = int(getattr(job, "complained", 0) or 0)
+        jobs.append(
+            {
+                "pmta_job_id": _job_pmta_job_id(job),
+                "counts": {
+                    "linked_emails_count": delivered + deferred + bounced + complained,
+                    "delivered_count": delivered,
+                    "deferred_count": deferred,
+                    "bounced_count": bounced,
+                    "complained_count": complained,
+                },
+                "last_update_time": str(getattr(job, "accounting_last_ts", "") or ""),
+                "outcomes_sync_enabled": bool(BRIDGE_POLL_FETCH_OUTCOMES),
+            }
+        )
+
+    status = {
+        "bridge_base_url": base_url,
+        "poll_interval": poll_interval,
+        "timeout": timeout,
+        "last_ok_ts": str(state.get("last_ok_ts") or ""),
+        "last_error_ts": str(state.get("last_error_ts") or ""),
+        "last_error_message": str(state.get("last_error_message") or ""),
+        "jobs": jobs,
+    }
+
+    state.update(status)
     state["pull_enabled"] = bool(PMTA_BRIDGE_PULL_ENABLED)
-    state["pull_interval_s"] = float(BRIDGE_POLL_INTERVAL_S or PMTA_BRIDGE_PULL_S or 0)
+    state["pull_interval_s"] = poll_interval
     state["pull_max_lines"] = int(PMTA_BRIDGE_PULL_MAX_LINES or 0)
-    runtime_url = _resolve_bridge_pull_url_runtime()
-    state["pull_url"] = runtime_url
-    state["pull_url_configured"] = bool(state["pull_url"])
-    if state["pull_url"]:
-        state["pull_url_masked"] = state["pull_url"].split("?", 1)[0]
-    else:
-        state["pull_url_masked"] = ""
-    with _DB_WRITE_LOCK:
-        state["db_writer"] = {
-            "queued_total": int(_DB_WRITER_STATUS.get("queued", 0) or 0),
-            "written_total": int(_DB_WRITER_STATUS.get("written", 0) or 0),
-            "failed_total": int(_DB_WRITER_STATUS.get("failed", 0) or 0),
-            "queue_full_total": int(_DB_WRITER_STATUS.get("queue_full", 0) or 0),
-            "last_error": str(_DB_WRITER_STATUS.get("last_error") or ""),
-            "last_error_ts": str(_DB_WRITER_STATUS.get("last_error_ts") or ""),
-            "queue_depth": int(_DB_WRITE_QUEUE.qsize()),
-            "retry_depth": int(len(_DB_WRITE_RETRY)),
-        }
-    return jsonify({"ok": True, "bridge": state})
+    return jsonify({"ok": True, **status, "bridge": state})
 
 
 @app.post("/api/accounting/bridge/pull")
