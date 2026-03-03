@@ -8677,24 +8677,80 @@ def _bridge_outcome_emails(obj: dict, key: str) -> List[str]:
     return out
 
 
+def _bridge_outcome_pairs(obj: dict) -> Dict[str, str]:
+    """Flatten bridge outcomes payload into rcpt->outcome map.
+
+    Supports canonical buckets (`delivered`, `deferred`, `bounced`, `complained`),
+    dotted-key variants (`delivered.emails`, etc), and top-level `emails` entries
+    when they include an explicit outcome/status.
+    """
+    pairs: Dict[str, str] = {}
+
+    def _set_pair(raw_rcpt: Any, outcome: str) -> None:
+        rcpt = str(raw_rcpt or "").strip().lower()
+        status = str(outcome or "").strip().lower()
+        if not rcpt or status not in {"delivered", "deferred", "bounced", "complained"}:
+            return
+        pairs[rcpt] = status
+
+    for status in ("delivered", "deferred", "bounced", "complained"):
+        for email in _bridge_outcome_emails(obj, status):
+            _set_pair(email, status)
+
+        dotted_emails = obj.get(f"{status}.emails")
+        if isinstance(dotted_emails, list):
+            for email in dotted_emails:
+                _set_pair(email, status)
+
+    top_level_emails = obj.get("emails")
+    if isinstance(top_level_emails, list):
+        for item in top_level_emails:
+            if isinstance(item, str):
+                # Top-level strings are ambiguous without an explicit status.
+                continue
+            if not isinstance(item, dict):
+                continue
+            _set_pair(
+                item.get("rcpt") or item.get("email"),
+                item.get("outcome") or item.get("status"),
+            )
+
+    return pairs
+
+
 def _bridge_sync_job_outcomes(job_id: str, obj: dict) -> Dict[str, int]:
     counts = {"delivered": 0, "deferred": 0, "bounced": 0, "complained": 0}
+    normalized_job_id = (job_id or "").strip().lower()
+    pairs = _bridge_outcome_pairs(obj)
+
+    for status in pairs.values():
+        if status in counts:
+            counts[status] += 1
+
     with DB_LOCK:
         conn = _db_conn()
         try:
-            conn.execute("DELETE FROM job_outcomes WHERE job_id=?", ((job_id or "").strip(),))
-            for status in ("delivered", "deferred", "bounced", "complained"):
-                emails = _bridge_outcome_emails(obj, status)
-                counts[status] = len(emails)
-                for email in emails:
-                    _db_set_outcome_payload(conn, {
-                        "job_id": (job_id or "").strip(),
-                        "rcpt": email,
-                        "status": status,
-                        "message_id": "",
-                        "dsn_status": "",
-                        "dsn_diag": "",
-                    })
+            for rcpt, status in pairs.items():
+                _db_set_outcome_payload(conn, {
+                    "job_id": normalized_job_id,
+                    "rcpt": rcpt,
+                    "status": status,
+                    "message_id": "",
+                    "dsn_status": "",
+                    "dsn_diag": "",
+                    "updated_at": now_iso(),
+                })
+
+            placeholders = ",".join(["?"] * len(pairs))
+            if placeholders:
+                params: List[Any] = [normalized_job_id]
+                params.extend(list(pairs.keys()))
+                conn.execute(
+                    f"DELETE FROM job_outcomes WHERE job_id=? AND rcpt NOT IN ({placeholders})",
+                    tuple(params),
+                )
+            else:
+                conn.execute("DELETE FROM job_outcomes WHERE job_id=?", (normalized_job_id,))
             conn.commit()
         finally:
             conn.close()

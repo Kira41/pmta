@@ -173,6 +173,49 @@ class BridgeShivaHarnessTests(unittest.TestCase):
             else:
                 os.environ["SHIVA_HOST"] = old_host
 
+    def test_bridge_sync_outcomes_flattens_and_upserts_without_duplicates(self):
+        self._prepare_job()
+        first = {
+            "ok": True,
+            "job_id": "abcdef123456",
+            "delivered": {"count": 1, "emails": ["A@example.com"]},
+            "deferred.emails": ["b@example.com"],
+            "emails": [
+                {"email": "c@example.com", "outcome": "bounced"},
+                {"rcpt": "ignored@example.com"},
+                "ambiguous@example.com",
+            ],
+        }
+        second = {
+            "ok": True,
+            "job_id": "abcdef123456",
+            "delivered": {"count": 0, "emails": []},
+            "bounced": {"count": 1, "emails": ["a@example.com"]},
+            "deferred": {"count": 0, "emails": []},
+            "complained": {"count": 1, "emails": ["d@example.com"]},
+        }
+
+        counts1 = shiva._bridge_sync_job_outcomes("abcdef123456", first)
+        self.assertEqual(counts1["delivered"], 1)
+        self.assertEqual(counts1["deferred"], 1)
+        self.assertEqual(counts1["bounced"], 1)
+
+        counts2 = shiva._bridge_sync_job_outcomes("abcdef123456", second)
+        self.assertEqual(counts2["bounced"], 1)
+        self.assertEqual(counts2["complained"], 1)
+
+        conn = shiva._db_conn()
+        try:
+            rows = conn.execute(
+                "SELECT rcpt, status FROM job_outcomes WHERE job_id=? ORDER BY rcpt",
+                ("abcdef123456",),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        # latest bridge payload wins; stale rcpts are removed.
+        self.assertEqual(rows, [("a@example.com", "bounced"), ("d@example.com", "complained")])
+
 
     def test_bridge_poller_skips_outcomes_when_disabled(self):
         old_port = shiva.PMTA_BRIDGE_PULL_PORT
