@@ -116,6 +116,79 @@ class BridgeShivaHarnessTests(unittest.TestCase):
                 os.environ["SHIVA_HOST"] = old_host
 
 
+
+    def test_bridge_poller_uses_job_count_and_job_outcomes(self):
+        old_port = shiva.PMTA_BRIDGE_PULL_PORT
+        old_host = os.environ.get("SHIVA_HOST")
+
+        class _Resp:
+            def __init__(self, payload):
+                self.payload = payload
+                self.status = 200
+
+            def read(self):
+                return self.payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        seen = []
+
+        def _fake_urlopen(req, timeout=20):
+            url = req.full_url
+            seen.append(url)
+            if "/api/v1/job/count" in url:
+                body = {
+                    "ok": True,
+                    "job_id": "abcdef123456",
+                    "linked_emails_count": 3,
+                    "delivered_count": 1,
+                    "deferred_count": 1,
+                    "bounced_count": 1,
+                    "complained_count": 0,
+                }
+                return _Resp(shiva.json.dumps(body).encode("utf-8"))
+            if "/api/v1/job/outcomes" in url:
+                body = {
+                    "ok": True,
+                    "job_id": "abcdef123456",
+                    "delivered": {"count": 1, "emails": ["d@example.com"]},
+                    "deferred": {"count": 1, "emails": ["t@example.com"]},
+                    "bounced": {"count": 1, "emails": ["b@example.com"]},
+                    "complained": {"count": 0, "emails": []},
+                }
+                return _Resp(shiva.json.dumps(body).encode("utf-8"))
+            raise AssertionError(f"unexpected URL: {url}")
+
+        try:
+            os.environ["SHIVA_HOST"] = "194.116.172.135"
+            shiva.PMTA_BRIDGE_PULL_PORT = 18090
+            self._prepare_job().smtp_host = "smtp.campaign.local"
+
+            old_urlopen = shiva.urlopen
+            shiva.urlopen = _fake_urlopen
+            result = shiva._poll_accounting_bridge_once()
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(any("/api/v1/job/count" in u for u in seen))
+            self.assertTrue(any("/api/v1/job/outcomes" in u for u in seen))
+
+            job = shiva.JOBS["abcdef123456"]
+            self.assertEqual(job.delivered, 1)
+            self.assertEqual(job.deferred, 1)
+            self.assertEqual(job.bounced, 1)
+            self.assertEqual(job.complained, 0)
+        finally:
+            shiva.urlopen = old_urlopen
+            shiva.PMTA_BRIDGE_PULL_PORT = old_port
+            if old_host is None:
+                os.environ.pop("SHIVA_HOST", None)
+            else:
+                os.environ["SHIVA_HOST"] = old_host
+
     def test_bridge_row_parser_accepts_json_and_rejects_csv_strings(self):
         self.assertEqual(
             shiva._parse_bridge_json_row({"type": "d", "rcpt": "x@example.com"}),
