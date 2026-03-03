@@ -7948,6 +7948,9 @@ def pmta_chunk_policy(*, smtp_host: str, chunk_domain_counts: Dict[str, int]) ->
 # Single supported mode:
 # Shiva requests accounting from bridge API, and bridge only serves API responses.
 PMTA_BRIDGE_PULL_ENABLED = (os.getenv("PMTA_BRIDGE_PULL_ENABLED", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+BRIDGE_MODE = (os.getenv("BRIDGE_MODE", "counts") or "counts").strip().lower()
+if BRIDGE_MODE not in {"counts", "legacy"}:
+    BRIDGE_MODE = "counts"
 try:
     PMTA_BRIDGE_PULL_PORT = int((os.getenv("PMTA_BRIDGE_PULL_PORT", "8090") or "8090").strip())
 except Exception:
@@ -8015,6 +8018,10 @@ _BRIDGE_CURSOR_COMPAT_WARNED = False
 _BRIDGE_POLL_CYCLE_LOCK = threading.Lock()
 
 
+def _bridge_mode_counts_enabled() -> bool:
+    return str(BRIDGE_MODE or "counts").strip().lower() == "counts"
+
+
 def _resolve_bridge_pull_host_from_campaign() -> str:
     """Resolve bridge host from campaign SMTP host (latest job), not server IP."""
     with JOBS_LOCK:
@@ -8060,6 +8067,8 @@ def _normalize_bridge_host(raw_host: str) -> str:
 
 
 def _resolve_bridge_pull_url_runtime() -> str:
+    if _bridge_mode_counts_enabled():
+        return ""
     host = _normalize_bridge_host(_resolve_bridge_pull_host_from_campaign())
     limit = max(1, int(PMTA_BRIDGE_PULL_MAX_LINES or 2000))
     return f"http://{host}:{PMTA_BRIDGE_PULL_PORT}{PMTA_BRIDGE_PULL_PATH}?kinds=acct&limit={limit}"
@@ -8584,6 +8593,8 @@ def process_campaign_accounting_payload(payload: dict) -> dict:
 
 
 def _db_get_bridge_cursor() -> str:
+    if _bridge_mode_counts_enabled():
+        return ""
     with DB_LOCK:
         conn = _db_conn()
         try:
@@ -8594,6 +8605,8 @@ def _db_get_bridge_cursor() -> str:
 
 
 def _db_set_bridge_cursor(cursor: str) -> None:
+    if _bridge_mode_counts_enabled():
+        return
     cur = (cursor or "").strip()
     if not cur:
         return
@@ -8617,6 +8630,8 @@ def _db_set_bridge_cursor(cursor: str) -> None:
 
 
 def _normalize_bridge_pull_urls(raw_url: str) -> List[str]:
+    if _bridge_mode_counts_enabled():
+        return []
     url = (raw_url or "").strip()
     if url and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
         url = f"http://{url}"
@@ -10113,8 +10128,10 @@ APP_CONFIG_SCHEMA: List[dict] = [
     # Accounting bridge pull mode (Shiva pull request -> bridge API response)
     {"key": "PMTA_BRIDGE_PULL_ENABLED", "type": "bool", "default": "1", "group": "Accounting", "restart_required": True,
      "desc": "Enable the only accounting flow: Shiva pulls accounting from bridge API."},
+    {"key": "BRIDGE_MODE", "type": "str", "default": "counts", "group": "Accounting", "restart_required": False,
+     "desc": "Bridge ingestion mode. Use 'counts' to enforce /api/v1/job/count (+ optional /job/outcomes) and disable legacy cursor /pull ingestion."},
     {"key": "PMTA_BRIDGE_PULL_PORT", "type": "int", "default": "8090", "group": "Accounting", "restart_required": False,
-     "desc": "Bridge port used by Shiva when building /api/v1/pull/latest URL from campaign SMTP host."},
+     "desc": "Bridge port used by Shiva when building count/outcomes API URLs from campaign SMTP host."},
     {"key": "PMTA_BRIDGE_PULL_S", "type": "float", "default": "5", "group": "Accounting", "restart_required": False,
      "desc": "Legacy polling interval (seconds) for Shiva bridge pull thread."},
     {"key": "BRIDGE_POLL_INTERVAL_S", "type": "float", "default": "5", "group": "Accounting", "restart_required": False,
@@ -10250,7 +10267,7 @@ def reload_runtime_config() -> dict:
         global PMTA_PRESSURE_CONTROL, PMTA_PRESSURE_POLL_S
         global PMTA_DOMAIN_STATS, PMTA_DOMAINS_POLL_S, PMTA_DOMAINS_TOP_N
         global OPENROUTER_ENDPOINT, OPENROUTER_MODEL, OPENROUTER_TIMEOUT_S
-        global PMTA_BRIDGE_PULL_ENABLED, PMTA_BRIDGE_PULL_PORT, PMTA_BRIDGE_PULL_S, PMTA_BRIDGE_PULL_MAX_LINES
+        global PMTA_BRIDGE_PULL_ENABLED, BRIDGE_MODE, PMTA_BRIDGE_PULL_PORT, PMTA_BRIDGE_PULL_S, PMTA_BRIDGE_PULL_MAX_LINES
         global BRIDGE_POLL_INTERVAL_S, BRIDGE_POLL_FETCH_OUTCOMES
 
         # Spam
@@ -10309,6 +10326,9 @@ def reload_runtime_config() -> dict:
 
         # Bridge pull mode (Shiva -> Bridge)
         PMTA_BRIDGE_PULL_ENABLED = bool(cfg_get_bool("PMTA_BRIDGE_PULL_ENABLED", bool(PMTA_BRIDGE_PULL_ENABLED)))
+        BRIDGE_MODE = (cfg_get_str("BRIDGE_MODE", BRIDGE_MODE) or BRIDGE_MODE).strip().lower()
+        if BRIDGE_MODE not in {"counts", "legacy"}:
+            BRIDGE_MODE = "counts"
         PMTA_BRIDGE_PULL_PORT = int(cfg_get_int("PMTA_BRIDGE_PULL_PORT", int(PMTA_BRIDGE_PULL_PORT or 8090)))
         PMTA_BRIDGE_PULL_S = float(cfg_get_float("PMTA_BRIDGE_PULL_S", float(PMTA_BRIDGE_PULL_S or 5.0)))
         BRIDGE_POLL_INTERVAL_S = float(cfg_get_float("BRIDGE_POLL_INTERVAL_S", float(PMTA_BRIDGE_PULL_S or BRIDGE_POLL_INTERVAL_S or 5.0)))
@@ -11345,6 +11365,7 @@ def api_accounting_bridge_status():
 
     state.update(status)
     state["pull_enabled"] = bool(PMTA_BRIDGE_PULL_ENABLED)
+    state["bridge_mode"] = str(BRIDGE_MODE or "counts")
     state["pull_interval_s"] = poll_interval
     state["pull_max_lines"] = int(PMTA_BRIDGE_PULL_MAX_LINES or 0)
     return jsonify({"ok": True, **status, "bridge": state})
@@ -11353,8 +11374,8 @@ def api_accounting_bridge_status():
 @app.post("/api/accounting/bridge/pull")
 def api_accounting_bridge_pull_once():
     """Manual pull from bridge endpoint (same processing path as periodic poller)."""
-    if not _resolve_bridge_pull_url_runtime():
-        return jsonify({"ok": False, "error": "bridge pull URL is not configured"}), 400
+    if not _resolve_bridge_base_url_runtime():
+        return jsonify({"ok": False, "error": "bridge base URL is not configured"}), 400
     result = _poll_accounting_bridge_once()
     if not result.get("ok") and str(result.get("reason") or "") == "busy":
         return jsonify(result), 409

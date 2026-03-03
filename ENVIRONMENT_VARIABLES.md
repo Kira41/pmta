@@ -407,6 +407,11 @@
 
 ## 10) PMTA Accounting Bridge Pull (داخل Shiva)
 
+### `BRIDGE_MODE`
+- **الافتراضي:** `counts`
+- **القيم:** `counts` أو `legacy`.
+- **counts (الموصى به):** Shiva يستخدم فقط `/api/v1/job/count` ومعه اختياريًا `/api/v1/job/outcomes`، ويوقف مسار cursor + `/api/v1/pull` القديم.
+
 ### `PMTA_BRIDGE_PULL_ENABLED`
 - **الافتراضي:** `1`
 - **الخلفية:** تشغيل/إيقاف خيط السحب الدوري من bridge.

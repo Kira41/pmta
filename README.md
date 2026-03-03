@@ -49,6 +49,7 @@ Covers:
   - `DEFAULT_PULL_LIMIT=500`
   - `MAX_PULL_LIMIT=2000`
 - Shiva:
+  - `BRIDGE_MODE=counts` to force count-based bridge polling only
   - `PMTA_BRIDGE_PULL_PORT=8090`
   - `PMTA_BRIDGE_PULL_MAX_LINES=2000`
   - `PMTA_BRIDGE_PULL_S=3..5` for near-real-time visibility
