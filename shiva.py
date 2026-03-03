@@ -7,7 +7,10 @@ import logging
 import random
 import re
 import socket
-import ssl
+try:
+    import ssl
+except Exception:  # pragma: no cover - runtime compatibility for Python builds without _ssl
+    ssl = None  # type: ignore
 import http.client
 import subprocess
 import time
@@ -135,6 +138,22 @@ EMAIL_FIND_RE = re.compile(
 
 def now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+def _ssl_unavailable_error() -> RuntimeError:
+    return RuntimeError("SSL/TLS is unavailable in this Python build (_ssl module missing)")
+
+
+def _create_default_ssl_context():
+    if ssl is None:
+        raise _ssl_unavailable_error()
+    return ssl.create_default_context()
+
+
+def _create_unverified_ssl_context():
+    if ssl is None:
+        raise _ssl_unavailable_error()
+    return ssl._create_unverified_context()
 
 
 def parse_multiline(text: str, *, dedupe_lower: bool = False) -> List[str]:
@@ -5683,7 +5702,7 @@ def smtp_test_connection(
     try:
         if smtp_security == "ssl":
             steps.append("connect:ssl")
-            context = ssl.create_default_context()
+            context = _create_default_ssl_context()
             server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=smtp_timeout, context=context)
         else:
             steps.append("connect:plain")
@@ -5692,7 +5711,7 @@ def smtp_test_connection(
             steps.append("ehlo")
             if smtp_security == "starttls":
                 steps.append("starttls")
-                context = ssl.create_default_context()
+                context = _create_default_ssl_context()
                 server.starttls(context=context)
                 server.ehlo()
                 steps.append("ehlo2")
@@ -6567,7 +6586,7 @@ def _http_get_json(url: str, *, timeout_s: float) -> Tuple[bool, dict, str]:
     want a fully secure setup, fix the PMTA HTTPS cert (use RSA-2048+), or keep monitor on HTTP.
     """
 
-    def _attempt(ctx: ssl.SSLContext | None) -> Tuple[bool, dict, str]:
+    def _attempt(ctx: Optional[Any]) -> Tuple[bool, dict, str]:
         try:
             req = Request(url, headers=_pmta_headers(), method="GET")
             if ctx is None:
@@ -6599,7 +6618,7 @@ def _http_get_json(url: str, *, timeout_s: float) -> Tuple[bool, dict, str]:
     err_l = (err or "").lower()
     if ("certificate_verify_failed" in err_l) or ("key too weak" in err_l) or ("ssl:" in err_l):
         try:
-            ctx = ssl._create_unverified_context()
+            ctx = _create_unverified_ssl_context()
             # Allow weaker keys on some servers (OpenSSL security level)
             try:
                 ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
@@ -6619,7 +6638,7 @@ def _http_get_json(url: str, *, timeout_s: float) -> Tuple[bool, dict, str]:
 def _http_get_text(url: str, *, timeout_s: float) -> Tuple[bool, str, str, dict]:
     """Fetch raw text + metadata from PMTA monitor endpoints (debug/probing)."""
 
-    def _attempt(ctx: ssl.SSLContext | None) -> Tuple[bool, str, str, dict]:
+    def _attempt(ctx: Optional[Any]) -> Tuple[bool, str, str, dict]:
         try:
             req = Request(url, headers=_pmta_headers(), method="GET")
             if ctx is None:
@@ -6659,7 +6678,7 @@ def _http_get_text(url: str, *, timeout_s: float) -> Tuple[bool, str, str, dict]
     err_l = (err or "").lower()
     if ("certificate_verify_failed" in err_l) or ("key too weak" in err_l) or ("ssl:" in err_l):
         try:
-            ctx = ssl._create_unverified_context()
+            ctx = _create_unverified_ssl_context()
             try:
                 ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
             except Exception:
@@ -9043,13 +9062,13 @@ def _smtp_connect(
     smtp_timeout: int,
 ) -> smtplib.SMTP:
     if smtp_security == "ssl":
-        context = ssl.create_default_context()
+        context = _create_default_ssl_context()
         return smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=smtp_timeout, context=context)
 
     server = smtplib.SMTP(smtp_host, smtp_port, timeout=smtp_timeout)
     server.ehlo()
     if smtp_security == "starttls":
-        context = ssl.create_default_context()
+        context = _create_default_ssl_context()
         server.starttls(context=context)
         server.ehlo()
     return server
