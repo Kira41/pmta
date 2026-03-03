@@ -8,6 +8,7 @@ import random
 import re
 import socket
 import ssl
+import http.client
 import subprocess
 import time
 import uuid
@@ -22,7 +23,7 @@ from typing import Optional, Any, Tuple, Dict, List, Set
 from concurrent.futures import ThreadPoolExecutor
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote_plus, urlsplit
+from urllib.parse import quote_plus, urlsplit, urlencode, parse_qsl
 
 import sqlite3
 from pathlib import Path
@@ -7951,6 +7952,11 @@ except Exception:
 PMTA_BRIDGE_PULL_PATH = "/api/v1/pull"
 PMTA_BRIDGE_JOB_COUNT_PATH = "/api/v1/job/count"
 PMTA_BRIDGE_JOB_OUTCOMES_PATH = "/api/v1/job/outcomes"
+BRIDGE_BASE_URL = ""
+try:
+    BRIDGE_TIMEOUT_S = float((os.getenv("BRIDGE_TIMEOUT_S", "20") or "20").strip())
+except Exception:
+    BRIDGE_TIMEOUT_S = 20.0
 
 
 try:
@@ -8050,6 +8056,56 @@ def _resolve_bridge_pull_url_runtime() -> str:
 def _resolve_bridge_base_url_runtime() -> str:
     host = _normalize_bridge_host(_resolve_bridge_pull_host_from_campaign())
     return f"http://{host}:{PMTA_BRIDGE_PULL_PORT}"
+
+
+def bridge_get_json(path: str, params: dict) -> dict:
+    base = (BRIDGE_BASE_URL or "").strip()
+    if not base:
+        raise ValueError("bridge base url is not configured")
+    if base.lower().startswith("https://"):
+        raise ValueError("https is not allowed for bridge client")
+
+    p = (path or "").strip() or "/"
+    if not p.startswith("/"):
+        p = "/" + p
+    query = urlencode(params or {}, doseq=True)
+    full_url = f"{base.rstrip('/')}{p}"
+    if query:
+        full_url = f"{full_url}?{query}"
+
+    parsed = urlsplit(full_url)
+    if parsed.scheme.lower() != "http":
+        raise ValueError("bridge client supports HTTP only")
+
+    host = (parsed.hostname or "").strip()
+    if not host:
+        raise ValueError("bridge host is missing")
+
+    port = parsed.port or 80
+    target = parsed.path or "/"
+    if parsed.query:
+        target = f"{target}?{parsed.query}"
+
+    conn = http.client.HTTPConnection(host, port=port, timeout=float(BRIDGE_TIMEOUT_S or 20.0))
+    try:
+        conn.request("GET", target, headers={"Accept": "application/json"})
+        resp = conn.getresponse()
+        status = int(getattr(resp, "status", 0) or 0)
+        raw = (resp.read() or b"").decode("utf-8", errors="replace")
+    finally:
+        conn.close()
+
+    if status != 200:
+        snippet = raw[:220].replace("\n", " ").replace("\r", " ")
+        raise RuntimeError(f"bridge_http_status={status} body={snippet!r}")
+
+    try:
+        obj = json.loads(raw or "{}")
+    except Exception as e:
+        raise ValueError(f"invalid_json_response: {e}")
+    if not isinstance(obj, dict):
+        raise ValueError("invalid_bridge_payload")
+    return obj
 
 
 def _bridge_debug_update(**kwargs: Any) -> None:
@@ -8564,38 +8620,38 @@ def _normalize_bridge_pull_urls(raw_url: str) -> List[str]:
 
 
 def _bridge_fetch_json(req_url: str, headers: Dict[str, str], max_request_attempts: int = 3) -> Tuple[Optional[dict], Optional[Exception]]:
-    raw = ""
     request_error: Optional[Exception] = None
     for attempt in range(1, max_request_attempts + 1):
         _bridge_debug_update(last_req_url=req_url)
         try:
-            req = Request(req_url, headers=headers, method="GET")
-            with urlopen(req, timeout=20) as resp:
-                code = getattr(resp, "status", None)
-                raw = (resp.read() or b"{}").decode("utf-8", errors="replace")
-            _bridge_debug_update(last_http_ok=True, last_http_status=code)
+            parsed = urlsplit(req_url)
+            if parsed.scheme and parsed.scheme.lower() != "http":
+                raise ValueError("bridge client supports HTTP only")
+            if not parsed.hostname:
+                raise ValueError("bridge request URL missing host")
+
+            global BRIDGE_BASE_URL
+            BRIDGE_BASE_URL = "http://{}:{}".format(parsed.hostname, parsed.port or 80)
+            params: Dict[str, Any] = {}
+            for k, v in parse_qsl(parsed.query, keep_blank_values=True):
+                if k in params:
+                    prev = params[k]
+                    if isinstance(prev, list):
+                        prev.append(v)
+                    else:
+                        params[k] = [prev, v]
+                else:
+                    params[k] = v
+            obj = bridge_get_json(parsed.path or "/", params)
+            _bridge_debug_update(last_http_ok=True, last_http_status=200)
             request_error = None
-            break
-        except HTTPError as e:
-            request_error = e
-            _bridge_debug_update(last_http_ok=False, last_http_status=e.code)
+            return obj, None
         except Exception as e:
             request_error = e
             _bridge_debug_update(last_http_ok=False)
-        if raw:
-            break
         if attempt < max_request_attempts:
             time.sleep(min(1.0 * attempt, 2.0))
-
-    if request_error is not None and not raw:
-        return None, request_error
-    try:
-        obj = json.loads(raw)
-    except Exception as e:
-        return None, e
-    if not isinstance(obj, dict):
-        return None, ValueError("invalid_bridge_payload")
-    return obj, None
+    return None, request_error
 
 
 def _bridge_outcome_emails(obj: dict, key: str) -> List[str]:
@@ -8642,6 +8698,8 @@ def _poll_accounting_bridge_once() -> dict:
     poll_ts = now_iso()
     _bridge_debug_update(last_poll_time=poll_ts)
     base_url = _resolve_bridge_base_url_runtime()
+    global BRIDGE_BASE_URL
+    BRIDGE_BASE_URL = base_url
     if not base_url:
         _bridge_debug_update(
             last_attempt_ts=now_iso(),

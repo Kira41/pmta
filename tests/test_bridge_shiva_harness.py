@@ -121,27 +121,13 @@ class BridgeShivaHarnessTests(unittest.TestCase):
         old_port = shiva.PMTA_BRIDGE_PULL_PORT
         old_host = os.environ.get("SHIVA_HOST")
 
-        class _Resp:
-            def __init__(self, payload):
-                self.payload = payload
-                self.status = 200
-
-            def read(self):
-                return self.payload
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
         seen = []
 
-        def _fake_urlopen(req, timeout=20):
-            url = req.full_url
+        def _fake_bridge_get_json(path, params):
+            url = "{}{}?{}".format(shiva.BRIDGE_BASE_URL, path, shiva.urlencode(params or {}, doseq=True))
             seen.append(url)
-            if "/api/v1/job/count" in url:
-                body = {
+            if path == "/api/v1/job/count":
+                return {
                     "ok": True,
                     "job_id": "abcdef123456",
                     "linked_emails_count": 3,
@@ -150,9 +136,8 @@ class BridgeShivaHarnessTests(unittest.TestCase):
                     "bounced_count": 1,
                     "complained_count": 0,
                 }
-                return _Resp(shiva.json.dumps(body).encode("utf-8"))
-            if "/api/v1/job/outcomes" in url:
-                body = {
+            if path == "/api/v1/job/outcomes":
+                return {
                     "ok": True,
                     "job_id": "abcdef123456",
                     "delivered": {"count": 1, "emails": ["d@example.com"]},
@@ -160,16 +145,15 @@ class BridgeShivaHarnessTests(unittest.TestCase):
                     "bounced": {"count": 1, "emails": ["b@example.com"]},
                     "complained": {"count": 0, "emails": []},
                 }
-                return _Resp(shiva.json.dumps(body).encode("utf-8"))
-            raise AssertionError(f"unexpected URL: {url}")
+            raise AssertionError("unexpected path: {}".format(path))
 
         try:
             os.environ["SHIVA_HOST"] = "194.116.172.135"
             shiva.PMTA_BRIDGE_PULL_PORT = 18090
             self._prepare_job().smtp_host = "smtp.campaign.local"
 
-            old_urlopen = shiva.urlopen
-            shiva.urlopen = _fake_urlopen
+            old_bridge_get_json = shiva.bridge_get_json
+            shiva.bridge_get_json = _fake_bridge_get_json
             result = shiva._poll_accounting_bridge_once()
 
             self.assertTrue(result["ok"])
@@ -182,7 +166,7 @@ class BridgeShivaHarnessTests(unittest.TestCase):
             self.assertEqual(job.bounced, 1)
             self.assertEqual(job.complained, 0)
         finally:
-            shiva.urlopen = old_urlopen
+            shiva.bridge_get_json = old_bridge_get_json
             shiva.PMTA_BRIDGE_PULL_PORT = old_port
             if old_host is None:
                 os.environ.pop("SHIVA_HOST", None)
