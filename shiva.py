@@ -8701,6 +8701,43 @@ def _bridge_sync_job_outcomes(job_id: str, obj: dict) -> Dict[str, int]:
     return counts
 
 
+def _replace_job_accounting_from_bridge_count(job: SendJob, count_obj: dict) -> int:
+    """Replace job accounting counters from bridge `/job/count` payload.
+
+    Bridge count response is authoritative for Shiva's aggregate counters, so this
+    method intentionally performs assignment (not increment/decrement) on each
+    successful poll to avoid drift across repeated polls.
+
+    Returns linked_emails_count from payload.
+    """
+    linked_count = int(count_obj.get("linked_emails_count") or 0)
+    job.delivered = int(count_obj.get("delivered_count") or 0)
+    job.deferred = int(count_obj.get("deferred_count") or 0)
+    job.bounced = int(count_obj.get("bounced_count") or 0)
+    job.complained = int(count_obj.get("complained_count") or 0)
+    job.accounting_last_ts = now_iso()
+
+    # Keep a lightweight per-minute snapshot to support trend charts while using
+    # deterministic replacement semantics for the counters.
+    try:
+        now_min = int(time.time() // 60)
+        if job.outcome_series and int(job.outcome_series[-1].get("t_min") or 0) == now_min:
+            bucket = job.outcome_series[-1]
+        else:
+            bucket = {"t_min": now_min}
+            job.outcome_series.append(bucket)
+            if len(job.outcome_series) > 180:
+                job.outcome_series = job.outcome_series[-140:]
+        bucket["delivered"] = int(job.delivered or 0)
+        bucket["deferred"] = int(job.deferred or 0)
+        bucket["bounced"] = int(job.bounced or 0)
+        bucket["complained"] = int(job.complained or 0)
+    except Exception:
+        pass
+
+    return linked_count
+
+
 def _active_jobs_for_bridge_poll() -> List['SendJob']:
     active_statuses = {"queued", "running", "backoff", "paused"}
     with JOBS_LOCK:
@@ -8773,33 +8810,21 @@ def _poll_accounting_bridge_once() -> dict:
             if outcomes_error is not None:
                 logger.warning("Bridge outcomes fetch failed for job_id=%s: %s", jid, outcomes_error)
 
-        delivered = int(count_obj.get("delivered_count") or 0)
-        deferred = int(count_obj.get("deferred_count") or 0)
-        bounced = int(count_obj.get("bounced_count") or 0)
-        complained = int(count_obj.get("complained_count") or 0)
-
         if BRIDGE_POLL_FETCH_OUTCOMES and outcomes_obj and outcomes_error is None:
             try:
-                synced = _bridge_sync_job_outcomes(jid, outcomes_obj)
-                delivered = int(synced.get("delivered") or delivered)
-                deferred = int(synced.get("deferred") or deferred)
-                bounced = int(synced.get("bounced") or bounced)
-                complained = int(synced.get("complained") or complained)
+                _bridge_sync_job_outcomes(jid, outcomes_obj)
             except Exception:
                 logger.exception("Bridge outcome sync failed for job_id=%s", jid)
 
+        linked_count = int(count_obj.get("linked_emails_count") or 0)
         with JOBS_LOCK:
             live_job = JOBS.get(str(getattr(job, "id", "") or "").strip().lower())
             if live_job and not getattr(live_job, "deleted", False):
-                live_job.delivered = delivered
-                live_job.deferred = deferred
-                live_job.bounced = bounced
-                live_job.complained = complained
-                live_job.accounting_last_ts = now_iso()
+                linked_count = _replace_job_accounting_from_bridge_count(live_job, count_obj)
                 live_job.maybe_persist()
 
         total_accepted += 1
-        total_count += int(count_obj.get("linked_emails_count") or 0)
+        total_count += int(linked_count)
         last_obj = count_obj
 
     ok = (last_error == "")
