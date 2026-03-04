@@ -3662,15 +3662,15 @@ PAGE_JOBS = r"""
 
               <div style="height:10px"></div>
 
-              <div class="mini"><b>Last errors</b></div>
+              <div class="mini"><b>Error 1 (summary)</b></div>
               <div class="mini" data-k="lastErrors">—</div>
 
               <div style="height:10px"></div>
-              <div class="mini"><b>Last errors 2</b></div>
+              <div class="mini"><b>Error 2 (detailed)</b></div>
               <div class="mini" data-k="lastErrors2">—</div>
 
               <div style="height:10px"></div>
-              <div class="mini"><b>Internal errors (Shiva)</b></div>
+              <div class="mini"><b>Internal errors (local network only)</b></div>
               <div class="mini" data-k="internalErrors">—</div>
 
               <div style="height:10px"></div>
@@ -3918,19 +3918,36 @@ This will remove it from Jobs history.`);
       el.innerHTML = parts.join('<br>');
     }
 
-    // last accounting errors - errors only (accepted is filtered out)
+    function shortWords(txt, maxWords){
+      const words = (txt || '').toString().replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
+      return words.slice(0, Math.max(1, Number(maxWords || 4))).join(' ');
+    }
+
+    function pickErrorCode(txt){
+      const s = (txt || '').toString();
+      let m = s.match(/\b([245]\.\d\.\d{1,3})\b/i);
+      if(m) return (m[1] || '').trim();
+      m = s.match(/\b([245]\d\d)\b/);
+      if(m) return (m[1] || '').trim();
+      return '';
+    }
+
+    // Error 1 (summary): latest 10 with compact "code + short reason"
     const re10 = onlyErrors.slice().reverse().slice(0,10);
     const el2 = qk(card,'lastErrors');
     if(el2){
       if(!re10.length){ el2.textContent = '—'; }
       else{
         el2.innerHTML = re10.map(x => {
-          const kk = (x.kind === 'temporary_error') ? '4XX' : '5XX';
-          return `• [${esc(kk)}] ${esc(x.email || '—')} — ${esc(x.detail || '')}`;
+          const detail = (x.detail || '').toString();
+          const code = pickErrorCode(detail) || ((x.kind === 'temporary_error') ? '4XX' : '5XX');
+          const summary = shortWords(detail, 4) || 'unknown reason';
+          return `• [${esc(code)}] ${esc(summary)}`;
         }).join('<br>');
       }
     }
 
+    // Error 2 (detailed): latest 20 with full details
     const re20 = onlyErrors.slice().reverse().slice(0,20);
     const el3 = qk(card,'lastErrors2');
     if(el3){
@@ -3938,16 +3955,47 @@ This will remove it from Jobs history.`);
       else{
         el3.innerHTML = re20.map(x => {
           const typ = (x.type || '').toString();
-          return `• ${esc(x.email || '—')} · ${esc(typ || 'unknown')} · ${esc(x.detail || '')}`;
+          const kind = (x.kind || '').toString();
+          const code = pickErrorCode(x.detail || '');
+          const codePart = code ? ` · code=${esc(code)}` : '';
+          return `• ${esc(x.email || '—')} · type=${esc(typ || 'unknown')} · kind=${esc(kind || 'unknown')}${codePart} · ${esc(x.detail || '')}`;
         }).join('<br>');
       }
     }
 
-    const ieCounts = j.internal_error_counts || {};
-    const ieRows = Array.isArray(j.internal_last_errors) ? j.internal_last_errors.slice().reverse().slice(0,10) : [];
+    function isNetworkInternalError(x){
+      if(!x) return false;
+      const t = (x.type || '').toString().toLowerCase();
+      const d = (x.detail || '').toString().toLowerCase();
+      const bag = `${t} ${d}`;
+      return (
+        bag.includes('network') ||
+        bag.includes('socket') ||
+        bag.includes('timeout') ||
+        bag.includes('timed out') ||
+        bag.includes('connection refused') ||
+        bag.includes('connection reset') ||
+        bag.includes('name or service not known') ||
+        bag.includes('temporary failure in name resolution') ||
+        bag.includes('host unreachable') ||
+        bag.includes('no route to host') ||
+        bag.includes('broken pipe') ||
+        bag.includes('ssl') ||
+        bag.includes('tls')
+      );
+    }
+
+    const allInternalRows = Array.isArray(j.internal_last_errors) ? j.internal_last_errors : [];
+    const netInternalRows = allInternalRows.filter(isNetworkInternalError);
+    const ieRows = netInternalRows.slice().reverse().slice(0,10);
+    const ieAgg = {};
+    for(const row of netInternalRows){
+      const k = (row && row.type) ? row.type.toString() : 'network_error';
+      ieAgg[k] = Number(ieAgg[k] || 0) + 1;
+    }
     const ie = qk(card,'internalErrors');
     if(ie){
-      const topFixed = Object.entries(ieCounts).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0));
+      const topFixed = Object.entries(ieAgg).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0));
       const countLine = topFixed.length
         ? topFixed.map(([k,v]) => `${esc(k)}: <b>${Number(v||0)}</b>`).join(' · ')
         : '';
