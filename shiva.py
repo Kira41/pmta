@@ -102,6 +102,13 @@ if dns is not None:
         DNS_RESOLVER = dns.resolver.Resolver()  # type: ignore
         DNS_RESOLVER.lifetime = 3.0
         DNS_RESOLVER.timeout = 2.0
+        custom_nameservers = [
+            x.strip()
+            for x in (os.getenv("DNS_RESOLVER_NAMESERVERS", "1.1.1.1,8.8.8.8,9.9.9.9") or "").split(",")
+            if x.strip()
+        ]
+        if custom_nameservers:
+            DNS_RESOLVER.nameservers = custom_nameservers  # type: ignore[attr-defined]
     except Exception:
         DNS_RESOLVER = None
 
@@ -7543,49 +7550,26 @@ def domain_mail_route(domain: str) -> dict:
             _MX_CACHE_EXPIRES_AT[d] = time.time() + float(ttl)
         return out
 
-    mx_hosts: List[str] = []
+    mx_query = _dns_lookup(d, "MX")
+    mx_hosts: List[str] = [str(x).strip().rstrip(".") for x in (mx_query.get("records") or []) if str(x).strip()]
+    if mx_hosts:
+        out = {"domain": d, "status": "mx", "mx_hosts": mx_hosts[:8]}
+        return _cache_and_return(out)
 
-    # If dnspython is available, use it.
-    if DNS_RESOLVER is not None:
-        try:
-            ans = DNS_RESOLVER.resolve(d, "MX")  # type: ignore
-            for r in ans:
-                exch = str(getattr(r, "exchange", "")).rstrip(".")
-                if exch:
-                    mx_hosts.append(exch)
-            if mx_hosts:
-                out = {"domain": d, "status": "mx", "mx_hosts": mx_hosts[:8]}
-                return _cache_and_return(out)
-        except Exception as e:
-            # If clearly no MX, we'll check A fallback below.
-            msg = str(e).lower()
-            # Treat timeouts/servfail as unknown.
-            if "timeout" in msg or "servfail" in msg or "refused" in msg:
-                out = {"domain": d, "status": "unknown", "mx_hosts": []}
-                return _cache_and_return(out)
-
-        # A fallback
-        try:
-            a = DNS_RESOLVER.resolve(d, "A")  # type: ignore
-            has_a = any(str(x) for x in a)
-            out = {"domain": d, "status": ("a_fallback" if has_a else "none"), "mx_hosts": []}
-            return _cache_and_return(out)
-        except Exception as e:
-            msg = str(e).lower()
-            if "timeout" in msg or "servfail" in msg or "refused" in msg:
-                out = {"domain": d, "status": "unknown", "mx_hosts": []}
-                return _cache_and_return(out)
-            out = {"domain": d, "status": "none", "mx_hosts": []}
-            return _cache_and_return(out)
-
-    # Fallback without dnspython: do not hard-fail; try A resolution only.
-    try:
-        _ = socket.gethostbyname(d)
+    a_query = _dns_lookup(d, "A")
+    a_records = [str(x).strip() for x in (a_query.get("records") or []) if str(x).strip()]
+    if a_records:
         out = {"domain": d, "status": "a_fallback", "mx_hosts": []}
         return _cache_and_return(out)
-    except Exception:
+
+    mx_err = str(mx_query.get("error") or "")
+    a_err = str(a_query.get("error") or "")
+    if _is_dns_transient_error(mx_err) or _is_dns_transient_error(a_err):
         out = {"domain": d, "status": "unknown", "mx_hosts": []}
         return _cache_and_return(out)
+
+    out = {"domain": d, "status": "none", "mx_hosts": []}
+    return _cache_and_return(out)
 
 
 def filter_emails_by_mx(emails: List[str]) -> Tuple[List[str], List[str], dict]:
@@ -7775,23 +7759,22 @@ def resolve_sender_domain_ips(domain: str) -> List[str]:
     seen: Set[str] = set()
 
     # 1) MX -> resolve exchange hostnames to IPv4
-    try:
-        if dns is not None:  # type: ignore
-            answers = dns.resolver.resolve(d, "MX")  # type: ignore
-            for r in answers:
-                exch = str(getattr(r, "exchange", "")).rstrip(".")
-                if not exch:
-                    continue
-                for ip in _resolve_ipv4(exch):
-                    if ip not in seen:
-                        seen.add(ip)
-                        out.append(ip)
-    except Exception:
-        pass
+    mx_hosts = [str(x).strip().rstrip(".") for x in (_dns_lookup(d, "MX").get("records") or []) if str(x).strip()]
+    for exch in mx_hosts:
+        a_records = [str(x).strip() for x in (_dns_lookup(exch, "A").get("records") or []) if str(x).strip()]
+        if not a_records:
+            a_records = _resolve_ipv4(exch)
+        for ip in a_records:
+            if ip not in seen:
+                seen.add(ip)
+                out.append(ip)
 
     # 2) Common hostnames (fallback)
     for h in (d, f"mail.{d}", f"smtp.{d}"):
-        for ip in _resolve_ipv4(h):
+        a_records = [str(x).strip() for x in (_dns_lookup(h, "A").get("records") or []) if str(x).strip()]
+        if not a_records:
+            a_records = _resolve_ipv4(h)
+        for ip in a_records:
             if ip not in seen:
                 seen.add(ip)
                 out.append(ip)
@@ -7818,42 +7801,58 @@ def sender_domain_counts(sender_emails_text: str) -> dict:
 
 
 def _dns_txt_lookup(name: str) -> dict:
+    return _dns_lookup(name, "TXT")
+
+
+def _dns_lookup(name: str, rtype: str) -> dict:
     q = (name or "").strip().lower().strip(".")
+    typ = (rtype or "TXT").strip().upper()
     if not q:
         return {"ok": False, "records": [], "error": "empty"}
-    if DNS_RESOLVER is None:
-        return {"ok": False, "records": [], "error": "resolver_unavailable"}
-    try:
-        ans = DNS_RESOLVER.resolve(q, "TXT")  # type: ignore
-        records: List[str] = []
-        for r in ans:
-            parts = getattr(r, "strings", None)
-            if parts:
-                try:
-                    txt = "".join(
-                        p.decode("utf-8", errors="ignore") if isinstance(p, (bytes, bytearray)) else str(p)
-                        for p in parts
-                    )
-                except Exception:
-                    txt = str(r)
-            else:
-                txt = str(r)
-            txt = txt.strip().strip('"')
-            if txt:
-                records.append(txt)
-        return {"ok": True, "records": records[:12], "error": ""}
-    except Exception as e:
-        fallback = _dns_txt_lookup_doh(q)
-        if fallback.get("ok"):
-            return fallback
-        base_error = str(e)[:180]
-        fb_error = str(fallback.get("error") or "")[:180]
-        combined = f"{base_error}; doh={fb_error}" if fb_error else base_error
-        return {"ok": False, "records": [], "error": combined}
+    resolver_error = "resolver_unavailable"
+    if DNS_RESOLVER is not None:
+        try:
+            ans = DNS_RESOLVER.resolve(q, typ)  # type: ignore
+            records: List[str] = []
+            for r in ans:
+                if typ == "TXT":
+                    parts = getattr(r, "strings", None)
+                    if parts:
+                        try:
+                            txt = "".join(
+                                p.decode("utf-8", errors="ignore") if isinstance(p, (bytes, bytearray)) else str(p)
+                                for p in parts
+                            )
+                        except Exception:
+                            txt = str(r)
+                    else:
+                        txt = str(r)
+                    txt = txt.strip().strip('"')
+                    if txt:
+                        records.append(txt)
+                elif typ == "MX":
+                    exch = str(getattr(r, "exchange", "") or "").rstrip(".")
+                    if exch:
+                        records.append(exch)
+                else:
+                    item = str(r).strip().strip('"')
+                    if item:
+                        records.append(item)
+            return {"ok": True, "records": records[:12], "error": ""}
+        except Exception as e:
+            resolver_error = str(e)[:180]
+
+    fallback = _dns_lookup_doh(q, typ)
+    if fallback.get("ok"):
+        return fallback
+    fb_error = str(fallback.get("error") or "")[:180]
+    combined = f"{resolver_error}; doh={fb_error}" if fb_error else resolver_error
+    return {"ok": False, "records": [], "error": combined}
 
 
-def _dns_txt_lookup_doh(name: str) -> dict:
+def _dns_lookup_doh(name: str, rtype: str = "TXT") -> dict:
     q = (name or "").strip().lower().strip(".")
+    typ = (rtype or "TXT").strip().upper()
     if not q:
         return {"ok": False, "records": [], "error": "empty"}
 
@@ -7864,7 +7863,7 @@ def _dns_txt_lookup_doh(name: str) -> dict:
     last_error = ""
     for endpoint in DNS_TXT_DOH_ENDPOINTS:
         try:
-            url = f"{endpoint}?name={quote_plus(q)}&type=TXT"
+            url = f"{endpoint}?name={quote_plus(q)}&type={quote_plus(typ)}"
             req = Request(url, headers=headers)
             with urlopen(req, timeout=4) as resp:
                 raw = resp.read()
@@ -7875,7 +7874,13 @@ def _dns_txt_lookup_doh(name: str) -> dict:
                 data = str((item or {}).get("data") or "").strip()
                 if not data:
                     continue
-                data = data.strip('"')
+                if typ == "TXT":
+                    data = data.strip('"')
+                elif typ == "MX":
+                    parts = data.split()
+                    data = (parts[-1] if parts else "").strip().rstrip(".")
+                else:
+                    data = data.strip('"')
                 if data:
                     records.append(data)
             if records:
@@ -7888,6 +7893,11 @@ def _dns_txt_lookup_doh(name: str) -> dict:
         except Exception as e:
             last_error = str(e)[:180]
     return {"ok": False, "records": [], "error": (last_error or "doh_failed")}
+
+
+def _is_dns_transient_error(error: str) -> bool:
+    msg = str(error or "").lower()
+    return any(x in msg for x in ("timeout", "servfail", "refused", "temporary failure", "unreachable"))
 
 
 def _dkim_selectors_from_env() -> List[str]:
