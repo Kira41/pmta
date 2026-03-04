@@ -9519,6 +9519,57 @@ def _classify_accounting_response(ev: dict, typ: str) -> Tuple[str, str]:
     return "temporary_error", full
 
 
+def _classify_backoff_failure(*, spam_blocked: bool, blacklist_blocked: bool, pmta_reason: str) -> Tuple[str, str]:
+    """Classify chunk preflight failures for response/backoff policy.
+
+    Returns: (failure_type, intervention)
+      - failure_type: transient_delay | block | reputation
+      - intervention: short operator hint (empty for no extra action)
+    """
+    reason = str(pmta_reason or "").strip().lower()
+
+    if spam_blocked or blacklist_blocked:
+        return "reputation", "review sender reputation (spam score / DNSBL) before retrying"
+
+    reputation_terms = (
+        "reputation",
+        "spam",
+        "blacklist",
+        "policy",
+        "throttled due to complaints",
+    )
+    if any(t in reason for t in reputation_terms):
+        return "reputation", "investigate domain/IP reputation and PMTA policy signals"
+
+    transient_terms = (
+        "timeout",
+        "timed out",
+        "temporary",
+        "temporarily",
+        "defer",
+        "4xx",
+        "try again",
+        "unreachable",
+        "busy",
+    )
+    if any(t in reason for t in transient_terms):
+        return "transient_delay", ""
+
+    return "block", ""
+
+
+def _compute_backoff_wait_seconds(*, attempt: int, base_s: float, max_s: float, failure_type: str) -> float:
+    """Calculate wait using failure-aware backoff strategy."""
+    base_wait = max(1.0, float(base_s or 1.0)) * (2 ** max(0, int(attempt or 0) - 1))
+    if failure_type == "transient_delay":
+        tuned = max(5.0, base_wait * 0.5)
+    elif failure_type == "reputation":
+        tuned = max(base_wait, base_wait * 2.0)
+    else:
+        tuned = base_wait
+    return min(max(float(max_s or tuned), 1.0), tuned)
+
+
 def _record_accounting_error(job: SendJob, rcpt: str, typ: str, ev: dict) -> None:
     kind, detail = _classify_accounting_response(ev, typ)
     job.accounting_error_counts[kind] = int(job.accounting_error_counts.get(kind, 0) or 0) + 1
@@ -11097,6 +11148,11 @@ def smtp_send_job(
                     blocked_signals.append(("pmta", pmta_reason or "policy block"))
 
                 blocked = spam_blocked or blacklist_blocked or pmta_blocked
+                failure_type, intervention = _classify_backoff_failure(
+                    spam_blocked=spam_blocked,
+                    blacklist_blocked=blacklist_blocked,
+                    pmta_reason=pmta_reason,
+                )
 
                 if blocked and SHIVA_DISABLE_BACKOFF:
                     with JOBS_LOCK:
@@ -11150,7 +11206,12 @@ def smtp_send_job(
                                 provider_sender_cursor[target_domain] = (sender_cursor_base + 1) % max(1, len(from_emails2))
                         break
 
-                    wait_s = min(backoff_max_s, backoff_base_s * (2 ** max(0, attempt - 1)))
+                    wait_s = _compute_backoff_wait_seconds(
+                        attempt=attempt,
+                        base_s=backoff_base_s,
+                        max_s=backoff_max_s,
+                        failure_type=failure_type,
+                    )
                     next_ts = time.time() + wait_s
 
                     entry = {
@@ -11163,6 +11224,8 @@ def smtp_send_job(
                         "subject": sb,
                         "spam_score": sc,
                         "blacklist": bl_detail,
+                        "failure_type": failure_type,
+                        "intervention": intervention,
                     }
 
                     with JOBS_LOCK:
@@ -11170,7 +11233,13 @@ def smtp_send_job(
                         job.chunks_backoff += 1
                         job.push_backoff(entry)
                         job.push_chunk_state({**entry, "status": "backoff"})
-                    job.log("WARN", f"Chunk {chunk_idx_local+1} [{target_domain}]: BACKOFF retry#{attempt} wait={int(wait_s)}s ({rtxt})")
+                    msg = (
+                        f"Chunk {chunk_idx_local+1} [{target_domain}]: BACKOFF retry#{attempt} "
+                        f"wait={int(wait_s)}s type={failure_type} ({rtxt})"
+                    )
+                    if intervention:
+                        msg += f" | intervention={intervention}"
+                    job.log("WARN", msg)
 
                     retry_queue = provider_retry_chunks.setdefault(target_domain, [])
                     retry_queue.append({
