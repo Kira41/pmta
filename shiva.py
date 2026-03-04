@@ -270,6 +270,33 @@ def filter_valid_emails(emails: List[str]) -> Tuple[List[str], List[str]]:
     return valid, invalid
 
 
+def normalize_recipients_for_sending(emails: List[str]) -> Tuple[List[str], int, int]:
+    """Normalize recipients and return (valid_unique, invalid_count, deduplicated_count)."""
+    out: List[str] = []
+    seen: Set[str] = set()
+    invalid_count = 0
+    deduplicated_count = 0
+    for raw in emails or []:
+        e = str(raw or "").strip()
+        if not e or e.count("@") != 1:
+            invalid_count += 1
+            continue
+        local, domain = e.split("@", 1)
+        local = local.strip()
+        domain = domain.strip().lower()
+        if not local or not domain:
+            invalid_count += 1
+            continue
+        norm = f"{local}@{domain}"
+        k = norm.lower()
+        if k in seen:
+            deduplicated_count += 1
+            continue
+        seen.add(k)
+        out.append(norm)
+    return out, invalid_count, deduplicated_count
+
+
 def count_recipient_domains(emails: List[str]) -> Dict[str, int]:
     """Count recipient domains for a list of emails."""
     counts: Dict[str, int] = {}
@@ -295,6 +322,89 @@ def build_provider_buckets(recipients: List[str]) -> Tuple[Dict[str, List[str]],
             order.append(dom)
         buckets[dom].append(rcpt)
     return buckets, order
+
+
+def normalize_and_partition_recipients(
+    recipients: List[str],
+    sender_emails: List[str],
+    seed: str,
+) -> Tuple[Dict[str, Dict[str, List[str]]], Dict[str, Any]]:
+    """Build buckets[sender_email][recipient_domain] with deterministic balancing."""
+    normalized_valid: List[str] = []
+    invalid_count = 0
+    seen: Set[str] = set()
+    deduped_count = 0
+
+    for raw in recipients or []:
+        e = str(raw or "").strip()
+        if not e or e.count("@") != 1:
+            invalid_count += 1
+            continue
+        local, domain = e.split("@", 1)
+        local = local.strip()
+        domain = domain.strip().lower()
+        if not local or not domain:
+            invalid_count += 1
+            continue
+        norm = f"{local}@{domain}"
+        dedupe_key = norm.lower()
+        if dedupe_key in seen:
+            deduped_count += 1
+            continue
+        seen.add(dedupe_key)
+        normalized_valid.append(norm)
+
+    senders = list(sender_emails or [])
+    k = max(1, len(senders))
+    domain_map, domain_order = build_provider_buckets(normalized_valid)
+    out: Dict[str, Dict[str, List[str]]] = {s: {} for s in senders}
+
+    for domain in domain_order:
+        domain_items = list(domain_map.get(domain) or [])
+        seed_material = f"{seed}|{domain}".encode("utf-8", errors="ignore")
+        domain_seed = int(hashlib.sha256(seed_material).hexdigest()[:16], 16)
+        random.Random(domain_seed).shuffle(domain_items)
+
+        n = len(domain_items)
+        base = n // k
+        rem = n % k
+        pos = 0
+        for i in range(k):
+            size = base + (1 if i < rem else 0)
+            if size <= 0:
+                continue
+            slice_items = domain_items[pos : pos + size]
+            pos += size
+            if not slice_items:
+                continue
+            sender = senders[i]
+            if sender not in out:
+                out[sender] = {}
+            out[sender].setdefault(domain, []).extend(slice_items)
+
+    sender_totals: Dict[str, int] = {}
+    sender_domain_counts: Dict[str, Dict[str, int]] = {}
+    for sender, domains in out.items():
+        sender_domain_counts[sender] = {d: len(v) for d, v in domains.items()}
+        sender_totals[sender] = sum(sender_domain_counts[sender].values())
+
+    domain_spread_ok = True
+    for domain in domain_order:
+        counts = [len((out.get(sender) or {}).get(domain) or []) for sender in senders]
+        if counts and (max(counts) - min(counts) > 1):
+            domain_spread_ok = False
+            break
+
+    stats: Dict[str, Any] = {
+        "valid_total": len(normalized_valid),
+        "invalid_count": invalid_count,
+        "deduplicated_count": deduped_count,
+        "sender_totals": sender_totals,
+        "sender_domain_counts": sender_domain_counts,
+        "totals_match": (sum(sender_totals.values()) == len(normalized_valid)),
+        "domain_spread_ok": domain_spread_ok,
+    }
+    return out, stats
 
 
 def map_provider_domains_to_sender_indexes(provider_domains: List[str], sender_emails: List[str]) -> Dict[str, int]:
@@ -11649,47 +11759,65 @@ def smtp_send_job(
         total = len(recipients)
         chunk_idx = 0
 
-        # Provider-aware queues: one recipient domain per queue.
-        # Chunks are scheduled in round-robin between domains, so each domain/provider
-        # gets short sending windows and cool-down gaps before its next chunk.
-        provider_buckets, provider_order = build_provider_buckets(recipients)
-        provider_sender_assignment = map_provider_domains_to_sender_indexes(provider_order, sender_emails)
-        provider_cursor = 0
-
-        # Per-provider sender rotation cursor: if a provider has many recipients,
-        # chunk#1 can use sender/IP-A, chunk#2 sender/IP-B, ... then wrap.
-        provider_sender_cursor: Dict[str, int] = {}
-        # Per-provider sender-domain cursor. This keeps distribution fair across
-        # all configured sender domains instead of pinning every fresh chunk to
-        # the first (or top-ranked) domain.
-        provider_sender_domain_cursor: Dict[str, int] = {}
-        # Global sender cursor to keep sender-domain usage balanced across providers.
-        # This prevents many single-chunk providers from all starting with sender#0.
-        global_sender_cursor = 0
+        # Two-level partitioning (sender -> recipient_domain -> recipients).
+        partition_seed = str(job.campaign_id or job.id or job_id)
+        sender_domain_buckets, partition_stats = normalize_and_partition_recipients(
+            recipients=recipients,
+            sender_emails=sender_emails,
+            seed=partition_seed,
+        )
+        sender_idx_map = {em: i for i, em in enumerate(sender_emails)}
+        sender_bucket_by_idx: Dict[int, Dict[str, List[str]]] = {
+            sender_idx_map[s]: {d: list(v) for d, v in (domains or {}).items()}
+            for s, domains in sender_domain_buckets.items()
+            if s in sender_idx_map
+        }
+        sender_cursor = 0
+        scheduler_rng = random.Random(int(hashlib.sha256(partition_seed.encode("utf-8", errors="ignore")).hexdigest()[:16], 16))
         provider_retry_chunks: Dict[str, List[dict]] = {}
 
-        def _sender_domain_rotation(emails: List[str], start_idx: int) -> Tuple[List[str], Dict[str, List[int]]]:
-            """Return domain order + sender index map, starting from start_idx and preserving round-robin order."""
-            if not emails:
-                return [], {}
-            n = len(emails)
-            ordered_indices = [((int(start_idx or 0) + i) % n) for i in range(n)]
-            domain_to_indices: Dict[str, List[int]] = {}
-            for idx3 in ordered_indices:
-                dom3 = (_extract_domain_from_email(emails[idx3]) or "").strip().lower() or "unknown"
-                domain_to_indices.setdefault(dom3, []).append(idx3)
-            return list(domain_to_indices.keys()), domain_to_indices
+        with JOBS_LOCK:
+            job.log(
+                "INFO",
+                "Recipient partition stats: "
+                f"valid={partition_stats.get('valid_total', 0)} invalid={partition_stats.get('invalid_count', 0)} "
+                f"deduplicated={partition_stats.get('deduplicated_count', 0)} totals_match={partition_stats.get('totals_match')} "
+                f"domain_spread_ok={partition_stats.get('domain_spread_ok')}",
+            )
+            job.log("INFO", f"Per-sender totals: {partition_stats.get('sender_totals', {})}")
+            job.log("INFO", f"Per-sender per-domain counts: {partition_stats.get('sender_domain_counts', {})}")
 
         def _remaining_total() -> int:
-            queued = sum(len(v) for v in provider_buckets.values())
-            queued += sum(len(v) for v in provider_retry_chunks.values())
+            queued = sum(sum(len(v) for v in domains.values()) for domains in sender_bucket_by_idx.values())
+            queued += sum(sum(int(x.get("size") or len(x.get("chunk") or [])) for x in v) for v in provider_retry_chunks.values())
             return queued
 
-        def _domain_has_ready_work(domain: str, now_ts: float) -> bool:
-            retries = provider_retry_chunks.get(domain) or []
+        def _sd_key(sender_idx: int, domain: str) -> str:
+            return f"{int(sender_idx)}|{str(domain)}"
+
+        def _sender_has_ready_work(sender_idx: int, now_ts: float) -> bool:
+            for domain in (sender_bucket_by_idx.get(sender_idx) or {}).keys():
+                retries = provider_retry_chunks.get(_sd_key(sender_idx, domain)) or []
+                if retries and float(retries[0].get("next_retry_ts") or 0.0) <= now_ts:
+                    return True
+                if (sender_bucket_by_idx.get(sender_idx) or {}).get(domain):
+                    return True
+            return False
+
+        def _sender_has_pending_work(sender_idx: int) -> bool:
+            for domain in (sender_bucket_by_idx.get(sender_idx) or {}).keys():
+                retries = provider_retry_chunks.get(_sd_key(sender_idx, domain)) or []
+                if retries:
+                    return True
+                if (sender_bucket_by_idx.get(sender_idx) or {}).get(domain):
+                    return True
+            return False
+
+        def _domain_has_ready_work(sender_idx: int, domain: str, now_ts: float) -> bool:
+            retries = provider_retry_chunks.get(_sd_key(sender_idx, domain)) or []
             if retries and float(retries[0].get("next_retry_ts") or 0.0) <= now_ts:
                 return True
-            return bool(provider_buckets.get(domain))
+            return bool((sender_bucket_by_idx.get(sender_idx) or {}).get(domain))
 
         def _next_retry_wait(now_ts: float) -> Optional[float]:
             waits: List[float] = []
@@ -11700,17 +11828,43 @@ def smtp_send_job(
                 waits.append(max(0.0, next_ts - now_ts))
             return min(waits) if waits else None
 
-        def _next_provider_domain(now_ts: float) -> Optional[str]:
-            nonlocal provider_cursor
-            if not provider_order:
+        def _pick_weighted_domain(sender_idx: int) -> Optional[str]:
+            domains = sender_bucket_by_idx.get(sender_idx) or {}
+            weighted = [(d, len(v)) for d, v in domains.items() if v]
+            if not weighted:
                 return None
-            n = len(provider_order)
-            for step in range(n):
-                idx2 = (provider_cursor + step) % n
-                dom2 = provider_order[idx2]
-                if _domain_has_ready_work(dom2, now_ts):
-                    provider_cursor = (idx2 + 1) % n
+            total_weight = sum(w for _, w in weighted)
+            if total_weight <= 0:
+                return None
+            draw = scheduler_rng.randint(1, total_weight)
+            acc = 0
+            for dom2, w in weighted:
+                acc += w
+                if draw <= acc:
                     return dom2
+            return weighted[-1][0]
+
+        def _next_sender_domain(now_ts: float) -> Optional[Tuple[int, str]]:
+            nonlocal sender_cursor
+            n = len(sender_emails)
+            if n <= 0:
+                return None
+            for step in range(n):
+                sender_idx2 = (sender_cursor + step) % n
+                if not _sender_has_pending_work(sender_idx2):
+                    continue
+                if not _sender_has_ready_work(sender_idx2, now_ts):
+                    continue
+                for dom2 in (sender_bucket_by_idx.get(sender_idx2) or {}).keys():
+                    if _domain_has_ready_work(sender_idx2, dom2, now_ts):
+                        retry_q2 = provider_retry_chunks.get(_sd_key(sender_idx2, dom2)) or []
+                        if retry_q2 and float(retry_q2[0].get("next_retry_ts") or 0.0) <= now_ts:
+                            sender_cursor = (sender_idx2 + 1) % n
+                            return sender_idx2, dom2
+                dom_weighted = _pick_weighted_domain(sender_idx2)
+                if dom_weighted:
+                    sender_cursor = (sender_idx2 + 1) % n
+                    return sender_idx2, dom_weighted
             return None
 
         with JOBS_LOCK:
@@ -11734,7 +11888,6 @@ def smtp_send_job(
 
             from_names2 = rt.get("from_names") or sender_names
             from_emails2 = rt.get("from_emails") or sender_emails
-            provider_sender_assignment = map_provider_domains_to_sender_indexes(provider_order, from_emails2)
             subjects2 = rt.get("subjects") or subjects
             body_format2 = str(rt.get("body_format") or body_format).strip().lower() or body_format
             body_variants2 = rt.get("body_variants") or split_body_variants(body)
@@ -11823,8 +11976,8 @@ def smtp_send_job(
                     pmta_pressure_applied = {}
 
             now_ts = time.time()
-            target_domain = _next_provider_domain(now_ts)
-            if not target_domain:
+            sender_domain_pick = _next_sender_domain(now_ts)
+            if not sender_domain_pick:
                 wait_retry = _next_retry_wait(now_ts)
                 if wait_retry is None:
                     break
@@ -11838,36 +11991,28 @@ def smtp_send_job(
                         return
                 continue
 
-            retry_q = provider_retry_chunks.get(target_domain) or []
+            sender_idx_fixed, target_domain = sender_domain_pick
+            target_key = _sd_key(sender_idx_fixed, target_domain)
+
+            retry_q = provider_retry_chunks.get(target_key) or []
             retry_item = retry_q.pop(0) if retry_q and float(retry_q[0].get("next_retry_ts") or 0.0) <= now_ts else None
-            provider_retry_chunks[target_domain] = retry_q
+            provider_retry_chunks[target_key] = retry_q
 
             if retry_item:
                 chunk = list(retry_item.get("chunk") or [])
                 attempt = int(retry_item.get("attempt") or 0)
                 chunk_subjects = list(retry_item.get("chunk_subjects") or subjects2 or subjects)
                 chunk_body_variants = list(retry_item.get("chunk_body_variants") or body_variants2 or split_body_variants(body))
-                sender_cursor_base = int(
-                    retry_item.get("sender_cursor_base")
-                    or provider_sender_cursor.get(target_domain, global_sender_cursor)
-                    or global_sender_cursor
-                    or 0
-                )
-                sender_domain_cursor = int(retry_item.get("sender_domain_cursor") or 0)
                 sender_attempt_in_domain = int(retry_item.get("sender_attempt_in_domain") or 0)
-                exhausted_sender_domains = list(retry_item.get("exhausted_sender_domains") or [])
                 chunk_idx_local = int(retry_item.get("chunk_idx") or chunk_idx)
             else:
-                bucket = provider_buckets.get(target_domain) or []
+                bucket = (sender_bucket_by_idx.get(sender_idx_fixed) or {}).get(target_domain) or []
                 chunk = bucket[:cs]
-                provider_buckets[target_domain] = bucket[len(chunk):]
+                sender_bucket_by_idx.setdefault(sender_idx_fixed, {})[target_domain] = bucket[len(chunk):]
                 if not chunk:
                     continue
                 attempt = 0
-                sender_cursor_base = int(provider_sender_cursor.get(target_domain, global_sender_cursor) or global_sender_cursor or 0)
-                sender_domain_cursor = int(provider_sender_domain_cursor.get(target_domain, 0) or 0)
                 sender_attempt_in_domain = 0
-                exhausted_sender_domains: List[str] = []
                 chunk_idx_local = chunk_idx
 
             chunk_url = _cyclic_pick(urls2, chunk_idx_local)
@@ -11976,9 +12121,10 @@ def smtp_send_job(
 
             chunk_finished = False
             while True:
-                # rotate senders by sender-domain first; each domain gets its own retry budget.
-                sender_domain_order, sender_domain_map = _sender_domain_rotation(from_emails2, sender_cursor_base)
-                available_domains = [d for d in sender_domain_order if d not in set(exhausted_sender_domains)]
+                if sender_idx_fixed >= len(from_emails2):
+                    sender_idx_fixed = sender_idx_fixed % max(1, len(from_emails2))
+                active_sender_domain = _extract_domain_from_email(from_emails2[sender_idx_fixed]) or "unknown"
+                available_domains = [active_sender_domain]
                 recommendation = learning_recommendation(
                     target_domain,
                     available_domains,
@@ -12023,12 +12169,8 @@ def smtp_send_job(
                     )
                     break
 
-                sender_domain_cursor = sender_domain_cursor % len(available_domains)
-                active_sender_domain = available_domains[sender_domain_cursor]
-                sender_indices = sender_domain_map.get(active_sender_domain) or [0]
-                sender_pick = sender_attempt_in_domain % len(sender_indices)
-                sender_idx = sender_indices[sender_pick]
-                rot = sender_idx + attempt
+                sender_idx = sender_idx_fixed
+                rot = sender_idx_fixed + attempt
 
                 fe = from_emails2[sender_idx % len(from_emails2)]
                 fn = from_names2[sender_idx % len(from_names2)] if from_names2 else "Sender"
@@ -12139,20 +12281,8 @@ def smtp_send_job(
                     )
                     rtxt = " ".join(blocked_reasons) or "blocked"
 
-                    domain_switched = False
-                    next_domain = active_sender_domain
                     sender_attempt_in_domain += 1
                     if sender_attempt_in_domain > pair_retry_cap:
-                        if active_sender_domain not in exhausted_sender_domains:
-                            exhausted_sender_domains.append(active_sender_domain)
-                        remaining_domains = [d for d in recommended_domains if d not in set(exhausted_sender_domains)]
-                        if remaining_domains:
-                            sender_domain_cursor = 0
-                            sender_attempt_in_domain = 0
-                            next_domain = remaining_domains[0]
-                            domain_switched = True
-
-                    if not [d for d in recommended_domains if d not in set(exhausted_sender_domains)]:
                         with JOBS_LOCK:
                             job.skipped += len(chunk)
                             job.chunks_abandoned += 1
@@ -12173,10 +12303,6 @@ def smtp_send_job(
                                 "reason": "all_sender_domains_exhausted",
                             })
                             job.log("ERROR", f"Chunk {chunk_idx_local+1} [{target_domain}]: ABANDONED after exhausting sender domains ({rtxt})")
-                            if from_emails2:
-                                next_sender_cursor = (sender_cursor_base + 1) % max(1, len(from_emails2))
-                                provider_sender_cursor[target_domain] = next_sender_cursor
-                                global_sender_cursor = next_sender_cursor
                         db_finalize_email_learning(
                             job_id=job_id,
                             campaign_id=job.campaign_id,
@@ -12223,13 +12349,11 @@ def smtp_send_job(
                         f"Chunk {chunk_idx_local+1} [{target_domain}]: BACKOFF retry#{attempt} "
                         f"wait={int(wait_s)}s type={failure_type} ({rtxt}) trend={recommendation.get('provider_trend','unknown')}"
                     )
-                    if domain_switched:
-                        msg += f" | switched_sender_domain={next_domain}"
                     if intervention:
                         msg += f" | intervention={intervention}"
                     job.log("WARN", msg)
 
-                    retry_queue = provider_retry_chunks.setdefault(target_domain, [])
+                    retry_queue = provider_retry_chunks.setdefault(target_key, [])
                     retry_queue.append({
                         "chunk_idx": chunk_idx_local,
                         "chunk": list(chunk),
@@ -12237,10 +12361,7 @@ def smtp_send_job(
                         "next_retry_ts": next_ts,
                         "chunk_subjects": list(chunk_subjects),
                         "chunk_body_variants": list(chunk_body_variants),
-                        "sender_cursor_base": sender_cursor_base,
-                        "sender_domain_cursor": sender_domain_cursor,
                         "sender_attempt_in_domain": sender_attempt_in_domain,
-                        "exhausted_sender_domains": list(exhausted_sender_domains),
                     })
                     retry_queue.sort(key=lambda x: float(x.get("next_retry_ts") or 0.0))
                     break
@@ -12320,14 +12441,6 @@ def smtp_send_job(
                         "next_retry_ts": 0,
                         "reason": "",
                     })
-                if from_emails2:
-                    next_sender_cursor = (sender_idx + 1) % max(1, len(from_emails2))
-                    provider_sender_cursor[target_domain] = next_sender_cursor
-                    global_sender_cursor = next_sender_cursor
-                if recommended_domains:
-                    # Advance provider domain cursor so next *fresh* chunk starts on
-                    # a different sender domain, while retries still follow learning.
-                    provider_sender_domain_cursor[target_domain] = (sender_domain_cursor + 1) % len(recommended_domains)
                 chunk_finished = True
                 break
 
@@ -13837,7 +13950,8 @@ def start():
             pass
 
     recipients = parse_recipients("\n".join(recipients))  # dedupe again
-    valid, invalid = filter_valid_emails(recipients)
+    normalized_recipients, rcpt_invalid_count, rcpt_dedup_count = normalize_recipients_for_sending(recipients)
+    valid, invalid = filter_valid_emails(normalized_recipients)
     syntax_valid = list(valid)
 
     # Safe list (optional whitelist)
@@ -13861,6 +13975,8 @@ def start():
     if safe_mx_invalid:
         safe_invalid.extend(safe_mx_invalid)
 
+    invalid_total_count = int(rcpt_invalid_count) + len(invalid)
+
     # Safety fallback: if DNS/probe temporarily rejects everything, do not hard-block
     # a send that already passed syntax validation. This avoids false negatives after
     # transient resolver/provider issues and lets runtime delivery decide.
@@ -13880,7 +13996,7 @@ def start():
 
     if len(valid) == 0:
         sample = ", ".join(invalid[:8])
-        return f"No valid recipients found. Invalid count={len(invalid)}. Examples: {sample}", 400
+        return f"No valid recipients found. Invalid count={invalid_total_count}. Examples: {sample}", 400
 
     if len(valid) > max_rcpt:
         return f"Too many recipients ({len(valid)}). Max allowed is {max_rcpt}.", 400
@@ -13934,7 +14050,7 @@ def start():
         bridge_mode=str(BRIDGE_MODE or "counts"),
         smtp_host=smtp_host,
         total=len(valid),
-        invalid=len(invalid),
+        invalid=invalid_total_count,
         skipped=safe_skipped,
         spam_threshold=spam_threshold,
         spam_score=spam_score,
@@ -13979,7 +14095,7 @@ def start():
             )
     except Exception:
         pass
-    job.log("INFO", f"Accepted {len(valid)} valid recipients, {len(invalid)} invalid recipients filtered.")
+    job.log("INFO", f"Accepted {len(valid)} valid recipients, {invalid_total_count} invalid recipients filtered, deduplicated={rcpt_dedup_count}.")
     if safe_valid:
         job.log("INFO", f"Safe maillist ON: safe_total={len(safe_valid)} safe_invalid={len(safe_invalid)} skipped_by_safe={safe_skipped}.")
     else:
