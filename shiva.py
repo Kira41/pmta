@@ -4449,6 +4449,10 @@ This will remove it from Jobs history.`);
     const rawErrors = Array.isArray(j.accounting_last_errors) ? j.accounting_last_errors : [];
     const onlyErrors = rawErrors.filter(x => (x && x.kind !== 'accepted'));
     const latestError = onlyErrors.length ? onlyErrors[onlyErrors.length - 1] : null;
+    const bouncedN = Number(j.bounced || 0);
+    const deferredN = Number(j.deferred || 0);
+    const complainedN = Number(j.complained || 0);
+    const hasOutcomeFailures = (bouncedN + deferredN + complainedN) > 0;
 
     function errorSignature(detail){
       const txt = (detail || '').toString();
@@ -4473,7 +4477,21 @@ This will remove it from Jobs history.`);
     const topSig = Array.from(sigMap.entries()).sort((a,b)=>b[1].count-a[1].count)[0] || null;
 
     if(!entries.length && !topSig && !latestError){
-      el.textContent = '—';
+      if(hasOutcomeFailures){
+        const estBlocked = Math.max(0, bouncedN + complainedN);
+        const estTemp = Math.max(0, deferredN);
+        const parts = [];
+        parts.push(`Latest code: <b>${estBlocked > 0 ? '5XX*' : '4XX*'}</b>`);
+        parts.push('Most common error: <b>Outcome-only snapshot</b> · <b>1</b>');
+        parts.push('Example: Bridge snapshot provides aggregate outcomes only (no SMTP response text).');
+        parts.push([
+          `4XX temporary: <b>${estTemp}</b>`,
+          `5XX blocked: <b>${estBlocked}</b>`
+        ].join(' · '));
+        el.innerHTML = parts.join('<br>');
+      }else{
+        el.textContent = '—';
+      }
     }else{
       const parts = [];
       if(latestError){
@@ -4522,7 +4540,17 @@ This will remove it from Jobs history.`);
     // Error 1 (summary): latest status keyword from PMTA (bounced/deferred/complained/blocked/backoff...)
     const el2 = qk(card,'lastErrors');
     if(el2){
-      if(!latestError){ el2.textContent = '—'; }
+      if(!latestError){
+        if(hasOutcomeFailures){
+          if(bouncedN + complainedN > 0){
+            el2.innerHTML = `• [5XX*] bounced/complained · count=${esc(String(bouncedN + complainedN))}`;
+          }else{
+            el2.innerHTML = `• [4XX*] deferred · count=${esc(String(deferredN))}`;
+          }
+        }else{
+          el2.textContent = '—';
+        }
+      }
       else{
         const detail = (latestError.detail || '').toString();
         const code = pickErrorCode(detail) || ((latestError.kind === 'temporary_error') ? '4XX' : '5XX');
@@ -4534,7 +4562,15 @@ This will remove it from Jobs history.`);
     // Error 2 (details): latest full PowerMTA response detail
     const el3 = qk(card,'lastErrors2');
     if(el3){
-      if(!latestError){ el3.textContent = '—'; }
+      if(!latestError){
+        if(hasOutcomeFailures){
+          const mode = ((j.bridge_mode || '').toString().toLowerCase() || 'counts');
+          const src = (mode === 'legacy') ? 'event ingestion' : 'bridge snapshot';
+          el3.innerHTML = `• aggregate outcomes present (bounced=${esc(String(bouncedN))} · deferred=${esc(String(deferredN))} · complained=${esc(String(complainedN))}) · source=${esc(src)} · no per-recipient SMTP detail in this mode`;
+        }else{
+          el3.textContent = '—';
+        }
+      }
       else{
         const typ = (latestError.type || '').toString();
         const kind = (latestError.kind || '').toString();
