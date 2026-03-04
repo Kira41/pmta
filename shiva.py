@@ -1132,6 +1132,21 @@ def db_clear_all() -> None:
 
 def _job_snapshot_dict(job: 'SendJob') -> dict:
     """Create a JSON-serializable snapshot of the job (bounded lists)."""
+    unique_done = int(job.chunks_done or 0)
+    unique_total = int(job.chunks_total or 0)
+    if unique_done < 0:
+        unique_done = 0
+    if unique_total < unique_done:
+        unique_total = unique_done
+
+    attempts_total = None
+    try:
+        attempts_total = int(unique_done + int(job.chunks_backoff or 0))
+        if attempts_total < unique_done:
+            attempts_total = unique_done
+    except Exception:
+        attempts_total = None
+
     return {
         "id": job.id,
         "campaign_id": job.campaign_id,
@@ -1155,6 +1170,9 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "stop_reason": job.stop_reason,
         "chunks_total": int(job.chunks_total or 0),
         "chunks_done": int(job.chunks_done or 0),
+        "chunk_unique_done": unique_done,
+        "chunk_unique_total": unique_total,
+        "chunk_attempts_total": attempts_total,
         "chunks_backoff": int(job.chunks_backoff or 0),
         "chunks_abandoned": int(job.chunks_abandoned or 0),
         "current_chunk": int(job.current_chunk or -1),
@@ -3735,6 +3753,7 @@ PAGE_JOBS = r"""
             <div class="mini" data-k="progressText">—</div>
             <div class="bar"><div data-k="barSend"></div></div>
             <div class="mini" style="margin-top:8px" data-k="chunksText">—</div>
+            <div class="mini" data-k="attemptsText" style="display:none">—</div>
             <div class="bar"><div data-k="barChunks"></div></div>
             <div class="mini" style="margin-top:8px" data-k="domainsText">—</div>
             <div class="bar"><div data-k="barDomains"></div></div>
@@ -4603,11 +4622,34 @@ This will remove it from Jobs history.`);
     qk(card,'barSend').style.width = pSend + '%';
     qk(card,'progressText').textContent = `Send progress: ${pSend}% (${done}/${total})`; 
 
-    const cd = Number(j.chunks_done||0);
-    const ct = Number(j.chunks_total||0);
-    const pChunks = pct(cd, ct);
+    const legacyDone = Number(j.chunks_done||0);
+    const legacyTotal = Number(j.chunks_total||0);
+    let chunkUniqueDone = Number(j.chunk_unique_done);
+    if(!Number.isFinite(chunkUniqueDone)) chunkUniqueDone = legacyDone;
+    if(!Number.isFinite(chunkUniqueDone) || chunkUniqueDone < 0) chunkUniqueDone = 0;
+
+    let chunkUniqueTotal = Number(j.chunk_unique_total);
+    if(!Number.isFinite(chunkUniqueTotal)) chunkUniqueTotal = legacyTotal;
+    if(!Number.isFinite(chunkUniqueTotal) || chunkUniqueTotal < 0) chunkUniqueTotal = 0;
+    if(chunkUniqueTotal < chunkUniqueDone) chunkUniqueTotal = chunkUniqueDone;
+
+    const pChunks = pct(chunkUniqueDone, chunkUniqueTotal);
     qk(card,'barChunks').style.width = pChunks + '%';
-    qk(card,'chunksText').textContent = `Chunks: ${cd}/${ct} · backoff_events=${Number(j.chunks_backoff||0)} · abandoned=${Number(j.chunks_abandoned||0)}`;
+    qk(card,'chunksText').textContent = `Chunks: ${chunkUniqueDone}/${chunkUniqueTotal} done · backoff_events=${Number(j.chunks_backoff||0)} · abandoned=${Number(j.chunks_abandoned||0)}`;
+    const attemptsEl = qk(card,'attemptsText');
+    if(attemptsEl){
+      let attemptsTotal = Number(j.chunk_attempts_total);
+      if(!Number.isFinite(attemptsTotal)) attemptsTotal = null;
+      if(attemptsTotal !== null && attemptsTotal < 0) attemptsTotal = null;
+      if(attemptsTotal !== null && attemptsTotal < chunkUniqueDone) attemptsTotal = chunkUniqueDone;
+      const hasRetries = attemptsTotal !== null && attemptsTotal > chunkUniqueDone;
+      if(hasRetries){
+        attemptsEl.style.display = '';
+        attemptsEl.textContent = `Attempts: ${attemptsTotal}`;
+      }else{
+        attemptsEl.style.display = 'none';
+      }
+    }
 
     const plan = j.domain_plan || {};
     const planTotal = Object.values(plan).reduce((a,v)=>a+Number(v||0),0);
