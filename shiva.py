@@ -3656,7 +3656,7 @@ PAGE_JOBS = r"""
               <div style="height:10px"></div>
 
               <!-- 7) error types -->
-              <div class="mini"><b>Error types</b></div>
+              <div class="mini"><b>Error type</b></div>
               <div class="mini" data-k="errorTypes">—</div>
 
               <div style="height:10px"></div>
@@ -3665,7 +3665,7 @@ PAGE_JOBS = r"""
               <div class="mini" data-k="lastErrors">—</div>
 
               <div style="height:10px"></div>
-              <div class="mini"><b>Error 2 (detailed)</b></div>
+              <div class="mini"><b>Error 2 (details)</b></div>
               <div class="mini" data-k="lastErrors2">—</div>
 
               <div style="height:10px"></div>
@@ -3673,7 +3673,7 @@ PAGE_JOBS = r"""
               <div class="mini" data-k="internalErrors">—</div>
 
               <div style="height:10px"></div>
-              <div class="mini"><b>Internal Error Receiver (Shiva ← Bridge.py)</b></div>
+              <div class="mini"><b>Last connection review (Shiva bridge)</b></div>
               <div class="mini" data-k="bridgeReceiver">—</div>
             </div>
 
@@ -3876,6 +3876,7 @@ This will remove it from Jobs history.`);
 
     const rawErrors = Array.isArray(j.accounting_last_errors) ? j.accounting_last_errors : [];
     const onlyErrors = rawErrors.filter(x => (x && x.kind !== 'accepted'));
+    const latestError = onlyErrors.length ? onlyErrors[onlyErrors.length - 1] : null;
 
     function errorSignature(detail){
       const txt = (detail || '').toString();
@@ -3899,10 +3900,14 @@ This will remove it from Jobs history.`);
     }
     const topSig = Array.from(sigMap.entries()).sort((a,b)=>b[1].count-a[1].count)[0] || null;
 
-    if(!entries.length && !topSig){
+    if(!entries.length && !topSig && !latestError){
       el.textContent = '—';
     }else{
       const parts = [];
+      if(latestError){
+        const latestCode = pickErrorCode(latestError.detail || '') || '—';
+        parts.push(`Latest code: <b>${esc(latestCode)}</b>`);
+      }
       if(topSig){
         const [sig, info] = topSig;
         parts.push(`Most common error: <b>${esc(sig)}</b> · <b>${Number(info.count||0)}</b>`);
@@ -3931,34 +3936,39 @@ This will remove it from Jobs history.`);
       return '';
     }
 
-    // Error 1 (summary): latest 10 with compact "code + short reason"
-    const re10 = onlyErrors.slice().reverse().slice(0,10);
+    function pickErrorSummary(x){
+      if(!x) return '';
+      const typ = (x.type || '').toString().trim().toLowerCase();
+      const kind = (x.kind || '').toString().trim().toLowerCase();
+      if(typ) return typ;
+      if(kind === 'temporary_error') return 'deferred';
+      if(kind === 'blocked') return 'blocked';
+      if(kind === 'accepted') return 'accepted';
+      return kind || 'unknown';
+    }
+
+    // Error 1 (summary): latest status keyword from PMTA (bounced/deferred/complained/blocked/backoff...)
     const el2 = qk(card,'lastErrors');
     if(el2){
-      if(!re10.length){ el2.textContent = '—'; }
+      if(!latestError){ el2.textContent = '—'; }
       else{
-        el2.innerHTML = re10.map(x => {
-          const detail = (x.detail || '').toString();
-          const code = pickErrorCode(detail) || ((x.kind === 'temporary_error') ? '4XX' : '5XX');
-          const summary = shortWords(detail, 4) || 'unknown reason';
-          return `• [${esc(code)}] ${esc(summary)}`;
-        }).join('<br>');
+        const detail = (latestError.detail || '').toString();
+        const code = pickErrorCode(detail) || ((latestError.kind === 'temporary_error') ? '4XX' : '5XX');
+        const summary = pickErrorSummary(latestError) || shortWords(detail, 4) || 'unknown';
+        el2.innerHTML = `• [${esc(code)}] ${esc(summary)}`;
       }
     }
 
-    // Error 2 (detailed): latest 20 with full details
-    const re20 = onlyErrors.slice().reverse().slice(0,20);
+    // Error 2 (details): latest full PowerMTA response detail
     const el3 = qk(card,'lastErrors2');
     if(el3){
-      if(!re20.length){ el3.textContent = '—'; }
+      if(!latestError){ el3.textContent = '—'; }
       else{
-        el3.innerHTML = re20.map(x => {
-          const typ = (x.type || '').toString();
-          const kind = (x.kind || '').toString();
-          const code = pickErrorCode(x.detail || '');
-          const codePart = code ? ` · code=${esc(code)}` : '';
-          return `• ${esc(x.email || '—')} · type=${esc(typ || 'unknown')} · kind=${esc(kind || 'unknown')}${codePart} · ${esc(x.detail || '')}`;
-        }).join('<br>');
+        const typ = (latestError.type || '').toString();
+        const kind = (latestError.kind || '').toString();
+        const code = pickErrorCode(latestError.detail || '');
+        const codePart = code ? ` · code=${esc(code)}` : '';
+        el3.innerHTML = `• ${esc(latestError.email || '—')} · type=${esc(typ || 'unknown')} · kind=${esc(kind || 'unknown')}${codePart} · ${esc(latestError.detail || '')}`;
       }
     }
 
