@@ -1018,6 +1018,60 @@ def db_init() -> None:
                    )"""
             )
 
+            # Attempt-level delivery learning ledger.
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS email_attempt_logs(
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       series_id TEXT NOT NULL,
+                       job_id TEXT NOT NULL,
+                       campaign_id TEXT NOT NULL,
+                       chunk_idx INTEGER NOT NULL,
+                       sender_domain TEXT NOT NULL,
+                       provider_domain TEXT NOT NULL,
+                       attempt_number INTEGER NOT NULL,
+                       outcome TEXT NOT NULL,
+                       attempt_ts TEXT NOT NULL,
+                       created_at TEXT NOT NULL
+                   )"""
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_attempt_logs_series ON email_attempt_logs(series_id, attempt_number)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_attempt_logs_pair ON email_attempt_logs(sender_domain, provider_domain, attempt_ts)")
+
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS email_attempt_learning(
+                       series_id TEXT PRIMARY KEY,
+                       job_id TEXT NOT NULL,
+                       campaign_id TEXT NOT NULL,
+                       chunk_idx INTEGER NOT NULL,
+                       sender_domain TEXT NOT NULL,
+                       provider_domain TEXT NOT NULL,
+                       attempts_taken INTEGER NOT NULL,
+                       outcome TEXT NOT NULL,
+                       first_attempt_ts TEXT NOT NULL,
+                       last_attempt_ts TEXT NOT NULL,
+                       duration_seconds REAL NOT NULL,
+                       created_at TEXT NOT NULL,
+                       updated_at TEXT NOT NULL
+                   )"""
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_attempt_learning_pair ON email_attempt_learning(sender_domain, provider_domain, last_attempt_ts)")
+
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS sender_provider_stats(
+                       sender_domain TEXT NOT NULL,
+                       provider_domain TEXT NOT NULL,
+                       total_series INTEGER NOT NULL,
+                       success_series INTEGER NOT NULL,
+                       failure_series INTEGER NOT NULL,
+                       total_attempts INTEGER NOT NULL,
+                       total_duration_seconds REAL NOT NULL,
+                       last_outcome TEXT NOT NULL,
+                       last_seen_ts TEXT NOT NULL,
+                       updated_at TEXT NOT NULL,
+                       PRIMARY KEY(sender_domain, provider_domain)
+                   )"""
+            )
+
             conn.commit()
 
             # Optional: clear DB on startup (off by default)
@@ -1029,6 +1083,9 @@ def db_init() -> None:
                 conn.execute("DELETE FROM job_outcomes")
                 conn.execute("DELETE FROM job_recipients")
                 conn.execute("DELETE FROM accounting_events")
+                conn.execute("DELETE FROM email_attempt_logs")
+                conn.execute("DELETE FROM email_attempt_learning")
+                conn.execute("DELETE FROM sender_provider_stats")
                 conn.commit()
         finally:
             conn.close()
@@ -1121,6 +1178,9 @@ def db_clear_all() -> None:
             conn.execute("DELETE FROM job_outcomes")
             conn.execute("DELETE FROM job_recipients")
             conn.execute("DELETE FROM accounting_events")
+            conn.execute("DELETE FROM email_attempt_logs")
+            conn.execute("DELETE FROM email_attempt_learning")
+            conn.execute("DELETE FROM sender_provider_stats")
             conn.commit()
         finally:
             conn.close()
@@ -1371,6 +1431,222 @@ def _email_domain(raw_email: Any) -> str:
     if not dom or "." not in dom:
         return ""
     return dom
+
+
+def _learning_series_id(job_id: str, chunk_idx: int, provider_domain: str) -> str:
+    return f"{str(job_id or '').strip()}:{int(chunk_idx or 0)}:{str(provider_domain or '').strip().lower()}"
+
+
+def db_log_email_attempt(*, job_id: str, campaign_id: str, chunk_idx: int, sender_domain: str, provider_domain: str, attempt_number: int, outcome: str) -> None:
+    series_id = _learning_series_id(job_id, chunk_idx, provider_domain)
+    payload = (
+        series_id,
+        str(job_id or "").strip(),
+        str(campaign_id or "").strip(),
+        int(chunk_idx or 0),
+        str(sender_domain or "").strip().lower(),
+        str(provider_domain or "").strip().lower(),
+        max(1, int(attempt_number or 1)),
+        str(outcome or "unknown").strip().lower(),
+        now_iso(),
+        now_iso(),
+    )
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            conn.execute(
+                "INSERT INTO email_attempt_logs(series_id, job_id, campaign_id, chunk_idx, sender_domain, provider_domain, attempt_number, outcome, attempt_ts, created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                payload,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def db_finalize_email_learning(*, job_id: str, campaign_id: str, chunk_idx: int, sender_domain: str, provider_domain: str, attempts_taken: int, outcome: str) -> None:
+    series_id = _learning_series_id(job_id, chunk_idx, provider_domain)
+    sender_dom = str(sender_domain or "").strip().lower()
+    provider_dom = str(provider_domain or "").strip().lower()
+    final_outcome = "success" if str(outcome or "").strip().lower() == "success" else "failure"
+    attempts_n = max(1, int(attempts_taken or 1))
+    now_ts = now_iso()
+
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            first_last = conn.execute(
+                "SELECT MIN(attempt_ts), MAX(attempt_ts) FROM email_attempt_logs WHERE series_id=?",
+                (series_id,),
+            ).fetchone()
+            first_attempt_ts = str((first_last[0] if first_last and first_last[0] else now_ts) or now_ts)
+            last_attempt_ts = str((first_last[1] if first_last and first_last[1] else now_ts) or now_ts)
+
+            duration_s = 0.0
+            try:
+                dt0 = datetime.fromisoformat(first_attempt_ts.replace("Z", "+00:00"))
+                dt1 = datetime.fromisoformat(last_attempt_ts.replace("Z", "+00:00"))
+                duration_s = max(0.0, (dt1 - dt0).total_seconds())
+            except Exception:
+                duration_s = 0.0
+
+            existing = conn.execute(
+                "SELECT outcome FROM email_attempt_learning WHERE series_id=?",
+                (series_id,),
+            ).fetchone()
+            already_finalized = bool(existing and str(existing[0] or "").strip())
+
+            _exec_upsert_compat(
+                conn,
+                "INSERT INTO email_attempt_learning(series_id, job_id, campaign_id, chunk_idx, sender_domain, provider_domain, attempts_taken, outcome, first_attempt_ts, last_attempt_ts, duration_seconds, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(series_id) DO UPDATE SET sender_domain=excluded.sender_domain, provider_domain=excluded.provider_domain, attempts_taken=excluded.attempts_taken, outcome=excluded.outcome, first_attempt_ts=excluded.first_attempt_ts, last_attempt_ts=excluded.last_attempt_ts, duration_seconds=excluded.duration_seconds, updated_at=excluded.updated_at",
+                (series_id, str(job_id or ""), str(campaign_id or ""), int(chunk_idx or 0), sender_dom, provider_dom, attempts_n, final_outcome, first_attempt_ts, last_attempt_ts, float(duration_s), now_ts, now_ts),
+                "UPDATE email_attempt_learning SET sender_domain=?, provider_domain=?, attempts_taken=?, outcome=?, first_attempt_ts=?, last_attempt_ts=?, duration_seconds=?, updated_at=? WHERE series_id=?",
+                (sender_dom, provider_dom, attempts_n, final_outcome, first_attempt_ts, last_attempt_ts, float(duration_s), now_ts, series_id),
+                "INSERT INTO email_attempt_learning(series_id, job_id, campaign_id, chunk_idx, sender_domain, provider_domain, attempts_taken, outcome, first_attempt_ts, last_attempt_ts, duration_seconds, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (series_id, str(job_id or ""), str(campaign_id or ""), int(chunk_idx or 0), sender_dom, provider_dom, attempts_n, final_outcome, first_attempt_ts, last_attempt_ts, float(duration_s), now_ts, now_ts),
+            )
+
+            if not already_finalized and sender_dom and provider_dom:
+                prev = conn.execute(
+                    "SELECT total_series, success_series, failure_series, total_attempts, total_duration_seconds FROM sender_provider_stats WHERE sender_domain=? AND provider_domain=?",
+                    (sender_dom, provider_dom),
+                ).fetchone()
+                t = int(prev[0] or 0) if prev else 0
+                s = int(prev[1] or 0) if prev else 0
+                f = int(prev[2] or 0) if prev else 0
+                a = int(prev[3] or 0) if prev else 0
+                d = float(prev[4] or 0.0) if prev else 0.0
+                t += 1
+                if final_outcome == "success":
+                    s += 1
+                else:
+                    f += 1
+                a += attempts_n
+                d += float(duration_s)
+                _exec_upsert_compat(
+                    conn,
+                    "INSERT INTO sender_provider_stats(sender_domain, provider_domain, total_series, success_series, failure_series, total_attempts, total_duration_seconds, last_outcome, last_seen_ts, updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(sender_domain, provider_domain) DO UPDATE SET total_series=excluded.total_series, success_series=excluded.success_series, failure_series=excluded.failure_series, total_attempts=excluded.total_attempts, total_duration_seconds=excluded.total_duration_seconds, last_outcome=excluded.last_outcome, last_seen_ts=excluded.last_seen_ts, updated_at=excluded.updated_at",
+                    (sender_dom, provider_dom, t, s, f, a, d, final_outcome, last_attempt_ts, now_ts),
+                    "UPDATE sender_provider_stats SET total_series=?, success_series=?, failure_series=?, total_attempts=?, total_duration_seconds=?, last_outcome=?, last_seen_ts=?, updated_at=? WHERE sender_domain=? AND provider_domain=?",
+                    (t, s, f, a, d, final_outcome, last_attempt_ts, now_ts, sender_dom, provider_dom),
+                    "INSERT INTO sender_provider_stats(sender_domain, provider_domain, total_series, success_series, failure_series, total_attempts, total_duration_seconds, last_outcome, last_seen_ts, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (sender_dom, provider_dom, t, s, f, a, d, final_outcome, last_attempt_ts, now_ts),
+                )
+
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def learning_recommendation(provider_domain: str, sender_domains: List[str], max_retry_cap: int) -> Dict[str, Any]:
+    provider = str(provider_domain or "").strip().lower()
+    if not provider or not sender_domains:
+        return {"sender_domains": list(sender_domains or []), "retry_cap": max(0, int(max_retry_cap or 0))}
+    ordered = list(dict.fromkeys([str(x or "").strip().lower() for x in sender_domains if str(x or "").strip()]))
+    if not ordered:
+        return {"sender_domains": [], "retry_cap": max(0, int(max_retry_cap or 0))}
+
+    stats: Dict[str, Dict[str, float]] = {}
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            placeholders = ",".join(["?"] * len(ordered))
+            rows = conn.execute(
+                f"SELECT sender_domain, total_series, success_series FROM sender_provider_stats WHERE provider_domain=? AND sender_domain IN ({placeholders})",
+                [provider] + ordered,
+            ).fetchall()
+        finally:
+            conn.close()
+
+    for row in rows:
+        dom = str(row[0] or "").strip().lower()
+        total = int(row[1] or 0)
+        succ = int(row[2] or 0)
+        rate = (succ + 1.0) / (total + 2.0)  # smoothed score for online adaptation
+        stats[dom] = {"total": total, "success": succ, "rate": rate}
+
+    ordered.sort(key=lambda d: (float(stats.get(d, {}).get("rate", 0.5)), float(stats.get(d, {}).get("total", 0))), reverse=True)
+
+    retry_cap = max(0, int(max_retry_cap or 0))
+    top = stats.get(ordered[0]) if ordered else None
+    if top and int(top.get("total", 0)) >= 12:
+        r = float(top.get("rate", 0.5))
+        if r < 0.35:
+            retry_cap = min(retry_cap, 1)
+        elif r < 0.5:
+            retry_cap = min(retry_cap, 2)
+
+    return {
+        "sender_domains": ordered,
+        "retry_cap": retry_cap,
+        "top_sender_success_rate": float(top.get("rate", 0.0)) if top else 0.0,
+        "top_sender_samples": int(top.get("total", 0)) if top else 0,
+    }
+
+
+def db_learning_summary(limit: int = 25) -> Dict[str, Any]:
+    lim = max(1, min(100, int(limit or 25)))
+    out: Dict[str, Any] = {"providers": [], "senders": [], "pairs": [], "attempts_to_success": {}, "generated_at": now_iso()}
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            pair_rows = conn.execute(
+                "SELECT sender_domain, provider_domain, total_series, success_series, failure_series, total_attempts, total_duration_seconds, last_seen_ts "
+                "FROM sender_provider_stats ORDER BY total_series DESC, success_series DESC LIMIT ?",
+                (lim,),
+            ).fetchall()
+            provider_rows = conn.execute(
+                "SELECT provider_domain, COUNT(*) AS pair_count, SUM(total_series), SUM(success_series), SUM(total_attempts), SUM(total_duration_seconds) "
+                "FROM sender_provider_stats GROUP BY provider_domain ORDER BY SUM(total_series) DESC LIMIT ?",
+                (lim,),
+            ).fetchall()
+            sender_rows = conn.execute(
+                "SELECT sender_domain, COUNT(*) AS pair_count, SUM(total_series), SUM(success_series), SUM(total_attempts), SUM(total_duration_seconds) "
+                "FROM sender_provider_stats GROUP BY sender_domain ORDER BY SUM(total_series) DESC LIMIT ?",
+                (lim,),
+            ).fetchall()
+            succ_row = conn.execute(
+                "SELECT AVG(attempts_taken), AVG(duration_seconds) FROM email_attempt_learning WHERE outcome='success'",
+            ).fetchone()
+        finally:
+            conn.close()
+
+    for r in pair_rows:
+        total = int(r[2] or 0)
+        succ = int(r[3] or 0)
+        out["pairs"].append({
+            "sender_domain": str(r[0] or ""),
+            "provider_domain": str(r[1] or ""),
+            "total_series": total,
+            "success_series": succ,
+            "failure_series": int(r[4] or 0),
+            "success_rate": (float(succ) / float(total)) if total > 0 else 0.0,
+            "avg_attempts": (float(r[5] or 0.0) / float(total)) if total > 0 else 0.0,
+            "avg_duration_seconds": (float(r[6] or 0.0) / float(total)) if total > 0 else 0.0,
+            "last_seen_ts": str(r[7] or ""),
+        })
+
+    for rows, key in ((provider_rows, "providers"), (sender_rows, "senders")):
+        for r in rows:
+            total = int(r[2] or 0)
+            succ = int(r[3] or 0)
+            out[key].append({
+                "domain": str(r[0] or ""),
+                "pair_count": int(r[1] or 0),
+                "total_series": total,
+                "success_rate": (float(succ) / float(total)) if total > 0 else 0.0,
+                "avg_attempts": (float(r[4] or 0.0) / float(total)) if total > 0 else 0.0,
+                "avg_duration_seconds": (float(r[5] or 0.0) / float(total)) if total > 0 else 0.0,
+            })
+
+    out["attempts_to_success"] = {
+        "avg_attempts": float((succ_row[0] if succ_row and succ_row[0] is not None else 0.0) or 0.0),
+        "avg_duration_seconds": float((succ_row[1] if succ_row and succ_row[1] is not None else 0.0) or 0.0),
+    }
+    return out
 
 
 def _job_provider_breakdown(job_id: str, limit: int = 6) -> List[dict]:
@@ -11101,6 +11377,9 @@ def smtp_send_job(
                 # rotate senders by sender-domain first; each domain gets its own retry budget.
                 sender_domain_order, sender_domain_map = _sender_domain_rotation(from_emails2, sender_cursor_base)
                 available_domains = [d for d in sender_domain_order if d not in set(exhausted_sender_domains)]
+                recommendation = learning_recommendation(target_domain, available_domains, max_backoff_retries)
+                available_domains = list(recommendation.get("sender_domains") or available_domains)
+                pair_retry_cap = max(0, int(recommendation.get("retry_cap", max_backoff_retries) or max_backoff_retries))
                 if not available_domains:
                     with JOBS_LOCK:
                         job.skipped += len(chunk)
@@ -11122,6 +11401,15 @@ def smtp_send_job(
                             "reason": "all_sender_domains_exhausted",
                         })
                         job.log("ERROR", f"Chunk {chunk_idx_local+1} [{target_domain}]: ABANDONED after exhausting all sender domains.")
+                    db_finalize_email_learning(
+                        job_id=job_id,
+                        campaign_id=job.campaign_id,
+                        chunk_idx=chunk_idx_local,
+                        sender_domain="",
+                        provider_domain=target_domain,
+                        attempts_taken=max(1, attempt + 1),
+                        outcome="failure",
+                    )
                     break
 
                 sender_domain_cursor = sender_domain_cursor % len(available_domains)
@@ -11224,16 +11512,26 @@ def smtp_send_job(
                         "pmta_reason": pmta_reason,
                         "pmta_slow": pmta_slow,
                         "target_domain": target_domain,
+                        "learning": recommendation,
                     })
 
                 if blocked:
                     attempt += 1
+                    db_log_email_attempt(
+                        job_id=job_id,
+                        campaign_id=job.campaign_id,
+                        chunk_idx=chunk_idx_local,
+                        sender_domain=active_sender_domain,
+                        provider_domain=target_domain,
+                        attempt_number=attempt,
+                        outcome=f"blocked_{failure_type}",
+                    )
                     rtxt = " ".join(blocked_reasons) or "blocked"
 
                     domain_switched = False
                     next_domain = active_sender_domain
                     sender_attempt_in_domain += 1
-                    if sender_attempt_in_domain > max_backoff_retries:
+                    if sender_attempt_in_domain > pair_retry_cap:
                         if active_sender_domain not in exhausted_sender_domains:
                             exhausted_sender_domains.append(active_sender_domain)
                         remaining_domains = [d for d in sender_domain_order if d not in set(exhausted_sender_domains)]
@@ -11266,6 +11564,15 @@ def smtp_send_job(
                             job.log("ERROR", f"Chunk {chunk_idx_local+1} [{target_domain}]: ABANDONED after exhausting sender domains ({rtxt})")
                             if from_emails2:
                                 provider_sender_cursor[target_domain] = (sender_cursor_base + 1) % max(1, len(from_emails2))
+                        db_finalize_email_learning(
+                            job_id=job_id,
+                            campaign_id=job.campaign_id,
+                            chunk_idx=chunk_idx_local,
+                            sender_domain=active_sender_domain,
+                            provider_domain=target_domain,
+                            attempts_taken=max(1, attempt),
+                            outcome="failure",
+                        )
                         break
 
                     wait_s = _compute_backoff_wait_seconds(
@@ -11357,6 +11664,24 @@ def smtp_send_job(
                     workers2=workers2,
                     urls2=urls2,
                     src2=src2,
+                )
+                db_log_email_attempt(
+                    job_id=job_id,
+                    campaign_id=job.campaign_id,
+                    chunk_idx=chunk_idx_local,
+                    sender_domain=active_sender_domain,
+                    provider_domain=target_domain,
+                    attempt_number=max(1, attempt + 1),
+                    outcome="sent",
+                )
+                db_finalize_email_learning(
+                    job_id=job_id,
+                    campaign_id=job.campaign_id,
+                    chunk_idx=chunk_idx_local,
+                    sender_domain=active_sender_domain,
+                    provider_domain=target_domain,
+                    attempts_taken=max(1, attempt + 1),
+                    outcome="success",
                 )
 
                 if _should_stop():
@@ -12325,6 +12650,15 @@ def api_version():
         "version": APP_VERSION,
         "schema_keys": [str(it.get("key") or "") for it in (APP_CONFIG_SCHEMA or [])],
     })
+
+
+@app.get("/api/learning/summary")
+def api_learning_summary():
+    try:
+        limit = int((request.args.get("limit") or "25").strip())
+    except Exception:
+        limit = 25
+    return jsonify({"ok": True, "summary": db_learning_summary(limit=limit)})
 
 
 def _cfg_validate_and_canon(key: str, value: Any) -> Tuple[bool, str, str]:
