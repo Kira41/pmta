@@ -3882,6 +3882,9 @@ PAGE_JOBS = r"""
               <div class="pmtaLive" data-k="pmtaLine">—</div>
               <div class="mini" style="margin-top:6px" data-k="pmtaNote">Note: <b>sent</b> = accepted by PMTA (client-side). Delivery may still be queued/deferred.</div>
               <div class="mini" style="margin-top:6px" data-k="pmtaDiag">Diag: —</div>
+              <div class="mini" style="margin-top:8px"><b>Outcomes (PMTA accounting)</b></div>
+              <div class="outcomesWrap" data-k="outcomes">—</div>
+              <div class="outTrend" data-k="outcomeTrend">—</div>
             </details>
           </div>
 
@@ -3928,9 +3931,6 @@ PAGE_JOBS = r"""
               <details class="errorFold" style="margin-top:8px">
                 <summary>Legacy quality + errors (unchanged data)</summary>
                 <div class="mini" style="margin-top:8px" data-k="counters">—</div>
-                <div class="mini" style="margin-top:8px"><b>Outcomes (PMTA accounting)</b></div>
-                <div class="outcomesWrap" data-k="outcomes">—</div>
-                <div class="outTrend" data-k="outcomeTrend">—</div>
                 <div class="mini" style="margin-top:8px"><b>Error type</b></div>
                 <div class="mini" data-k="errorTypes">—</div>
                 <div class="mini" style="margin-top:8px"><b>Error summary</b></div>
