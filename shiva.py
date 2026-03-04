@@ -4065,6 +4065,7 @@ PAGE_JOBS = r"""
     .pmtaVal.bad{ color: var(--bad); }
     .pmtaBig{ font-size: 22px; font-weight: 1000; letter-spacing: .2px; }
     .pmtaSub{ margin-top:8px; font-size: 11px; color: rgba(255,255,255,.60); line-height: 1.35; word-break: break-word; overflow-wrap:anywhere; }
+    .pmtaHint{ margin-top:6px; font-size: 11px; color: rgba(255,255,255,.52); line-height: 1.35; }
 
     .pmtaBanner{
       border:1px solid rgba(255,255,255,.14);
@@ -4341,11 +4342,13 @@ PAGE_JOBS = r"""
             <!-- 2) Current chunk + 3) backoff info -->
             <div class="panel">
               <h4>Current chunk</h4>
+              <div class="mini">Current send settings + top active domains in this running chunk.</div>
               <div class="mini" data-k="chunkLine">—</div>
               <div class="mini" data-k="chunkDomains">—</div>
             </div>
             <div class="panel">
               <h4>Backoff</h4>
+              <div class="mini">Latest retry event when PMTA/provider pressure slows delivery.</div>
               <div class="mini" data-k="backoffLine">—</div>
             </div>
           </div>
@@ -5533,9 +5536,10 @@ This will remove it from Jobs history.`);
       return `<span class="${cls}">${esc(label)}</span>`;
     }
 
-    function _box(title, tagTone, tagLabel, inner){
+    function _box(title, tagTone, tagLabel, hint, inner){
       return `<div class="pmtaBox">`+
         `<div class="pmtaTitle"><span>${esc(title)}</span>${tagLabel ? _tagHtml(tagTone, tagLabel) : ''}</div>`+
+        (hint ? `<div class="pmtaHint">${esc(hint)}</div>` : '')+
         (inner || '')+
       `</div>`;
     }
@@ -5603,13 +5607,13 @@ This will remove it from Jobs history.`);
 
       const html = `
         <div class="pmtaGrid">
-          ${_box('Spool', toneSp, 'rcpt', _kv('RCPT', spR, toneSp, true) + _kv('MSG', spM, toneSp, false))}
-          ${_box('Queue', toneQ, 'rcpt', _kv('RCPT', qR, toneQ, true) + _kv('MSG', qM, toneQ, false))}
-          ${_box('Connections', toneC, '', _kv('SMTP In', conIn, toneC, true) + _kv('SMTP Out', conOut, toneC, true) + _kv('Total', con, toneC, false))}
-          ${_box('Last minute', toneMin, '', _kv('In', minIn, toneMin, true) + _kv('Out', minOut, toneMin, true) + `<div class="pmtaSub">traffic recipients / minute</div>`)}
-          ${_box('Last hour', toneHr, '', _kv('In', hrIn, toneHr, true) + _kv('Out', hrOut, toneHr, true) + `<div class="pmtaSub">traffic recipients / hour</div>`)}
-          ${_box('Top queues', (topTxt === '—' ? 'good' : 'warn'), '', `<div class="pmtaSub">${esc(topTxt)}</div>`)}
-          ${_box('Time', 'good', '', `<div class="pmtaSub">${esc(ts || '—')}</div>`)}
+          ${_box('Spool', toneSp, 'rcpt', 'Total recipients/messages currently held by PMTA spool.', _kv('RCPT', spR, toneSp, true) + _kv('MSG', spM, toneSp, false))}
+          ${_box('Queue', toneQ, 'rcpt', 'Recipients/messages still queued to be delivered.', _kv('RCPT', qR, toneQ, true) + _kv('MSG', qM, toneQ, false))}
+          ${_box('Connections', toneC, '', 'Live SMTP sessions used for inbound/outbound traffic.', _kv('SMTP In', conIn, toneC, true) + _kv('SMTP Out', conOut, toneC, true) + _kv('Total', con, toneC, false))}
+          ${_box('Last minute', toneMin, '', 'Recent PMTA throughput over the last 60 seconds.', _kv('In', minIn, toneMin, true) + _kv('Out', minOut, toneMin, true) + `<div class="pmtaSub">traffic recipients / minute</div>`)}
+          ${_box('Last hour', toneHr, '', 'Rolling traffic totals for the previous 60 minutes.', _kv('In', hrIn, toneHr, true) + _kv('Out', hrOut, toneHr, true) + `<div class="pmtaSub">traffic recipients / hour</div>`)}
+          ${_box('Top queues', (topTxt === '—' ? 'good' : 'warn'), '', 'Queues with the highest recipient backlog and latest queue errors.', `<div class="pmtaSub">${esc(topTxt)}</div>`)}
+          ${_box('Time', 'good', '', 'Timestamp of the latest PMTA snapshot used for this panel.', `<div class="pmtaSub">${esc(ts || '—')}</div>`)}
         </div>
       `;
       return html;
