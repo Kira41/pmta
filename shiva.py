@@ -9853,10 +9853,68 @@ def _bridge_outcome_pairs(obj: dict) -> Dict[str, str]:
     return pairs
 
 
+def _bridge_outcome_records(obj: dict) -> Dict[str, Dict[str, str]]:
+    """Flatten bridge outcomes payload into rcpt -> detailed outcome record."""
+    records: Dict[str, Dict[str, str]] = {}
+
+    def _set_record(item: Any, fallback_status: str = "") -> None:
+        if isinstance(item, str):
+            rcpt = item
+            status = fallback_status
+            payload = {}
+        elif isinstance(item, dict):
+            rcpt = item.get("rcpt") or item.get("email")
+            status = item.get("outcome") or item.get("status") or fallback_status
+            payload = item
+        else:
+            return
+
+        email = str(rcpt or "").strip().lower()
+        norm_status = str(status or "").strip().lower()
+        if not email or norm_status not in {"delivered", "deferred", "bounced", "complained"}:
+            return
+
+        records[email] = {
+            "rcpt": email,
+            "status": norm_status,
+            "message_id": str(payload.get("message_id") or payload.get("msgid") or ""),
+            "dsn_status": str(payload.get("dsn_status") or payload.get("dsnStatus") or ""),
+            "dsn_diag": str(payload.get("dsn_diag") or payload.get("dsnDiag") or payload.get("diag") or ""),
+            "response": str(payload.get("response") or payload.get("smtp_response") or payload.get("smtp-response") or ""),
+        }
+
+    for status in ("delivered", "deferred", "bounced", "complained"):
+        bucket = obj.get(status)
+        emails = []
+        if isinstance(bucket, dict):
+            emails = bucket.get("emails") if isinstance(bucket.get("emails"), list) else []
+        elif isinstance(bucket, list):
+            emails = bucket
+        if isinstance(emails, list):
+            for row in emails:
+                _set_record(row, status)
+
+        dotted_emails = obj.get(f"{status}.emails")
+        if isinstance(dotted_emails, list):
+            for row in dotted_emails:
+                _set_record(row, status)
+
+    top_level_emails = obj.get("emails")
+    if isinstance(top_level_emails, list):
+        for row in top_level_emails:
+            _set_record(row)
+
+    return records
+
+
 def _bridge_sync_job_outcomes(job_id: str, obj: dict) -> Dict[str, int]:
     counts = {"delivered": 0, "deferred": 0, "bounced": 0, "complained": 0}
     normalized_job_id = (job_id or "").strip().lower()
-    pairs = _bridge_outcome_pairs(obj)
+    records = _bridge_outcome_records(obj)
+    pairs = {rcpt: str(item.get("status") or "") for rcpt, item in records.items()}
+    if not pairs:
+        pairs = _bridge_outcome_pairs(obj)
+        records = {rcpt: {"rcpt": rcpt, "status": status} for rcpt, status in pairs.items()}
 
     for status in pairs.values():
         if status in counts:
@@ -9866,13 +9924,14 @@ def _bridge_sync_job_outcomes(job_id: str, obj: dict) -> Dict[str, int]:
         conn = _db_conn()
         try:
             for rcpt, status in pairs.items():
+                rec = records.get(rcpt) or {}
                 _db_set_outcome_payload(conn, {
                     "job_id": normalized_job_id,
                     "rcpt": rcpt,
                     "status": status,
-                    "message_id": "",
-                    "dsn_status": "",
-                    "dsn_diag": "",
+                    "message_id": str(rec.get("message_id") or ""),
+                    "dsn_status": str(rec.get("dsn_status") or ""),
+                    "dsn_diag": str(rec.get("dsn_diag") or rec.get("response") or ""),
                     "updated_at": now_iso(),
                 })
 
@@ -9890,6 +9949,41 @@ def _bridge_sync_job_outcomes(job_id: str, obj: dict) -> Dict[str, int]:
         finally:
             conn.close()
     return counts
+
+
+def _bridge_apply_accounting_error_samples(job: SendJob, outcomes_obj: dict) -> None:
+    records = _bridge_outcome_records(outcomes_obj)
+    if not records:
+        return
+
+    errors: List[dict] = []
+    for rcpt, row in records.items():
+        status = str(row.get("status") or "").lower()
+        if status not in {"deferred", "bounced", "complained"}:
+            continue
+        parts = [
+            str(row.get("response") or "").strip(),
+            str(row.get("dsn_status") or "").strip(),
+            str(row.get("dsn_diag") or "").strip(),
+        ]
+        detail = " | ".join([p for p in parts if p])
+        if not detail:
+            continue
+        kind = "temporary_error" if status == "deferred" else "blocked"
+        errors.append({
+            "ts": now_iso(),
+            "email": rcpt,
+            "type": status,
+            "kind": kind,
+            "detail": detail,
+        })
+
+    if not errors:
+        return
+
+    errors = errors[-40:]
+    merged = list(job.accounting_last_errors or []) + errors
+    job.accounting_last_errors = merged[-40:]
 
 
 def _replace_job_accounting_from_bridge_count(job: SendJob, count_obj: dict) -> int:
@@ -10040,6 +10134,8 @@ def _poll_accounting_bridge_once() -> dict:
                 live_job = JOBS.get(str(getattr(job, "id", "") or "").strip().lower())
                 if live_job and not getattr(live_job, "deleted", False):
                     linked_count = _replace_job_accounting_from_bridge_count(live_job, count_obj)
+                    if BRIDGE_POLL_FETCH_OUTCOMES and outcomes_obj and outcomes_error is None:
+                        _bridge_apply_accounting_error_samples(live_job, outcomes_obj)
                     live_job.maybe_persist()
 
             total_accepted += 1
