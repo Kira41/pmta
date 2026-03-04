@@ -3939,6 +3939,7 @@ PAGE_JOBS = r"""
     .triageBadge{
       display:inline-flex;
       align-items:center;
+      gap:6px;
       max-width:100%;
       border:1px solid rgba(255,255,255,.14);
       background:rgba(255,255,255,.06);
@@ -3949,8 +3950,14 @@ PAGE_JOBS = r"""
       line-height:1.2;
       color:rgba(255,255,255,.88);
       white-space:nowrap;
+      overflow:visible;
+      min-width:0;
+    }
+    .triageBadge .badgeLabel{
+      min-width:0;
       overflow:hidden;
       text-overflow:ellipsis;
+      white-space:nowrap;
     }
     .triageBadge.good{border-color: rgba(53,228,154,.35); color: var(--good);}
     .triageBadge.warn{border-color: rgba(255,193,77,.35); color: var(--warn);}
@@ -4459,7 +4466,7 @@ PAGE_JOBS = r"""
   function badgeWithTip(label, tip){
     const safeLabel = esc(label || '—');
     const safeTip = escAttr(tip || '—');
-    return `<span>${safeLabel}</span> <span class="tip" data-tip="${safeTip}">ⓘ</span>`;
+    return `<span class="badgeLabel">${safeLabel}</span><span class="tip" data-tip="${safeTip}">ⓘ</span>`;
   }
 
   function toast(title, msg, kind){
