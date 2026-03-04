@@ -45,6 +45,8 @@ Covers:
 
 ## Recommended settings
 
+For a full Arabic deep-dive on `BRIDGE_MODE`, see `docs/BRIDGE_MODE_REPORT_AR.md`.
+
 - Bridge:
   - `DEFAULT_PULL_LIMIT=500`
   - `MAX_PULL_LIMIT=2000`
