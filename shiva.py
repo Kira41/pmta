@@ -11976,19 +11976,9 @@ def smtp_send_job(
 
             chunk_finished = False
             while True:
-                assigned_sender_idx = provider_sender_assignment.get(target_domain)
-                assigned_sender_domain = ""
-                if isinstance(assigned_sender_idx, int) and from_emails2:
-                    assigned_sender_domain = (_extract_domain_from_email(from_emails2[assigned_sender_idx % len(from_emails2)]) or "").strip().lower()
-
                 # rotate senders by sender-domain first; each domain gets its own retry budget.
                 sender_domain_order, sender_domain_map = _sender_domain_rotation(from_emails2, sender_cursor_base)
                 available_domains = [d for d in sender_domain_order if d not in set(exhausted_sender_domains)]
-                if assigned_sender_domain:
-                    if assigned_sender_domain in available_domains:
-                        available_domains = [assigned_sender_domain]
-                    else:
-                        available_domains = []
                 recommendation = learning_recommendation(
                     target_domain,
                     available_domains,
@@ -12036,11 +12026,8 @@ def smtp_send_job(
                 sender_domain_cursor = sender_domain_cursor % len(available_domains)
                 active_sender_domain = available_domains[sender_domain_cursor]
                 sender_indices = sender_domain_map.get(active_sender_domain) or [0]
-                if isinstance(assigned_sender_idx, int) and from_emails2:
-                    sender_idx = assigned_sender_idx % len(from_emails2)
-                else:
-                    sender_pick = sender_attempt_in_domain % len(sender_indices)
-                    sender_idx = sender_indices[sender_pick]
+                sender_pick = sender_attempt_in_domain % len(sender_indices)
+                sender_idx = sender_indices[sender_pick]
                 rot = sender_idx + attempt
 
                 fe = from_emails2[sender_idx % len(from_emails2)]
