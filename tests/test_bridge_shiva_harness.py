@@ -151,6 +151,114 @@ class BridgeShivaHarnessTests(unittest.TestCase):
         finally:
             shiva.BRIDGE_MODE = old_mode
 
+    def test_learning_logs_and_updates_pair_stats(self):
+        shiva.db_log_email_attempt(
+            job_id="abcdef123456",
+            campaign_id="camp001",
+            chunk_idx=0,
+            sender_domain="sender-a.com",
+            provider_domain="gmail.com",
+            attempt_number=1,
+            outcome="blocked_transient_delay",
+        )
+        shiva.db_log_email_attempt(
+            job_id="abcdef123456",
+            campaign_id="camp001",
+            chunk_idx=0,
+            sender_domain="sender-a.com",
+            provider_domain="gmail.com",
+            attempt_number=2,
+            outcome="sent",
+        )
+        shiva.db_finalize_email_learning(
+            job_id="abcdef123456",
+            campaign_id="camp001",
+            chunk_idx=0,
+            sender_domain="sender-a.com",
+            provider_domain="gmail.com",
+            attempts_taken=2,
+            outcome="success",
+        )
+
+        conn = shiva._db_conn()
+        try:
+            row = conn.execute(
+                "SELECT total_series, success_series, failure_series, total_attempts FROM sender_provider_stats WHERE sender_domain=? AND provider_domain=?",
+                ("sender-a.com", "gmail.com"),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row, (1, 1, 0, 2))
+
+    def test_learning_recommendation_prioritizes_high_success_sender(self):
+        for idx in range(14):
+            shiva.db_log_email_attempt(
+                job_id=f"job-good-{idx}",
+                campaign_id="camp001",
+                chunk_idx=idx,
+                sender_domain="good.com",
+                provider_domain="outlook.com",
+                attempt_number=1,
+                outcome="sent",
+            )
+            shiva.db_finalize_email_learning(
+                job_id=f"job-good-{idx}",
+                campaign_id="camp001",
+                chunk_idx=idx,
+                sender_domain="good.com",
+                provider_domain="outlook.com",
+                attempts_taken=1,
+                outcome="success",
+            )
+
+        for idx in range(14):
+            shiva.db_log_email_attempt(
+                job_id=f"job-bad-{idx}",
+                campaign_id="camp001",
+                chunk_idx=idx,
+                sender_domain="bad.com",
+                provider_domain="outlook.com",
+                attempt_number=1,
+                outcome="blocked_block",
+            )
+            shiva.db_finalize_email_learning(
+                job_id=f"job-bad-{idx}",
+                campaign_id="camp001",
+                chunk_idx=idx,
+                sender_domain="bad.com",
+                provider_domain="outlook.com",
+                attempts_taken=1,
+                outcome="failure",
+            )
+
+        rec = shiva.learning_recommendation("outlook.com", ["bad.com", "good.com"], 3)
+        self.assertEqual(rec["sender_domains"][0], "good.com")
+        self.assertLessEqual(rec["retry_cap"], 3)
+
+    def test_learning_summary_reports_attempts_to_success(self):
+        shiva.db_log_email_attempt(
+            job_id="abc1",
+            campaign_id="camp001",
+            chunk_idx=0,
+            sender_domain="sender-a.com",
+            provider_domain="yahoo.com",
+            attempt_number=1,
+            outcome="sent",
+        )
+        shiva.db_finalize_email_learning(
+            job_id="abc1",
+            campaign_id="camp001",
+            chunk_idx=0,
+            sender_domain="sender-a.com",
+            provider_domain="yahoo.com",
+            attempts_taken=1,
+            outcome="success",
+        )
+        summary = shiva.db_learning_summary(limit=5)
+        self.assertIn("pairs", summary)
+        self.assertGreaterEqual(len(summary["pairs"]), 1)
+        self.assertGreaterEqual(float(summary["attempts_to_success"]["avg_attempts"]), 1.0)
+
 
 
     def test_bridge_poller_uses_job_count_and_job_outcomes(self):
