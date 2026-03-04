@@ -2375,7 +2375,7 @@ def ai_rewrite_subjects_and_body(
 
     Notes:
     - This is for readability/professional tone.
-    - Preserves placeholders: [URL], [SRC], [EMAIL] exactly.
+    - Preserves placeholders: [URL], [SRC], [EMAIL], [MAIL] exactly.
     - Keeps meaning, does not add new claims.
     """
     if not token:
@@ -2387,7 +2387,7 @@ def ai_rewrite_subjects_and_body(
     sys = (
         "You rewrite email subject lines and body for clarity and professionalism, "
         "keeping the same meaning. Do NOT add new claims, promotions, or calls to action. "
-        "Preserve these placeholders exactly (do not remove/rename them): [URL], [SRC], [EMAIL]. "
+        "Preserve these placeholders exactly (do not remove/rename them): [URL], [SRC], [EMAIL], [MAIL]. "
         "Keep the output language the same as input. "
         "Return ONLY valid JSON with keys: subjects (array of strings), body (string)."
     )
@@ -2397,7 +2397,7 @@ def ai_rewrite_subjects_and_body(
         "body_format": body_format,
         "body": body_in,
         "constraints": {
-            "preserve_placeholders": ["[URL]", "[SRC]", "[EMAIL]"],
+            "preserve_placeholders": ["[URL]", "[SRC]", "[EMAIL]", "[MAIL]"],
             "no_new_claims": True,
             "json_only": True,
         },
@@ -2929,13 +2929,13 @@ PAGE_FORM = r"""
           <label>URL list (one per line)</label>
           <textarea name="urls_list" placeholder="https://example.com/a
 https://example.com/b" style="min-height:90px"></textarea>
-          <div class="mini">Use <code>[URL]</code> in the body. It will be replaced per email using a pseudo-random value from this list.</div>
+          <div class="mini">Use <code>[URL]</code> in subject/body. Replaced per chunk in line order (cycles back to first line after the last).</div>
         </div>
         <div>
           <label>SRC list (one per line)</label>
           <textarea name="src_list" placeholder="https://cdn.example.com/img1.png
 https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
-          <div class="mini">Use <code>[SRC]</code> in the body. It will be replaced per email using a pseudo-random value from this list.</div>
+          <div class="mini">Use <code>[SRC]</code> in subject/body. Replaced per chunk in line order (cycles back to first line after the last). Use <code>[MAIL]</code> or <code>[EMAIL]</code> for recipient email.</div>
         </div>
       </div>
 
@@ -11237,12 +11237,17 @@ def smtp_send_job(
             "reduced": bool(reduced),
         }
 
-    def _render_body(local_rng: random.Random, base_body: str, urls2: List[str], src2: List[str]) -> str:
-        rendered = base_body
-        if "[URL]" in rendered:
-            rendered = rendered.replace("[URL]", local_rng.choice(urls2) if urls2 else "")
-        if "[SRC]" in rendered:
-            rendered = rendered.replace("[SRC]", local_rng.choice(src2) if src2 else "")
+    def _cyclic_pick(items: List[str], idx: int) -> str:
+        seq = [str(x).strip() for x in (items or []) if str(x).strip()]
+        if not seq:
+            return ""
+        return seq[int(idx or 0) % len(seq)]
+
+    def _render_with_placeholders(base_text: str, *, url_value: str, src_value: str, rcpt: str) -> str:
+        rendered = str(base_text or "")
+        rendered = re.sub(r"\[(?:URL)\]", str(url_value or ""), rendered, flags=re.IGNORECASE)
+        rendered = re.sub(r"\[(?:SRC)\]", str(src_value or ""), rendered, flags=re.IGNORECASE)
+        rendered = re.sub(r"\[(?:MAIL|EMAIL)\]", str(rcpt or ""), rendered, flags=re.IGNORECASE)
         return rendered
 
     def _send_chunk(
@@ -11257,14 +11262,13 @@ def smtp_send_job(
         reply_to2: str,
         delay2: float,
         workers2: int,
-        urls2: List[str],
-        src2: List[str],
+        chunk_url: str,
+        chunk_src: str,
     ):
         def worker_send(worker_idx: int, rcpts: List[str]):
             if not rcpts:
                 return
 
-            local_rng = random.Random(f"{job_id}:{chunk_idx}:{worker_idx}")
             server = None
             try:
                 server = _smtp_connect(smtp_host, smtp_port, smtp_security, smtp_timeout)
@@ -11280,7 +11284,8 @@ def smtp_send_job(
                     msg = EmailMessage()
                     msg["From"] = formataddr((from_name, from_email))
                     msg["To"] = rcpt
-                    msg["Subject"] = subject
+                    subject_rendered = _render_with_placeholders(subject, url_value=chunk_url, src_value=chunk_src, rcpt=rcpt)
+                    msg["Subject"] = subject_rendered
                     msg["Date"] = format_datetime(datetime.now(timezone.utc))
                     # App trace header (helps searching in downstream logs/accounting)
                     msg["X-Job-ID"] = job_id
@@ -11293,7 +11298,7 @@ def smtp_send_job(
                     if reply_to2.strip():
                         msg["Reply-To"] = reply_to2.strip()
 
-                    rendered_body = _render_body(local_rng, body_used, urls2, src2)
+                    rendered_body = _render_with_placeholders(body_used, url_value=chunk_url, src_value=chunk_src, rcpt=rcpt)
 
                     if body_format2 == "html":
                         msg.set_content("This email contains HTML content. Please view it in an HTML-capable client.")
@@ -11591,6 +11596,9 @@ def smtp_send_job(
                 sender_attempt_in_domain = 0
                 exhausted_sender_domains: List[str] = []
                 chunk_idx_local = chunk_idx
+
+            chunk_url = _cyclic_pick(urls2, chunk_idx_local)
+            chunk_src = _cyclic_pick(src2, chunk_idx_local)
 
             # Live chunk info for Jobs UI
             dom_counts = count_recipient_domains(chunk)
@@ -11993,8 +12001,8 @@ def smtp_send_job(
                     reply_to2=reply_to2,
                     delay2=delay2,
                     workers2=workers2,
-                    urls2=urls2,
-                    src2=src2,
+                    chunk_url=chunk_url,
+                    chunk_src=chunk_src,
                 )
                 db_log_email_attempt(
                     job_id=job_id,
