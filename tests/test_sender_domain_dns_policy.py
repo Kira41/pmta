@@ -55,3 +55,64 @@ def test_compute_sender_domain_states_uses_common_dkim_selector_fallback(monkeyp
     rows = shiva.compute_sender_domain_states({"example.com": 2})
     assert rows[0]["dkim"]["status"] == "pass"
     assert rows[0]["dkim"]["selector"] == "default"
+
+
+def test_domain_mail_route_falls_back_to_doh_for_mx(monkeypatch):
+    class _BoomResolver:
+        def resolve(self, *_args, **_kwargs):
+            raise RuntimeError("resolver down")
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "Status": 0,
+                    "Answer": [
+                        {"data": "10 mx1.example.net."},
+                    ],
+                }
+            ).encode("utf-8")
+
+    monkeypatch.setattr(shiva, "DNS_RESOLVER", _BoomResolver())
+    monkeypatch.setattr(shiva, "urlopen", lambda *_args, **_kwargs: _Resp())
+
+    out = shiva.domain_mail_route("example.com")
+    assert out["status"] == "mx"
+    assert out["mx_hosts"] == ["mx1.example.net"]
+
+
+def test_domain_mail_route_handles_a_fallback_via_doh(monkeypatch):
+    class _BoomResolver:
+        def resolve(self, *_args, **_kwargs):
+            raise RuntimeError("resolver down")
+
+    class _Resp:
+        def __init__(self, req):
+            self.req = req
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            url = str(getattr(self.req, "full_url", ""))
+            if "type=MX" in url:
+                return json.dumps({"Status": 0, "Answer": []}).encode("utf-8")
+            return json.dumps({"Status": 0, "Answer": [{"data": "203.0.113.10"}]}).encode("utf-8")
+
+    def _fake_open(req, **_kwargs):
+        return _Resp(req)
+
+    monkeypatch.setattr(shiva, "DNS_RESOLVER", _BoomResolver())
+    monkeypatch.setattr(shiva, "urlopen", _fake_open)
+
+    out = shiva.domain_mail_route("example.org")
+    assert out["status"] == "a_fallback"
