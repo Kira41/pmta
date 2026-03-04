@@ -3393,12 +3393,21 @@ PAGE_JOBS = r"""
     .triageBadge.warn{border-color: rgba(255,193,77,.35); color: var(--warn);}
     .triageBadge.bad{border-color: rgba(255,94,115,.35); color: var(--bad);}
 
-    .grid{display:grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap:10px; margin-top:12px;}
-    @media (max-width: 1050px){ .grid{grid-template-columns: 1fr 1fr;} }
-    @media (max-width: 560px){ .grid{grid-template-columns: 1fr;} }
-
-    .metric{border:1px solid rgba(255,255,255,.10); background: rgba(0,0,0,.10); border-radius: 14px; padding: 10px 12px;}
-    .metric b{color: rgba(255,255,255,.92)}
+    .kpiWrap{margin-top:12px; border:1px solid rgba(255,255,255,.10); background: rgba(0,0,0,.10); border-radius: 14px; padding: 10px 12px;}
+    .kpiRow{display:grid; grid-template-columns: repeat(6, minmax(0,1fr)); gap:8px;}
+    .kpiCell{border:1px solid rgba(255,255,255,.08); background: rgba(255,255,255,.03); border-radius:10px; padding:7px 9px;}
+    .kpiCell .k{font-size:11px; color: rgba(255,255,255,.62); text-transform:uppercase; letter-spacing:.3px;}
+    .kpiCell .v{font-size:16px; font-weight:900; margin-top:2px; display:flex; align-items:center; gap:6px;}
+    .kpiWarn{font-size:12px; color:var(--warn); cursor:help;}
+    .ratesRow{display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:8px; margin-top:8px;}
+    .rateCell{border:1px solid rgba(255,255,255,.08); background: rgba(255,255,255,.02); border-radius:10px; padding:6px 9px;}
+    .rateCell .k{font-size:11px; color: rgba(255,255,255,.62); text-transform:uppercase; letter-spacing:.3px;}
+    .rateCell .v{font-size:13px; font-weight:800; margin-top:2px;}
+    .qualityMini{margin-top:8px;}
+    .qualityMini summary{cursor:pointer; color:rgba(255,255,255,.78); font-size:12px; user-select:none;}
+    .qualityLine{margin-top:6px; font-size:12px; color:rgba(255,255,255,.72);}
+    @media (max-width: 980px){ .kpiRow{grid-template-columns: repeat(3, minmax(0,1fr));} }
+    @media (max-width: 620px){ .kpiRow{grid-template-columns: repeat(2, minmax(0,1fr));} .ratesRow{grid-template-columns: 1fr;} }
 
     .bars{display:grid; grid-template-columns: 1fr; gap:10px; margin-top: 12px;}
     .barWrap{display:flex; gap:10px; flex-wrap:wrap; align-items:center; justify-content:space-between;}
@@ -3612,17 +3621,25 @@ PAGE_JOBS = r"""
           </div>
         </div>
 
-        <!-- 1) Summary header metrics -->
-        <div class="grid">
-          <div class="metric"><b>Sent</b><div class="mini"><span data-k="sent">0</span> / <span data-k="total">0</span></div></div>
-          <div class="metric"><b>Failed</b><div class="mini"><span data-k="failed">0</span></div></div>
-          <div class="metric"><b>Skipped</b><div class="mini"><span data-k="skipped">0</span></div></div>
-          <div class="metric"><b>Invalid</b><div class="mini"><span data-k="invalid">0</span></div></div>
-
-          <div class="metric"><b>Delivered</b><div class="mini"><span data-k="delivered">0</span></div></div>
-          <div class="metric"><b>Bounced</b><div class="mini"><span data-k="bounced">0</span></div></div>
-          <div class="metric"><b>Deferred</b><div class="mini"><span data-k="deferred">0</span></div></div>
-          <div class="metric"><b>Complained</b><div class="mini"><span data-k="complained">0</span></div></div>
+        <!-- 1) Compact KPI + rates -->
+        <div class="kpiWrap">
+          <div class="kpiRow">
+            <div class="kpiCell"><div class="k">Sent</div><div class="v"><span data-k="sent">—</span></div></div>
+            <div class="kpiCell"><div class="k">Pending</div><div class="v"><span data-k="pending">—</span><span class="kpiWarn" data-k="pendingWarn" style="display:none" title="Pending was clamped to 0 because Sent is lower than PMTA outcomes.">⚠</span></div></div>
+            <div class="kpiCell"><div class="k">Del</div><div class="v"><span data-k="delivered">—</span></div></div>
+            <div class="kpiCell"><div class="k">Bnc</div><div class="v"><span data-k="bounced">—</span></div></div>
+            <div class="kpiCell"><div class="k">Def</div><div class="v"><span data-k="deferred">—</span></div></div>
+            <div class="kpiCell"><div class="k">Cmp</div><div class="v"><span data-k="complained">—</span></div></div>
+          </div>
+          <div class="ratesRow">
+            <div class="rateCell"><div class="k">Bounce %</div><div class="v" data-k="rateBounce">—</div></div>
+            <div class="rateCell"><div class="k">Complaint %</div><div class="v" data-k="rateComplaint">—</div></div>
+            <div class="rateCell"><div class="k">Deferred %</div><div class="v" data-k="rateDeferred">—</div></div>
+          </div>
+          <details class="qualityMini">
+            <summary>Quality</summary>
+            <div class="qualityLine">Failed: <span data-k="failed">—</span> · Skipped: <span data-k="skipped">—</span> · Invalid: <span data-k="invalid">—</span> · Total: <span data-k="total">—</span></div>
+          </details>
         </div>
 
         <!-- 4) Progress bars -->
@@ -4234,18 +4251,59 @@ This will remove it from Jobs history.`);
 
     renderTriageBadges(card, j);
 
-    // Core counters
-    qk(card,'total').textContent = j.total || 0;
-    qk(card,'sent').textContent = j.sent || 0;
-    qk(card,'failed').textContent = j.failed || 0;
-    qk(card,'skipped').textContent = j.skipped || 0;
-    qk(card,'invalid').textContent = j.invalid || 0;
+    // Core counters + compact KPI values
+    const asNum = (v) => {
+      if(v === null || v === undefined || v === '') return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    const fmtNum = (n) => (n === null ? '—' : String(n));
+    const fmtRate = (num, den) => {
+      if(num === null || den === null || den <= 0) return '—';
+      const r = (num / den) * 100;
+      return `${r.toFixed(2)}%`;
+    };
 
-    // Outcomes (PMTA accounting)
-    const elDel = qk(card,'delivered'); if(elDel) elDel.textContent = j.delivered || 0;
-    const elBnc = qk(card,'bounced'); if(elBnc) elBnc.textContent = j.bounced || 0;
-    const elDef = qk(card,'deferred'); if(elDef) elDef.textContent = j.deferred || 0;
-    const elCmp = qk(card,'complained'); if(elCmp) elCmp.textContent = j.complained || 0;
+    const totalN = asNum(j.total);
+    const sentN = asNum(j.sent);
+    const failedN = asNum(j.failed);
+    const skippedN = asNum(j.skipped);
+    const invalidN = asNum(j.invalid);
+    const deliveredN = asNum(j.delivered);
+    const bouncedN = asNum(j.bounced);
+    const deferredN = asNum(j.deferred);
+    const complainedN = asNum(j.complained);
+
+    qk(card,'total').textContent = fmtNum(totalN);
+    qk(card,'sent').textContent = fmtNum(sentN);
+    qk(card,'failed').textContent = fmtNum(failedN);
+    qk(card,'skipped').textContent = fmtNum(skippedN);
+    qk(card,'invalid').textContent = fmtNum(invalidN);
+
+    const elDel = qk(card,'delivered'); if(elDel) elDel.textContent = fmtNum(deliveredN);
+    const elBnc = qk(card,'bounced'); if(elBnc) elBnc.textContent = fmtNum(bouncedN);
+    const elDef = qk(card,'deferred'); if(elDef) elDef.textContent = fmtNum(deferredN);
+    const elCmp = qk(card,'complained'); if(elCmp) elCmp.textContent = fmtNum(complainedN);
+
+    let pendingValue = null;
+    let pendingClamped = false;
+    if(sentN !== null && deliveredN !== null && bouncedN !== null && deferredN !== null && complainedN !== null){
+      pendingValue = sentN - (deliveredN + bouncedN + deferredN + complainedN);
+      if(pendingValue < 0){
+        pendingValue = 0;
+        pendingClamped = true;
+      }
+    }
+    qk(card,'pending').textContent = fmtNum(pendingValue);
+    const pendingWarnEl = qk(card,'pendingWarn');
+    if(pendingWarnEl) pendingWarnEl.style.display = pendingClamped ? '' : 'none';
+
+    const rateBounceEl = qk(card,'rateBounce');
+    const rateComplaintEl = qk(card,'rateComplaint');
+    const rateDeferredEl = qk(card,'rateDeferred');
+    if(rateBounceEl) rateBounceEl.textContent = fmtRate(bouncedN, sentN);
+    if(rateComplaintEl) rateComplaintEl.textContent = fmtRate(complainedN, sentN);
+    if(rateDeferredEl) rateDeferredEl.textContent = fmtRate(deferredN, sentN);
 
     // Progress bars
     const total = Number(j.total||0);
