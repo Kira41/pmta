@@ -11640,6 +11640,10 @@ def smtp_send_job(
         # Per-provider sender rotation cursor: if a provider has many recipients,
         # chunk#1 can use sender/IP-A, chunk#2 sender/IP-B, ... then wrap.
         provider_sender_cursor: Dict[str, int] = {}
+        # Per-provider sender-domain cursor. This keeps distribution fair across
+        # all configured sender domains instead of pinning every fresh chunk to
+        # the first (or top-ranked) domain.
+        provider_sender_domain_cursor: Dict[str, int] = {}
         # Global sender cursor to keep sender-domain usage balanced across providers.
         # This prevents many single-chunk providers from all starting with sender#0.
         global_sender_cursor = 0
@@ -11841,7 +11845,7 @@ def smtp_send_job(
                     continue
                 attempt = 0
                 sender_cursor_base = int(provider_sender_cursor.get(target_domain, global_sender_cursor) or global_sender_cursor or 0)
-                sender_domain_cursor = 0
+                sender_domain_cursor = int(provider_sender_domain_cursor.get(target_domain, 0) or 0)
                 sender_attempt_in_domain = 0
                 exhausted_sender_domains: List[str] = []
                 chunk_idx_local = chunk_idx
@@ -11963,6 +11967,7 @@ def smtp_send_job(
                     max_backoff_s=backoff_max_s,
                 )
                 available_domains = list(recommendation.get("sender_domains") or available_domains)
+                recommended_domains = list(available_domains)
                 pair_retry_cap = max(0, int(recommendation.get("retry_cap", max_backoff_retries) or max_backoff_retries))
                 dynamic_backoff_base_s = max(1.0, float(recommendation.get("provider_backoff_base_s", backoff_base_s) or backoff_base_s))
                 dynamic_backoff_max_s = max(dynamic_backoff_base_s, float(recommendation.get("provider_backoff_max_s", backoff_max_s) or backoff_max_s))
@@ -12120,14 +12125,14 @@ def smtp_send_job(
                     if sender_attempt_in_domain > pair_retry_cap:
                         if active_sender_domain not in exhausted_sender_domains:
                             exhausted_sender_domains.append(active_sender_domain)
-                        remaining_domains = [d for d in sender_domain_order if d not in set(exhausted_sender_domains)]
+                        remaining_domains = [d for d in recommended_domains if d not in set(exhausted_sender_domains)]
                         if remaining_domains:
                             sender_domain_cursor = 0
                             sender_attempt_in_domain = 0
                             next_domain = remaining_domains[0]
                             domain_switched = True
 
-                    if not [d for d in sender_domain_order if d not in set(exhausted_sender_domains)]:
+                    if not [d for d in recommended_domains if d not in set(exhausted_sender_domains)]:
                         with JOBS_LOCK:
                             job.skipped += len(chunk)
                             job.chunks_abandoned += 1
@@ -12299,6 +12304,10 @@ def smtp_send_job(
                     next_sender_cursor = (sender_idx + 1) % max(1, len(from_emails2))
                     provider_sender_cursor[target_domain] = next_sender_cursor
                     global_sender_cursor = next_sender_cursor
+                if recommended_domains:
+                    # Advance provider domain cursor so next *fresh* chunk starts on
+                    # a different sender domain, while retries still follow learning.
+                    provider_sender_domain_cursor[target_domain] = (sender_domain_cursor + 1) % len(recommended_domains)
                 chunk_finished = True
                 break
 
