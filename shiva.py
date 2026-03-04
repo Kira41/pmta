@@ -3525,6 +3525,20 @@ PAGE_JOBS = r"""
 
     /* PMTA Live Panel (Jobs) — clearer layout */
     .pmtaLive{ margin-top:10px; }
+    .pmtaCompact{
+      margin-top:10px;
+      font-size:12px;
+      color:rgba(255,255,255,.86);
+      border:1px solid rgba(255,255,255,.14);
+      background:rgba(0,0,0,.14);
+      border-radius:10px;
+      padding:8px 10px;
+      font-weight:800;
+      line-height:1.45;
+      overflow-wrap:anywhere;
+    }
+    .pmtaToggle{ margin-top:8px; }
+    .pmtaToggle > summary{ cursor:pointer; user-select:none; color:rgba(255,255,255,.88); font-weight:800; }
     .pmtaGrid{ display:grid; grid-template-columns: repeat(7, minmax(0,1fr)); gap:10px; }
     @media (max-width: 1150px){ .pmtaGrid{ grid-template-columns: repeat(4, minmax(0,1fr)); } }
     @media (max-width: 820px){ .pmtaGrid{ grid-template-columns: repeat(2, minmax(0,1fr)); } }
@@ -3779,9 +3793,13 @@ PAGE_JOBS = r"""
 
           <div class="panel moreBlock">
             <h4>PMTA Live Panel</h4>
-            <div class="pmtaLive" data-k="pmtaLine">—</div>
-            <div class="mini" style="margin-top:6px" data-k="pmtaNote">Note: <b>sent</b> = accepted by PMTA (client-side). Delivery may still be queued/deferred.</div>
-            <div class="mini" style="margin-top:6px" data-k="pmtaDiag">Diag: —</div>
+            <div class="pmtaCompact" data-k="pmtaCompact">PMTA: —</div>
+            <details class="pmtaToggle">
+              <summary>Show PMTA panel</summary>
+              <div class="pmtaLive" data-k="pmtaLine">—</div>
+              <div class="mini" style="margin-top:6px" data-k="pmtaNote">Note: <b>sent</b> = accepted by PMTA (client-side). Delivery may still be queued/deferred.</div>
+              <div class="mini" style="margin-top:6px" data-k="pmtaDiag">Diag: —</div>
+            </details>
           </div>
 
           <div class="moreGrid moreBlock">
@@ -4733,6 +4751,7 @@ This will remove it from Jobs history.`);
     qk(card,'backoffLine').textContent = backLine;
     // PMTA Live Panel (optional) — richer UI
     const pmEl = qk(card,'pmtaLine');
+    const pmCompactEl = qk(card,'pmtaCompact');
     const pmDiagEl = qk(card,'pmtaDiag');
     const pmNoteEl = qk(card,'pmtaNote');
     if(pmNoteEl){
@@ -4871,10 +4890,23 @@ This will remove it from Jobs history.`);
       return html;
     }
 
+    function _renderPmtaCompact(pm){
+      if(!pm || !pm.enabled || !pm.ok) return 'PMTA: —';
+      const queue = _pmNum(pm.queued_recipients);
+      const minOut = _pmNum(pm.traffic_last_min_out);
+      const hrOut = _pmNum(pm.traffic_last_hr_out);
+      if(queue === null && minOut === null && hrOut === null) return 'PMTA: —';
+      return `Queue: ${_pmFmt(queue)} | last min out: ${_pmFmt(minOut)} | last hour out: ${_pmFmt(hrOut)}`;
+    }
+
     if(pmEl){
       const pm = j.pmta_live || null;
       const pr = j.pmta_pressure || null;
       pmEl.innerHTML = _renderPmtaPanel(pm, pr);
+    }
+    if(pmCompactEl){
+      const pm = j.pmta_live || null;
+      pmCompactEl.textContent = _renderPmtaCompact(pm);
     }
 
     // PMTA diagnostics snapshot (point 7)
