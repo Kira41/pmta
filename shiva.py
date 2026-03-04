@@ -297,6 +297,24 @@ def build_provider_buckets(recipients: List[str]) -> Tuple[Dict[str, List[str]],
     return buckets, order
 
 
+def map_provider_domains_to_sender_indexes(provider_domains: List[str], sender_emails: List[str]) -> Dict[str, int]:
+    """Distribute provider domains evenly across sender emails.
+
+    Mapping is by *domain count* (not recipient count): if there are 50 provider domains
+    and 5 sender emails, each sender will be assigned ~10 provider domains.
+    """
+    if not provider_domains or not sender_emails:
+        return {}
+
+    out: Dict[str, int] = {}
+    n = max(1, len(sender_emails))
+    for i, dom in enumerate(provider_domains):
+        if not dom:
+            continue
+        out[dom] = i % n
+    return out
+
+
 def split_body_variants(body: str) -> List[str]:
     """Allow multiple body variants separated by a delimiter line:
 
@@ -11635,6 +11653,7 @@ def smtp_send_job(
         # Chunks are scheduled in round-robin between domains, so each domain/provider
         # gets short sending windows and cool-down gaps before its next chunk.
         provider_buckets, provider_order = build_provider_buckets(recipients)
+        provider_sender_assignment = map_provider_domains_to_sender_indexes(provider_order, sender_emails)
         provider_cursor = 0
 
         # Per-provider sender rotation cursor: if a provider has many recipients,
@@ -11715,6 +11734,7 @@ def smtp_send_job(
 
             from_names2 = rt.get("from_names") or sender_names
             from_emails2 = rt.get("from_emails") or sender_emails
+            provider_sender_assignment = map_provider_domains_to_sender_indexes(provider_order, from_emails2)
             subjects2 = rt.get("subjects") or subjects
             body_format2 = str(rt.get("body_format") or body_format).strip().lower() or body_format
             body_variants2 = rt.get("body_variants") or split_body_variants(body)
@@ -11956,9 +11976,19 @@ def smtp_send_job(
 
             chunk_finished = False
             while True:
+                assigned_sender_idx = provider_sender_assignment.get(target_domain)
+                assigned_sender_domain = ""
+                if isinstance(assigned_sender_idx, int) and from_emails2:
+                    assigned_sender_domain = (_extract_domain_from_email(from_emails2[assigned_sender_idx % len(from_emails2)]) or "").strip().lower()
+
                 # rotate senders by sender-domain first; each domain gets its own retry budget.
                 sender_domain_order, sender_domain_map = _sender_domain_rotation(from_emails2, sender_cursor_base)
                 available_domains = [d for d in sender_domain_order if d not in set(exhausted_sender_domains)]
+                if assigned_sender_domain:
+                    if assigned_sender_domain in available_domains:
+                        available_domains = [assigned_sender_domain]
+                    else:
+                        available_domains = []
                 recommendation = learning_recommendation(
                     target_domain,
                     available_domains,
@@ -12006,8 +12036,11 @@ def smtp_send_job(
                 sender_domain_cursor = sender_domain_cursor % len(available_domains)
                 active_sender_domain = available_domains[sender_domain_cursor]
                 sender_indices = sender_domain_map.get(active_sender_domain) or [0]
-                sender_pick = sender_attempt_in_domain % len(sender_indices)
-                sender_idx = sender_indices[sender_pick]
+                if isinstance(assigned_sender_idx, int) and from_emails2:
+                    sender_idx = assigned_sender_idx % len(from_emails2)
+                else:
+                    sender_pick = sender_attempt_in_domain % len(sender_indices)
+                    sender_idx = sender_indices[sender_pick]
                 rot = sender_idx + attempt
 
                 fe = from_emails2[sender_idx % len(from_emails2)]
