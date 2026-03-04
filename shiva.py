@@ -1541,7 +1541,128 @@ def db_finalize_email_learning(*, job_id: str, campaign_id: str, chunk_idx: int,
             conn.close()
 
 
-def learning_recommendation(provider_domain: str, sender_domains: List[str], max_retry_cap: int) -> Dict[str, Any]:
+def _provider_dynamic_backoff_policy(provider_domain: str, base_backoff_s: float, max_backoff_s: float, max_retry_cap: int) -> Dict[str, Any]:
+    """Return provider-level adaptive retry/backoff policy using recency-weighted history.
+
+    Policy goals:
+    - Fast + reliable provider behavior => fewer retries + shorter waits.
+    - Slow / failure-prone behavior => more retries + longer waits.
+    - Continuous adaptation via exponential recency weighting.
+    """
+    provider = str(provider_domain or "").strip().lower()
+    base_wait = max(1.0, float(base_backoff_s or 1.0))
+    max_wait = max(base_wait, float(max_backoff_s or base_wait))
+    retry_cap = max(0, int(max_retry_cap or 0))
+    if not provider:
+        return {
+            "retry_cap": retry_cap,
+            "backoff_base_s": base_wait,
+            "backoff_max_s": max_wait,
+            "sample_size": 0,
+            "trend": "unknown",
+        }
+
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            rows = conn.execute(
+                "SELECT outcome, attempts_taken, duration_seconds FROM email_attempt_learning WHERE provider_domain=? ORDER BY last_attempt_ts DESC LIMIT 120",
+                (provider,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+    if not rows:
+        return {
+            "retry_cap": retry_cap,
+            "backoff_base_s": base_wait,
+            "backoff_max_s": max_wait,
+            "sample_size": 0,
+            "trend": "unknown",
+        }
+
+    weighted_success = 0.0
+    weighted_failure = 0.0
+    weighted_attempts = 0.0
+    weighted_duration = 0.0
+    weight_sum = 0.0
+    decay = 0.965
+
+    for idx, row in enumerate(rows):
+        w = decay ** idx
+        outcome = str(row[0] or "").strip().lower()
+        attempts_taken = max(1.0, float(row[1] or 1.0))
+        duration_s = max(0.0, float(row[2] or 0.0))
+        is_success = 1.0 if outcome == "success" else 0.0
+
+        weighted_success += w * is_success
+        weighted_failure += w * (1.0 - is_success)
+        weighted_attempts += w * attempts_taken
+        weighted_duration += w * duration_s
+        weight_sum += w
+
+    if weight_sum <= 0.0:
+        return {
+            "retry_cap": retry_cap,
+            "backoff_base_s": base_wait,
+            "backoff_max_s": max_wait,
+            "sample_size": len(rows),
+            "trend": "unknown",
+        }
+
+    success_rate = weighted_success / weight_sum
+    failure_rate = weighted_failure / weight_sum
+    avg_attempts = weighted_attempts / weight_sum
+    avg_duration = weighted_duration / weight_sum
+
+    # Baselines from current global defaults to infer "fast" vs "slow".
+    duration_ratio = avg_duration / max(base_wait, 1.0)
+    attempts_ratio = avg_attempts / max(retry_cap + 1.0, 1.0)
+
+    # Quality score > 0 means healthier provider recently.
+    quality = (success_rate - failure_rate) - 0.30 * max(0.0, attempts_ratio - 1.0) - 0.20 * max(0.0, duration_ratio - 1.0)
+
+    if quality >= 0.25:
+        retry_factor = 0.55
+        wait_factor = 0.65
+        trend = "fast_success"
+    elif quality >= 0.05:
+        retry_factor = 0.80
+        wait_factor = 0.85
+        trend = "stable"
+    elif quality <= -0.30:
+        retry_factor = 1.40
+        wait_factor = 1.55
+        trend = "slow_or_failing"
+    elif quality <= -0.10:
+        retry_factor = 1.20
+        wait_factor = 1.25
+        trend = "degrading"
+    else:
+        retry_factor = 1.0
+        wait_factor = 1.0
+        trend = "mixed"
+
+    tuned_retry_cap = min(10, max(0, int(round(max(retry_cap, 1) * retry_factor))))
+    if retry_cap == 0:
+        tuned_retry_cap = 0
+
+    tuned_base = max(5.0, base_wait * wait_factor)
+    tuned_max = max(tuned_base, min(max_wait * 3.0, max_wait * wait_factor))
+
+    return {
+        "retry_cap": tuned_retry_cap,
+        "backoff_base_s": float(tuned_base),
+        "backoff_max_s": float(tuned_max),
+        "sample_size": len(rows),
+        "trend": trend,
+        "success_rate": float(success_rate),
+        "avg_attempts": float(avg_attempts),
+        "avg_duration_s": float(avg_duration),
+    }
+
+
+def learning_recommendation(provider_domain: str, sender_domains: List[str], max_retry_cap: int, *, base_backoff_s: float = 60.0, max_backoff_s: float = 1800.0) -> Dict[str, Any]:
     provider = str(provider_domain or "").strip().lower()
     if not provider or not sender_domains:
         return {"sender_domains": list(sender_domains or []), "retry_cap": max(0, int(max_retry_cap or 0))}
@@ -1570,9 +1691,11 @@ def learning_recommendation(provider_domain: str, sender_domains: List[str], max
 
     ordered.sort(key=lambda d: (float(stats.get(d, {}).get("rate", 0.5)), float(stats.get(d, {}).get("total", 0))), reverse=True)
 
-    retry_cap = max(0, int(max_retry_cap or 0))
+    provider_policy = _provider_dynamic_backoff_policy(provider, base_backoff_s, max_backoff_s, max_retry_cap)
+    retry_cap = max(0, int(provider_policy.get("retry_cap", max_retry_cap) or max_retry_cap))
     top = stats.get(ordered[0]) if ordered else None
-    if top and int(top.get("total", 0)) >= 12:
+    provider_trend = str(provider_policy.get("trend") or "unknown")
+    if top and int(top.get("total", 0)) >= 12 and provider_trend not in {"slow_or_failing", "degrading"}:
         r = float(top.get("rate", 0.5))
         if r < 0.35:
             retry_cap = min(retry_cap, 1)
@@ -1584,6 +1707,11 @@ def learning_recommendation(provider_domain: str, sender_domains: List[str], max
         "retry_cap": retry_cap,
         "top_sender_success_rate": float(top.get("rate", 0.0)) if top else 0.0,
         "top_sender_samples": int(top.get("total", 0)) if top else 0,
+        "provider_backoff_base_s": float(provider_policy.get("backoff_base_s", base_backoff_s) or base_backoff_s),
+        "provider_backoff_max_s": float(provider_policy.get("backoff_max_s", max_backoff_s) or max_backoff_s),
+        "provider_trend": provider_trend,
+        "provider_samples": int(provider_policy.get("sample_size") or 0),
+        "provider_success_rate": float(provider_policy.get("success_rate", 0.0) or 0.0),
     }
 
 
@@ -11377,9 +11505,17 @@ def smtp_send_job(
                 # rotate senders by sender-domain first; each domain gets its own retry budget.
                 sender_domain_order, sender_domain_map = _sender_domain_rotation(from_emails2, sender_cursor_base)
                 available_domains = [d for d in sender_domain_order if d not in set(exhausted_sender_domains)]
-                recommendation = learning_recommendation(target_domain, available_domains, max_backoff_retries)
+                recommendation = learning_recommendation(
+                    target_domain,
+                    available_domains,
+                    max_backoff_retries,
+                    base_backoff_s=backoff_base_s,
+                    max_backoff_s=backoff_max_s,
+                )
                 available_domains = list(recommendation.get("sender_domains") or available_domains)
                 pair_retry_cap = max(0, int(recommendation.get("retry_cap", max_backoff_retries) or max_backoff_retries))
+                dynamic_backoff_base_s = max(1.0, float(recommendation.get("provider_backoff_base_s", backoff_base_s) or backoff_base_s))
+                dynamic_backoff_max_s = max(dynamic_backoff_base_s, float(recommendation.get("provider_backoff_max_s", backoff_max_s) or backoff_max_s))
                 if not available_domains:
                     with JOBS_LOCK:
                         job.skipped += len(chunk)
@@ -11577,8 +11713,8 @@ def smtp_send_job(
 
                     wait_s = _compute_backoff_wait_seconds(
                         attempt=attempt,
-                        base_s=backoff_base_s,
-                        max_s=backoff_max_s,
+                        base_s=dynamic_backoff_base_s,
+                        max_s=dynamic_backoff_max_s,
                         failure_type=failure_type,
                     )
                     next_ts = time.time() + wait_s
@@ -11597,6 +11733,8 @@ def smtp_send_job(
                         "intervention": intervention,
                         "sender_domain": active_sender_domain,
                         "sender_attempt_in_domain": sender_attempt_in_domain,
+                        "provider_trend": str(recommendation.get("provider_trend") or "unknown"),
+                        "provider_samples": int(recommendation.get("provider_samples") or 0),
                     }
 
                     with JOBS_LOCK:
@@ -11606,7 +11744,7 @@ def smtp_send_job(
                         job.push_chunk_state({**entry, "status": "backoff"})
                     msg = (
                         f"Chunk {chunk_idx_local+1} [{target_domain}]: BACKOFF retry#{attempt} "
-                        f"wait={int(wait_s)}s type={failure_type} ({rtxt})"
+                        f"wait={int(wait_s)}s type={failure_type} ({rtxt}) trend={recommendation.get('provider_trend','unknown')}"
                     )
                     if domain_switched:
                         msg += f" | switched_sender_domain={next_domain}"

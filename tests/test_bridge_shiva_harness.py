@@ -235,6 +235,59 @@ class BridgeShivaHarnessTests(unittest.TestCase):
         self.assertEqual(rec["sender_domains"][0], "good.com")
         self.assertLessEqual(rec["retry_cap"], 3)
 
+
+    def test_dynamic_policy_shortens_backoff_for_fast_success_provider(self):
+        for idx in range(40):
+            shiva.db_log_email_attempt(
+                job_id=f"job-fast-{idx}",
+                campaign_id="camp001",
+                chunk_idx=idx,
+                sender_domain="sender-a.com",
+                provider_domain="fastmail.com",
+                attempt_number=1,
+                outcome="sent",
+            )
+            shiva.db_finalize_email_learning(
+                job_id=f"job-fast-{idx}",
+                campaign_id="camp001",
+                chunk_idx=idx,
+                sender_domain="sender-a.com",
+                provider_domain="fastmail.com",
+                attempts_taken=1,
+                outcome="success",
+            )
+
+        rec = shiva.learning_recommendation("fastmail.com", ["sender-a.com"], 4, base_backoff_s=60.0, max_backoff_s=1800.0)
+        self.assertLessEqual(rec["retry_cap"], 3)
+        self.assertLess(rec["provider_backoff_base_s"], 60.0)
+        self.assertIn(rec["provider_trend"], {"fast_success", "stable"})
+
+    def test_dynamic_policy_expands_backoff_for_failing_provider(self):
+        for idx in range(35):
+            shiva.db_log_email_attempt(
+                job_id=f"job-slow-{idx}",
+                campaign_id="camp001",
+                chunk_idx=idx,
+                sender_domain="sender-b.com",
+                provider_domain="slowmail.com",
+                attempt_number=3,
+                outcome="blocked_reputation",
+            )
+            shiva.db_finalize_email_learning(
+                job_id=f"job-slow-{idx}",
+                campaign_id="camp001",
+                chunk_idx=idx,
+                sender_domain="sender-b.com",
+                provider_domain="slowmail.com",
+                attempts_taken=4,
+                outcome="failure",
+            )
+
+        rec = shiva.learning_recommendation("slowmail.com", ["sender-b.com"], 3, base_backoff_s=60.0, max_backoff_s=1800.0)
+        self.assertGreaterEqual(rec["retry_cap"], 3)
+        self.assertGreater(rec["provider_backoff_base_s"], 60.0)
+        self.assertEqual(rec["provider_trend"], "slow_or_failing")
+
     def test_learning_summary_reports_attempts_to_success(self):
         shiva.db_log_email_attempt(
             job_id="abc1",
