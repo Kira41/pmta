@@ -10746,11 +10746,29 @@ def smtp_send_job(
         # Per-provider sender rotation cursor: if a provider has many recipients,
         # chunk#1 can use sender/IP-A, chunk#2 sender/IP-B, ... then wrap.
         provider_sender_cursor: Dict[str, int] = {}
+        provider_retry_chunks: Dict[str, List[dict]] = {}
 
         def _remaining_total() -> int:
-            return sum(len(v) for v in provider_buckets.values())
+            queued = sum(len(v) for v in provider_buckets.values())
+            queued += sum(len(v) for v in provider_retry_chunks.values())
+            return queued
 
-        def _next_provider_domain() -> Optional[str]:
+        def _domain_has_ready_work(domain: str, now_ts: float) -> bool:
+            retries = provider_retry_chunks.get(domain) or []
+            if retries and float(retries[0].get("next_retry_ts") or 0.0) <= now_ts:
+                return True
+            return bool(provider_buckets.get(domain))
+
+        def _next_retry_wait(now_ts: float) -> Optional[float]:
+            waits: List[float] = []
+            for retries in provider_retry_chunks.values():
+                if not retries:
+                    continue
+                next_ts = float(retries[0].get("next_retry_ts") or 0.0)
+                waits.append(max(0.0, next_ts - now_ts))
+            return min(waits) if waits else None
+
+        def _next_provider_domain(now_ts: float) -> Optional[str]:
             nonlocal provider_cursor
             if not provider_order:
                 return None
@@ -10758,7 +10776,7 @@ def smtp_send_job(
             for step in range(n):
                 idx2 = (provider_cursor + step) % n
                 dom2 = provider_order[idx2]
-                if provider_buckets.get(dom2):
+                if _domain_has_ready_work(dom2, now_ts):
                     provider_cursor = (idx2 + 1) % n
                     return dom2
             return None
@@ -10871,15 +10889,42 @@ def smtp_send_job(
                 except Exception:
                     pmta_pressure_applied = {}
 
-            target_domain = _next_provider_domain()
+            now_ts = time.time()
+            target_domain = _next_provider_domain(now_ts)
             if not target_domain:
-                break
+                wait_retry = _next_retry_wait(now_ts)
+                if wait_retry is None:
+                    break
+                if wait_retry > 0:
+                    with JOBS_LOCK:
+                        if job.status != "error":
+                            job.status = "backoff"
+                        job.log("INFO", f"No provider ready yet; waiting {int(wait_retry)}s for next provider retry window.")
+                    if not _sleep_checked(wait_retry):
+                        _stop_job("stop requested during provider retry wait")
+                        return
+                continue
 
-            bucket = provider_buckets.get(target_domain) or []
-            chunk = bucket[:cs]
-            provider_buckets[target_domain] = bucket[len(chunk):]
-            if not chunk:
-                break
+            retry_q = provider_retry_chunks.get(target_domain) or []
+            retry_item = retry_q.pop(0) if retry_q and float(retry_q[0].get("next_retry_ts") or 0.0) <= now_ts else None
+            provider_retry_chunks[target_domain] = retry_q
+
+            if retry_item:
+                chunk = list(retry_item.get("chunk") or [])
+                attempt = int(retry_item.get("attempt") or 0)
+                chunk_subjects = list(retry_item.get("chunk_subjects") or subjects2 or subjects)
+                chunk_body_variants = list(retry_item.get("chunk_body_variants") or body_variants2 or split_body_variants(body))
+                sender_cursor_base = int(retry_item.get("sender_cursor_base") or provider_sender_cursor.get(target_domain, 0) or 0)
+                chunk_idx_local = int(retry_item.get("chunk_idx") or chunk_idx)
+            else:
+                bucket = provider_buckets.get(target_domain) or []
+                chunk = bucket[:cs]
+                provider_buckets[target_domain] = bucket[len(chunk):]
+                if not chunk:
+                    continue
+                attempt = 0
+                sender_cursor_base = int(provider_sender_cursor.get(target_domain, 0) or 0)
+                chunk_idx_local = chunk_idx
 
             # Live chunk info for Jobs UI
             dom_counts = count_recipient_domains(chunk)
@@ -10921,10 +10966,10 @@ def smtp_send_job(
                     pass
 
             with JOBS_LOCK:
-                job.current_chunk = chunk_idx
+                job.current_chunk = chunk_idx_local
                 job.current_chunk_domains = dom_counts
                 job.current_chunk_info = {
-                    "chunk": chunk_idx,
+                    "chunk": chunk_idx_local,
                     "size": len(chunk),
                     "target_domain": target_domain,
                     "chunk_size": cs,
@@ -10947,13 +10992,14 @@ def smtp_send_job(
             with JOBS_LOCK:
                 job.chunks_total = max(job.chunks_total, job.chunks_done + est_remaining)
 
-            # Per-chunk attempt loop (GLOBAL backoff)
+            # Per-chunk attempt loop (provider-isolated backoff)
             # Per-chunk AI rewrite chain (optional): rewrite from last accepted message,
             # then carry rewritten output forward as input for next chunk.
-            chunk_subjects = list(subjects2 or subjects)
-            chunk_body_variants = list(body_variants2 or split_body_variants(body))
+            if not retry_item:
+                chunk_subjects = list(subjects2 or subjects)
+                chunk_body_variants = list(body_variants2 or split_body_variants(body))
 
-            if ai_enabled:
+            if ai_enabled and not retry_item:
                 ai_in_subjects = list(ai_subject_chain or chunk_subjects)
                 ai_in_body = ai_body_chain if ai_body_chain.strip() else (chunk_body_variants[0] if chunk_body_variants else body)
                 try:
@@ -10981,8 +11027,7 @@ def smtp_send_job(
                     with JOBS_LOCK:
                         job.log("WARN", f"Chunk {chunk_idx+1} [{target_domain}]: AI rewrite failed, using previous content ({e})")
 
-            attempt = 0
-            sender_cursor_base = int(provider_sender_cursor.get(target_domain, 0) or 0)
+            chunk_finished = False
             while True:
                 # rotate per provider (domain), and shift again on each retry
                 rot = sender_cursor_base + attempt
@@ -11089,7 +11134,7 @@ def smtp_send_job(
                             job.current_chunk_info = {}
                             job.current_chunk_domains = {}
                             job.push_chunk_state({
-                                "chunk": chunk_idx,
+                                "chunk": chunk_idx_local,
                                 "status": "abandoned",
                                 "size": len(chunk),
                                 "sender": fe,
@@ -11100,7 +11145,7 @@ def smtp_send_job(
                                 "next_retry_ts": 0,
                                 "reason": "abandoned",
                             })
-                            job.log("ERROR", f"Chunk {chunk_idx+1} [{target_domain}]: ABANDONED after {attempt-1} retries ({rtxt})")
+                            job.log("ERROR", f"Chunk {chunk_idx_local+1} [{target_domain}]: ABANDONED after {attempt-1} retries ({rtxt})")
                             if from_emails2:
                                 provider_sender_cursor[target_domain] = (sender_cursor_base + 1) % max(1, len(from_emails2))
                         break
@@ -11109,7 +11154,7 @@ def smtp_send_job(
                     next_ts = time.time() + wait_s
 
                     entry = {
-                        "chunk": chunk_idx,
+                        "chunk": chunk_idx_local,
                         "size": len(chunk),
                         "attempt": attempt,
                         "next_retry_ts": next_ts,
@@ -11125,24 +11170,26 @@ def smtp_send_job(
                         job.chunks_backoff += 1
                         job.push_backoff(entry)
                         job.push_chunk_state({**entry, "status": "backoff"})
-                        job.log("WARN", f"Chunk {chunk_idx+1} [{target_domain}]: BACKOFF retry#{attempt} wait={int(wait_s)}s ({rtxt})")
+                    job.log("WARN", f"Chunk {chunk_idx_local+1} [{target_domain}]: BACKOFF retry#{attempt} wait={int(wait_s)}s ({rtxt})")
 
-                    # Global pause (but responsive to pause/stop)
-                    if not _sleep_checked(wait_s):
-                        _stop_job("stop requested during backoff")
-                        return
-
-                    with JOBS_LOCK:
-                        if job.status != "error":
-                            job.status = "running"
-                    # loop again (re-check)
-                    continue
+                    retry_queue = provider_retry_chunks.setdefault(target_domain, [])
+                    retry_queue.append({
+                        "chunk_idx": chunk_idx_local,
+                        "chunk": list(chunk),
+                        "attempt": attempt,
+                        "next_retry_ts": next_ts,
+                        "chunk_subjects": list(chunk_subjects),
+                        "chunk_body_variants": list(chunk_body_variants),
+                        "sender_cursor_base": sender_cursor_base,
+                    })
+                    retry_queue.sort(key=lambda x: float(x.get("next_retry_ts") or 0.0))
+                    break
 
                 # allowed -> send
                 with JOBS_LOCK:
                     job.status = "running"
                     job.push_chunk_state({
-                        "chunk": chunk_idx,
+                        "chunk": chunk_idx_local,
                         "status": "running",
                         "size": len(chunk),
                         "sender": fe,
@@ -11153,14 +11200,14 @@ def smtp_send_job(
                         "next_retry_ts": 0,
                         "reason": "",
                     })
-                    job.log("INFO", f"Chunk {chunk_idx+1} [{target_domain}]: sending size={len(chunk)} sender={fe} workers={workers2}")
+                    job.log("INFO", f"Chunk {chunk_idx_local+1} [{target_domain}]: sending size={len(chunk)} sender={fe} workers={workers2}")
 
                 if not _wait_ready():
                     _stop_job("stop requested")
                     return
 
                 _send_chunk(
-                    chunk_idx=chunk_idx,
+                    chunk_idx=chunk_idx_local,
                     chunk_rcpts=chunk,
                     from_name=fn,
                     from_email=fe,
@@ -11184,7 +11231,7 @@ def smtp_send_job(
                     job.current_chunk_info = {}
                     job.current_chunk_domains = {}
                     job.push_chunk_state({
-                        "chunk": chunk_idx,
+                        "chunk": chunk_idx_local,
                         "status": "done" if attempt == 0 else "done_after_backoff",
                         "size": len(chunk),
                         "sender": fe,
@@ -11197,10 +11244,12 @@ def smtp_send_job(
                     })
                 if from_emails2:
                     provider_sender_cursor[target_domain] = (sender_cursor_base + 1) % max(1, len(from_emails2))
+                chunk_finished = True
                 break
 
             # next chunk
-            chunk_idx += 1
+            if chunk_finished:
+                chunk_idx += 1
 
             if sleep2 > 0 and _remaining_total() > 0:
                 with JOBS_LOCK:
