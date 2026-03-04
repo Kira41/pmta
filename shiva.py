@@ -3458,6 +3458,39 @@ PAGE_JOBS = r"""
       backdrop-filter: blur(10px);
     }
 
+    .filterBar{
+      background: linear-gradient(180deg, var(--card), var(--card2));
+      border:1px solid var(--border);
+      border-radius: 14px;
+      padding: 10px 12px;
+      margin-bottom: 12px;
+      display:grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap:8px;
+      align-items:end;
+    }
+    .filterCell label{
+      display:block;
+      font-size:11px;
+      color:var(--muted);
+      margin-bottom:5px;
+      font-weight:700;
+      text-transform:uppercase;
+      letter-spacing:.3px;
+    }
+    .filterCell select{
+      width:100%;
+      border:1px solid rgba(255,255,255,.16);
+      background: rgba(255,255,255,.06);
+      color: rgba(255,255,255,.9);
+      border-radius:10px;
+      font: inherit;
+      font-size:13px;
+      padding:8px 9px;
+    }
+    .filterCell option{ background:#0b1020; color:#fff; }
+    .filterMeta{ grid-column:1 / -1; font-size:12px; color:var(--muted); }
+
     .jobTop{display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start; justify-content:space-between;}
     .titleRow{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
     .mini{color:var(--muted); font-size:12px; line-height:1.55}
@@ -3709,6 +3742,56 @@ PAGE_JOBS = r"""
       </div>
     </div>
 
+    <div class="filterBar" id="jobsFilterBar">
+      <div class="filterCell">
+        <label for="fltStatus">Status</label>
+        <select id="fltStatus">
+          <option value="all">All</option>
+          <option value="running">running</option>
+          <option value="done">done</option>
+          <option value="paused">paused</option>
+          <option value="backoff">backoff</option>
+        </select>
+      </div>
+      <div class="filterCell">
+        <label for="fltMode">Mode</label>
+        <select id="fltMode">
+          <option value="all">All</option>
+          <option value="counts">counts</option>
+          <option value="legacy">legacy</option>
+        </select>
+      </div>
+      <div class="filterCell">
+        <label for="fltRisk">Risk</label>
+        <select id="fltRisk">
+          <option value="all">All</option>
+          <option value="internal_degraded">internal degraded</option>
+          <option value="deliverability_high">deliverability high</option>
+          <option value="stale">stale</option>
+        </select>
+      </div>
+      <div class="filterCell">
+        <label for="fltProvider">Provider</label>
+        <select id="fltProvider">
+          <option value="all">All</option>
+          <option value="gmail">gmail</option>
+          <option value="yahoo">yahoo</option>
+          <option value="outlook">outlook</option>
+          <option value="icloud">icloud</option>
+          <option value="other">other</option>
+        </select>
+      </div>
+      <div class="filterCell">
+        <label for="fltSort">Sort</label>
+        <select id="fltSort">
+          <option value="newest">newest first</option>
+          <option value="highest_risk">highest risk first</option>
+          <option value="stalest">stalest first</option>
+        </select>
+      </div>
+      <div class="filterMeta" id="filterMeta">Showing all jobs.</div>
+    </div>
+
     {% for j in jobs %}
       <div class="job" data-jobid="{{j.id}}" data-created="{{j.created_at}}">
         <div class="jobTop">
@@ -3886,6 +3969,10 @@ PAGE_JOBS = r"""
       </div>
     {% endfor %}
 
+    <div class="job" id="jobsFilteredEmpty" style="display:none">
+      <div class="mini">No jobs match the selected filters.</div>
+    </div>
+
     {% if jobs|length == 0 %}
       <div class="job">
         <div class="mini">No jobs yet.</div>
@@ -3975,6 +4062,89 @@ PAGE_JOBS = r"""
     if(bRate >= 0.12 || cRate >= 0.01 || (delivered <= 0 && sent >= 30)) return 'HIGH';
     if(bRate >= 0.05 || cRate >= 0.003 || dRate >= 0.2) return 'MED';
     return 'LOW';
+  }
+
+
+  function normalizeJobStatus(j){
+    const raw = (j && j.status ? j.status : '').toString().trim().toLowerCase();
+    if(raw === 'running' || raw === 'done' || raw === 'paused' || raw === 'backoff') return raw;
+    return 'other';
+  }
+
+  function normalizeBridgeMode(j){
+    const raw = (j && j.bridge_mode ? j.bridge_mode : 'counts').toString().trim().toLowerCase();
+    if(raw === 'legacy') return 'legacy';
+    if(raw === 'counts') return 'counts';
+    return 'counts';
+  }
+
+  function freshnessMinutes(j){
+    const mode = normalizeBridgeMode(j);
+    if(mode === 'counts'){
+      return ageMin(j.accounting_last_update_ts || j.accounting_last_ts);
+    }
+    const lagSecRaw = Number(j && j.ingestion_lag_seconds);
+    if(Number.isFinite(lagSecRaw) && lagSecRaw >= 0){
+      return Math.floor(lagSecRaw / 60);
+    }
+    return ageMin(j.ingestion_last_event_ts || j.accounting_last_ts);
+  }
+
+  function hasInternalDegraded(j){
+    const failureCount = Number(j && j.bridge_failure_count);
+    const failN = Number.isFinite(failureCount) ? failureCount : Number(j && j.internal_health_failures || 0);
+    return Number.isFinite(failN) && failN > 0;
+  }
+
+  function hasDeliverabilityHigh(j){
+    return computeDeliverabilityRisk(j) === 'HIGH';
+  }
+
+  function isStaleJob(j){
+    const mode = normalizeBridgeMode(j);
+    const mins = freshnessMinutes(j);
+    if(mins === null || !Number.isFinite(mins)) return false;
+    return mode === 'legacy' ? mins > 15 : mins > 10;
+  }
+
+  function providerBucketFromDomain(domain){
+    const d = (domain || '').toString().trim().toLowerCase();
+    if(!d) return 'other';
+    if(d.includes('gmail.') || d.includes('googlemail.')) return 'gmail';
+    if(d.includes('yahoo.') || d.includes('ymail.') || d.includes('rocketmail.')) return 'yahoo';
+    if(d.includes('outlook.') || d.includes('hotmail.') || d.includes('live.') || d.includes('msn.')) return 'outlook';
+    if(d.includes('icloud.') || d.includes('me.com') || d.includes('mac.com')) return 'icloud';
+    return 'other';
+  }
+
+  function detectProviderBucket(j){
+    const weighted = {};
+    const add = (dom, w) => {
+      const b = providerBucketFromDomain(dom);
+      weighted[b] = Number(weighted[b] || 0) + Math.max(0, Number(w || 0));
+    };
+    const plan = (j && j.domain_plan) || {};
+    for(const [dom, count] of Object.entries(plan)) add(dom, count);
+    if(!Object.keys(plan).length){
+      const host = (j && j.smtp_host ? j.smtp_host : '').toString().trim().toLowerCase();
+      if(host) add(host, 1);
+    }
+    let best = 'other';
+    let bestW = -1;
+    for(const [k,v] of Object.entries(weighted)){
+      if(v > bestW){
+        best = k;
+        bestW = v;
+      }
+    }
+    return best;
+  }
+
+  function riskRank(j){
+    if(hasInternalDegraded(j)) return 3;
+    if(hasDeliverabilityHigh(j)) return 2;
+    if(isStaleJob(j)) return 1;
+    return 0;
   }
 
   function renderTriageBadges(card, j){
@@ -4077,6 +4247,13 @@ PAGE_JOBS = r"""
     lastPmtaMonitor: {},
     lastJobPayload: {},
     latestBridgeState: null,
+    filters: {
+      status: 'all',
+      mode: 'all',
+      risk: 'all',
+      provider: 'all',
+      sort: 'newest',
+    },
   };
 
   async function controlJob(jobId, action){
@@ -4108,6 +4285,8 @@ This will remove it from Jobs history.`);
       if(r.ok && j && j.ok){
         toast('Job deleted', `Job ${jobId} deleted.`, 'good');
         if(card) card.remove();
+        cards = cards.filter(x => x !== card);
+        applyFiltersAndSort();
       }else{
         toast('Delete failed', (j && (j.error||j.detail)) ? (j.error||j.detail) : ('HTTP '+r.status), 'bad');
       }
@@ -5129,6 +5308,7 @@ This will remove it from Jobs history.`);
 
     state.lastJobPayload[jobId] = j;
     renderBridgeReceiver(card, j, state.latestBridgeState);
+    applyFiltersAndSort();
   }
 
   async function tickCard(card){
@@ -5176,7 +5356,128 @@ This will remove it from Jobs history.`);
     });
   }
 
-  const cards = Array.from(document.querySelectorAll('.job[data-jobid]'));
+  function updateFilterUrl(){
+    try{
+      const u = new URL(window.location.href);
+      const keep = (key, val) => {
+        if(!val || val === 'all' || (key === 'sort' && val === 'newest')) u.searchParams.delete(key);
+        else u.searchParams.set(key, val);
+      };
+      keep('status', state.filters.status);
+      keep('mode', state.filters.mode);
+      keep('risk', state.filters.risk);
+      keep('provider', state.filters.provider);
+      keep('sort', state.filters.sort);
+      history.replaceState(null, '', `${u.pathname}?${u.searchParams.toString()}`.replace(/\?$/, ''));
+    }catch(e){ /* ignore */ }
+  }
+
+  function restoreFiltersFromQuery(){
+    try{
+      const p = new URLSearchParams(window.location.search || '');
+      const get = (k, d) => (p.get(k) || d).toString().trim().toLowerCase();
+      const status = get('status', 'all');
+      const mode = get('mode', 'all');
+      const risk = get('risk', 'all');
+      const provider = get('provider', 'all');
+      const sort = get('sort', 'newest');
+      state.filters.status = ['all','running','done','paused','backoff'].includes(status) ? status : 'all';
+      state.filters.mode = ['all','counts','legacy'].includes(mode) ? mode : 'all';
+      state.filters.risk = ['all','internal_degraded','deliverability_high','stale'].includes(risk) ? risk : 'all';
+      state.filters.provider = ['all','gmail','yahoo','outlook','icloud','other'].includes(provider) ? provider : 'all';
+      state.filters.sort = ['newest','highest_risk','stalest'].includes(sort) ? sort : 'newest';
+    }catch(e){ /* ignore */ }
+  }
+
+  function syncFilterInputs(){
+    const bind = (id, key) => {
+      const el = document.getElementById(id);
+      if(!el) return;
+      el.value = state.filters[key];
+      el.addEventListener('change', () => {
+        state.filters[key] = (el.value || 'all').toString().trim().toLowerCase();
+        applyFiltersAndSort();
+        updateFilterUrl();
+      });
+    };
+    bind('fltStatus', 'status');
+    bind('fltMode', 'mode');
+    bind('fltRisk', 'risk');
+    bind('fltProvider', 'provider');
+    bind('fltSort', 'sort');
+  }
+
+  function passesRiskFilter(j){
+    if(state.filters.risk === 'all') return true;
+    if(state.filters.risk === 'internal_degraded') return hasInternalDegraded(j);
+    if(state.filters.risk === 'deliverability_high') return hasDeliverabilityHigh(j);
+    if(state.filters.risk === 'stale') return isStaleJob(j);
+    return true;
+  }
+
+  function applyFiltersAndSort(){
+    const rows = cards.map((card, idx) => {
+      const jobId = (card.dataset.jobid || '').toString();
+      const fallbackStatus = ((qk(card, 'status') && qk(card, 'status').textContent) || '').toString().trim().toLowerCase();
+      const j = state.lastJobPayload[jobId] || { status: fallbackStatus, created_at: card.dataset.created || '' };
+      return { card, idx, job: j };
+    });
+
+    const visible = [];
+    for(const row of rows){
+      const j = row.job || {};
+      const statusOk = state.filters.status === 'all' || normalizeJobStatus(j) === state.filters.status;
+      const modeOk = state.filters.mode === 'all' || normalizeBridgeMode(j) === state.filters.mode;
+      const riskOk = passesRiskFilter(j);
+      const providerOk = state.filters.provider === 'all' || detectProviderBucket(j) === state.filters.provider;
+      const keep = statusOk && modeOk && riskOk && providerOk;
+      row.card.style.display = keep ? '' : 'none';
+      if(keep) visible.push(row);
+    }
+
+    const createdMs = (row) => {
+      const ms = tsToMs(row.job.created_at || row.card.dataset.created || '');
+      return Number.isFinite(ms) ? ms : 0;
+    };
+    const staleMin = (row) => {
+      const v = freshnessMinutes(row.job);
+      return Number.isFinite(v) ? v : -1;
+    };
+    visible.sort((a,b) => {
+      if(state.filters.sort === 'highest_risk'){
+        const d = riskRank(b.job) - riskRank(a.job);
+        if(d !== 0) return d;
+      }else if(state.filters.sort === 'stalest'){
+        const d = staleMin(b) - staleMin(a);
+        if(d !== 0) return d;
+      }
+      const byNew = createdMs(b) - createdMs(a);
+      if(byNew !== 0) return byNew;
+      return a.idx - b.idx;
+    });
+
+    const parent = cards[0] ? cards[0].parentElement : null;
+    if(parent){
+      for(const row of visible){ parent.appendChild(row.card); }
+    }
+
+    const empty = document.getElementById('jobsFilteredEmpty');
+    if(empty) empty.style.display = (cards.length > 0 && visible.length === 0) ? '' : 'none';
+
+    const meta = document.getElementById('filterMeta');
+    if(meta){
+      const total = cards.length;
+      const shown = visible.length;
+      meta.textContent = shown === total
+        ? `Showing all ${total} job${total === 1 ? '' : 's'}.`
+        : `Showing ${shown} of ${total} job${total === 1 ? '' : 's'}.`;
+    }
+  }
+
+  restoreFiltersFromQuery();
+  syncFilterInputs();
+
+  let cards = Array.from(document.querySelectorAll('.job[data-jobid]'));
   cards.forEach(bindControls);
   cards.forEach(bindDetailState);
 
@@ -5184,6 +5485,7 @@ This will remove it from Jobs history.`);
     for(const c of cards){
       await tickCard(c);
     }
+    applyFiltersAndSort();
   }
 
   async function bridgeDebugTick(){
@@ -5291,6 +5593,7 @@ This will remove it from Jobs history.`);
 
   document.getElementById('btnRefreshAll')?.addEventListener('click', tickAll);
 
+  applyFiltersAndSort();
   tickAll();
   bridgeDebugTick();
   setInterval(tickAll, 1200);
