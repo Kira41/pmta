@@ -459,6 +459,19 @@ class SendJob:
         )
         if len(self.internal_last_errors) > 80:
             self.internal_last_errors = self.internal_last_errors[-40:]
+        try:
+            _bridge_push_sample(
+                "internal_error_samples",
+                {
+                    "ts": now_iso(),
+                    "job_id": self.id,
+                    "type": t,
+                    "detail": d,
+                    "email": (email or "").strip(),
+                },
+            )
+        except Exception:
+            pass
         self.maybe_persist()
     def speed_epm(self) -> float:
         """Emails per minute based on last 60s of send events."""
@@ -1328,6 +1341,68 @@ def _sync_job_outcome_counters_from_db(job: 'SendJob') -> None:
     job.bounced = int(counts.get("bounced") or 0)
     job.deferred = int(counts.get("deferred") or 0)
     job.complained = int(counts.get("complained") or 0)
+
+
+def _email_domain(raw_email: Any) -> str:
+    s = str(raw_email or "").strip().lower()
+    if "@" not in s:
+        return ""
+    dom = s.rsplit("@", 1)[-1].strip().lower()
+    if not dom or "." not in dom:
+        return ""
+    return dom
+
+
+def _job_provider_breakdown(job_id: str, limit: int = 6) -> List[dict]:
+    """Best-effort provider/domain breakdown from recent accounting ledger rows."""
+    jid = str(job_id or "").strip().lower()
+    if not jid:
+        return []
+    by_domain: Dict[str, Dict[str, int]] = {}
+    try:
+        with DB_LOCK:
+            conn = _db_conn()
+            try:
+                rows = conn.execute(
+                    "SELECT rcpt, outcome FROM accounting_events "
+                    "WHERE job_id=? ORDER BY created_at DESC LIMIT 1200",
+                    (jid,),
+                ).fetchall()
+            finally:
+                conn.close()
+    except Exception:
+        return []
+
+    for row in rows:
+        rcpt = str((row[0] if row else "") or "")
+        outcome = str((row[1] if row else "") or "").strip().lower()
+        if outcome not in {"delivered", "deferred", "bounced", "complained"}:
+            continue
+        dom = _email_domain(rcpt)
+        if not dom:
+            continue
+        if dom not in by_domain:
+            by_domain[dom] = {"delivered": 0, "deferred": 0, "bounced": 0, "complained": 0, "total": 0}
+        by_domain[dom][outcome] = int(by_domain[dom].get(outcome, 0) or 0) + 1
+        by_domain[dom]["total"] = int(by_domain[dom].get("total", 0) or 0) + 1
+
+    out: List[dict] = []
+    for dom, counts in by_domain.items():
+        total = int(counts.get("total") or 0)
+        if total <= 0:
+            continue
+        out.append(
+            {
+                "domain": dom,
+                "total": total,
+                "delivered": int(counts.get("delivered") or 0),
+                "deferred": int(counts.get("deferred") or 0),
+                "bounced": int(counts.get("bounced") or 0),
+                "complained": int(counts.get("complained") or 0),
+            }
+        )
+    out.sort(key=lambda x: (int(x.get("total") or 0), str(x.get("domain") or "")), reverse=True)
+    return out[: max(1, int(limit or 6))]
 
 
 def db_insert_accounting_event(event: Dict[str, Any]) -> bool:
@@ -3698,39 +3773,47 @@ PAGE_JOBS = r"""
             </div>
 
             <div class="panel">
-              <h4>Quality + Errors</h4>
+              <h4>System / Provider / Integrity</h4>
 
-              <!-- 6) counters -->
-              <div class="mini" data-k="counters">—</div>
-
-              <div style="height:10px"></div>
-              <div class="mini"><b>Outcomes (PMTA accounting)</b></div>
-              <div class="outcomesWrap" data-k="outcomes">—</div>
-              <div class="outTrend" data-k="outcomeTrend">—</div>
-
-              <div style="height:10px"></div>
-
-              <!-- 7) error types -->
-              <div class="mini"><b>Error type</b></div>
-              <div class="mini" data-k="errorTypes">—</div>
-
-              <div style="height:10px"></div>
-
-              <div class="mini"><b>Error 1 (summary)</b></div>
-              <div class="mini" data-k="lastErrors">—</div>
-
+              <div class="mini"><b>System / Internal</b></div>
+              <div class="mini" data-k="systemSummary">—</div>
               <details class="errorFold">
-                <summary>Error 2 (details)</summary>
+                <summary>View details</summary>
+                <div class="mini" style="margin-top:8px" data-k="systemDetails">—</div>
+              </details>
+
+              <div style="height:10px"></div>
+
+              <div class="mini"><b>Provider / Deliverability</b></div>
+              <div class="mini" data-k="providerSummary">—</div>
+              <div class="mini" style="margin-top:6px" data-k="providerBreakdown">—</div>
+              <div class="mini" style="margin-top:6px" data-k="providerReasons">—</div>
+              <details class="errorFold">
+                <summary>View details</summary>
+                <div class="mini" style="margin-top:8px" data-k="providerDetails">—</div>
+              </details>
+
+              <div style="height:10px"></div>
+
+              <div class="mini"><b>Data Integrity / Mapping</b></div>
+              <div class="mini" data-k="integritySummary">—</div>
+              <details class="errorFold">
+                <summary>View details</summary>
+                <div class="mini" style="margin-top:8px" data-k="integrityDetails">—</div>
+              </details>
+
+              <details class="errorFold" style="margin-top:8px">
+                <summary>Legacy quality + errors (unchanged data)</summary>
+                <div class="mini" style="margin-top:8px" data-k="counters">—</div>
+                <div class="mini" style="margin-top:8px"><b>Outcomes (PMTA accounting)</b></div>
+                <div class="outcomesWrap" data-k="outcomes">—</div>
+                <div class="outTrend" data-k="outcomeTrend">—</div>
+                <div class="mini" style="margin-top:8px"><b>Error type</b></div>
+                <div class="mini" data-k="errorTypes">—</div>
+                <div class="mini" style="margin-top:8px"><b>Error summary</b></div>
+                <div class="mini" data-k="lastErrors">—</div>
                 <div class="mini" style="margin-top:8px" data-k="lastErrors2">—</div>
-              </details>
-
-              <details class="errorFold">
-                <summary>Internal errors (local network only)</summary>
                 <div class="mini" style="margin-top:8px" data-k="internalErrors">—</div>
-              </details>
-
-              <details class="errorFold">
-                <summary>Last connection review (Shiva bridge)</summary>
                 <div class="mini" style="margin-top:8px" data-k="bridgeReceiver">—</div>
               </details>
             </div>
@@ -4209,6 +4292,103 @@ This will remove it from Jobs history.`);
 
 
 
+  function renderIssueBlocks(card, j){
+    const asNum = (v) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    const fmtRate = (n, d) => {
+      if(n === null || d === null || d <= 0) return '—';
+      return `${((n/d)*100).toFixed(1)}%`;
+    };
+
+    const bridgeFail = asNum(j.bridge_failure_count);
+    const bridgeErr = (j.bridge_last_error_message || '').toString().trim();
+    const bridgeAge = ageMin(j.bridge_last_success_ts);
+    const internalCounts = j.internal_error_counts || {};
+    const runtimeErr = Object.values(internalCounts).reduce((a,v)=>a+Number(v||0),0);
+    const dbFail = asNum(j.db_write_failures);
+
+    const sys = qk(card,'systemSummary');
+    if(sys){
+      const bits = [
+        `Bridge failures: <b>${bridgeFail === null ? '—' : bridgeFail}</b>`,
+        `Bridge last success: <b>${bridgeAge === null ? '—' : (bridgeAge + 'm ago')}</b>`,
+        `Runtime internal errors: <b>${runtimeErr || 0}</b>`,
+        `DB write failures: <b>${dbFail === null ? '—' : dbFail}</b>`,
+      ];
+      if(bridgeErr) bits.push(`Bridge last error: ${esc(bridgeErr.slice(0,140))}`);
+      sys.innerHTML = bits.join(' · ');
+    }
+
+    const sysRows = [];
+    const irows = Array.isArray(j.internal_last_samples) ? j.internal_last_samples : (Array.isArray(j.internal_last_errors) ? j.internal_last_errors : []);
+    for(const x of irows.slice().reverse().slice(0,8)){
+      sysRows.push(`• ${esc(x.ts || '—')} · [${esc(x.type || 'internal')}] ${esc((x.detail || '').toString().slice(0,180))}`);
+    }
+    const sysDet = qk(card,'systemDetails');
+    if(sysDet) sysDet.innerHTML = sysRows.length ? sysRows.join('<br>') : '—';
+
+    const sent = asNum(j.sent);
+    const delivered = asNum(j.delivered);
+    const deferred = asNum(j.deferred);
+    const bounced = asNum(j.bounced);
+    const complained = asNum(j.complained);
+
+    const prov = qk(card,'providerSummary');
+    if(prov){
+      prov.innerHTML = [
+        `Delivered: <b>${delivered ?? '—'}</b> (${fmtRate(delivered, sent)})`,
+        `Deferred: <b>${deferred ?? '—'}</b> (${fmtRate(deferred, sent)})`,
+        `Bounced: <b>${bounced ?? '—'}</b> (${fmtRate(bounced, sent)})`,
+        `Complained: <b>${complained ?? '—'}</b> (${fmtRate(complained, sent)})`,
+      ].join(' · ');
+    }
+
+    const pb = qk(card,'providerBreakdown');
+    const breakdown = Array.isArray(j.provider_breakdown) ? j.provider_breakdown : [];
+    if(pb){
+      pb.innerHTML = breakdown.length
+        ? ('Provider/domain breakdown: ' + breakdown.slice(0,6).map(x => `${esc(x.domain || '—')} D=${Number(x.delivered||0)} Def=${Number(x.deferred||0)} B=${Number(x.bounced||0)} C=${Number(x.complained||0)}`).join(' · '))
+        : 'Provider/domain breakdown: —';
+    }
+
+    const pr = qk(card,'providerReasons');
+    const reasons = j.provider_reason_buckets || {};
+    const reasonEntries = Object.entries(reasons).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0)).slice(0,4);
+    if(pr){
+      pr.innerHTML = reasonEntries.length
+        ? ('Top reason buckets: ' + reasonEntries.map(([k,v]) => `${esc(k)}=<b>${Number(v||0)}</b>`).join(' · '))
+        : 'Top reason buckets: —';
+    }
+
+    const provDet = qk(card,'providerDetails');
+    if(provDet){
+      const samples = (Array.isArray(j.accounting_last_errors) ? j.accounting_last_errors : []).filter(x => x && x.kind !== 'accepted').slice().reverse().slice(0,8);
+      provDet.innerHTML = samples.length
+        ? samples.map(x => `• ${esc(x.ts || '—')} · ${esc(x.email || '—')} · ${esc(x.type || '—')} · ${esc((x.detail || '').toString().slice(0,180))}`).join('<br>')
+        : '—';
+    }
+
+    const dup = asNum(j.duplicates_dropped) || 0;
+    const jnf = asNum(j.job_not_found) || 0;
+    const miss = asNum(j.missing_fields) || 0;
+    const dbwf = asNum(j.db_write_failures) || 0;
+    const integ = qk(card,'integritySummary');
+    if(integ){
+      integ.innerHTML = `duplicates_dropped: <b>${dup}</b> · job_not_found: <b>${jnf}</b> · missing_fields: <b>${miss}</b> · db_write_failures: <b>${dbwf}</b>`;
+    }
+
+    const integDet = qk(card,'integrityDetails');
+    const integRows = Array.isArray(j.integrity_last_samples) ? j.integrity_last_samples : [];
+    if(integDet){
+      integDet.innerHTML = integRows.length
+        ? integRows.slice().reverse().slice(0,8).map(x => `• ${esc(x.ts || '—')} · ${esc(x.kind || 'integrity')} · job=${esc(x.job_id || '—')} · rcpt=${esc(x.rcpt || '—')}`).join('<br>')
+        : '—';
+    }
+  }
+
+
   function renderChunkHist(card, j){
     const tb = qk(card,'chunkHist');
     if(!tb) return;
@@ -4648,8 +4828,11 @@ This will remove it from Jobs history.`);
     // 5) Top domains
     renderTopDomains(card, j);
 
-    // 7) Error types + last errors
+    // 7) Error types + last errors (legacy section)
     renderErrorTypes(card, j);
+
+    // Structured issue blocks
+    renderIssueBlocks(card, j);
 
     // 8) Chunk history
     renderChunkHist(card, j);
@@ -8340,6 +8523,9 @@ _BRIDGE_DEBUG_STATE: Dict[str, Any] = {
     "duplicates_dropped": 0,
     "job_not_found": 0,
     "db_write_failures": 0,
+    "missing_fields": 0,
+    "internal_error_samples": [],
+    "integrity_samples": [],
 }
 
 _BRIDGE_POLLER_LOCK = threading.Lock()
@@ -8465,6 +8651,17 @@ def bridge_get_json(path: str, params: dict) -> dict:
 def _bridge_debug_update(**kwargs: Any) -> None:
     with _BRIDGE_DEBUG_LOCK:
         _BRIDGE_DEBUG_STATE.update(kwargs)
+
+
+def _bridge_push_sample(key: str, entry: dict, max_keep: int = 24) -> None:
+    if not key or not isinstance(entry, dict):
+        return
+    with _BRIDGE_DEBUG_LOCK:
+        rows = _BRIDGE_DEBUG_STATE.get(key)
+        if not isinstance(rows, list):
+            rows = []
+        rows.append(entry)
+        _BRIDGE_DEBUG_STATE[key] = rows[-max(4, int(max_keep or 24)):]
 
 _OUTCOME_CACHE_LOCK = threading.Lock()
 _OUTCOME_CACHE: Dict[Tuple[str, str], str] = {}
@@ -8847,9 +9044,31 @@ def process_pmta_accounting_event(ev: dict) -> dict:
 
     event_row = _build_accounting_event_row(ev, typ, rcpt, job_id)
     if not db_insert_accounting_event(event_row):
+        _bridge_push_sample(
+            "integrity_samples",
+            {
+                "ts": now_iso(),
+                "kind": "duplicates_dropped",
+                "job_id": job_id,
+                "campaign_id": campaign_id,
+                "rcpt": rcpt,
+                "outcome": typ,
+            },
+        )
         return {"ok": True, "duplicate": True, "event_id": event_row.get("event_id"), "job_id": job_id, "campaign_id": campaign_id, "rcpt": rcpt, "type": typ}
 
     if not rcpt or typ not in {"delivered", "bounced", "deferred", "complained"}:
+        _bridge_push_sample(
+            "integrity_samples",
+            {
+                "ts": now_iso(),
+                "kind": "missing_fields",
+                "job_id": job_id,
+                "campaign_id": campaign_id,
+                "rcpt": rcpt,
+                "outcome": typ,
+            },
+        )
         return {"ok": False, "reason": "missing_fields", "job_id": job_id, "campaign_id": campaign_id, "rcpt": rcpt, "type": typ}
 
     with JOBS_LOCK:
@@ -8859,6 +9078,17 @@ def process_pmta_accounting_event(ev: dict) -> dict:
         if not job and rcpt:
             job = _find_job_by_recipient(rcpt)
         if not job:
+            _bridge_push_sample(
+                "integrity_samples",
+                {
+                    "ts": now_iso(),
+                    "kind": "job_not_found",
+                    "job_id": job_id,
+                    "campaign_id": campaign_id,
+                    "rcpt": rcpt,
+                    "outcome": typ,
+                },
+            )
             return {"ok": False, "reason": "job_not_found", "job_id": job_id, "campaign_id": campaign_id, "rcpt": rcpt}
 
         _apply_outcome_to_job(job, rcpt, typ, ev)
@@ -9304,7 +9534,10 @@ def _poll_accounting_bridge_once() -> dict:
             "events_ingested": int(_BRIDGE_DEBUG_STATE.get("events_ingested", 0) or 0) + total_accepted,
             "duplicates_dropped": int(_BRIDGE_DEBUG_STATE.get("duplicates_dropped", 0) or 0),
             "job_not_found": int(_BRIDGE_DEBUG_STATE.get("job_not_found", 0) or 0),
+            "missing_fields": int(_BRIDGE_DEBUG_STATE.get("missing_fields", 0) or 0),
             "db_write_failures": int(_DB_WRITER_STATUS.get("failed", 0) or 0) + int(_DB_WRITER_STATUS.get("queue_full", 0) or 0),
+            "internal_error_samples": list(_BRIDGE_DEBUG_STATE.get("internal_error_samples") or [])[-24:],
+            "integrity_samples": list(_BRIDGE_DEBUG_STATE.get("integrity_samples") or [])[-24:],
         }
         if ok:
             debug_payload.update(
@@ -10819,6 +11052,11 @@ def job_api(job_id: str):
         recent_page_rows = (job.recent_results or [])[start_idx:end_idx]
         recent_page_rows.reverse()  # newest first within current page
 
+        provider_breakdown = _job_provider_breakdown(job.id, limit=8)
+        provider_reason_buckets = dict(job.accounting_error_counts or {})
+        internal_samples = list(bridge_state.get("internal_error_samples") or [])[-10:]
+        integrity_samples = list(bridge_state.get("integrity_samples") or [])[-10:]
+
         return jsonify(
             {
                 "id": job.id,
@@ -10896,6 +11134,10 @@ def job_api(job_id: str):
                 "job_not_found": int(bridge_state.get("job_not_found") or 0),
                 "db_write_failures": int(bridge_state.get("db_write_failures") or 0),
                 "missing_fields": int(bridge_state.get("missing_fields") or 0),
+                "provider_breakdown": provider_breakdown,
+                "provider_reason_buckets": provider_reason_buckets,
+                "internal_last_samples": internal_samples,
+                "integrity_last_samples": integrity_samples,
             }
         )
 
