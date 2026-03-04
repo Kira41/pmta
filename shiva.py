@@ -12339,6 +12339,10 @@ APP_CONFIG_SCHEMA: List[dict] = [
     {"key": "SHIVA_DISABLE_BLACKLIST", "type": "bool", "default": "0", "group": "DNSBL", "restart_required": False,
      "desc": "If enabled: disable all DNSBL/DBL blacklist checks (alias env: DISABLE_BLACKLIST)."},
 
+    # Recipient filter
+    {"key": "RECIPIENT_FILTER_ENABLE_ROUTE_CHECK", "type": "bool", "default": "1", "group": "Recipient Filter", "restart_required": False,
+     "desc": "If enabled: perform MX/A route checks before enqueueing recipient domains."},
+
     # PMTA monitor
     {"key": "PMTA_MONITOR_TIMEOUT_S", "type": "float", "default": "3", "group": "PMTA Monitor", "restart_required": False,
      "desc": "Timeout for PMTA monitor HTTP calls (seconds)."},
@@ -12559,6 +12563,7 @@ def reload_runtime_config() -> dict:
     """
     try:
         global SPAMCHECK_BACKEND, SPAMD_HOST, SPAMD_PORT, SPAMD_TIMEOUT
+        global RECIPIENT_FILTER_ENABLE_ROUTE_CHECK
         global _RBL_ZONES_RAW, _DBL_ZONES_RAW, RBL_ZONES_LIST, DBL_ZONES_LIST, SHIVA_DISABLE_BLACKLIST
         global PMTA_MONITOR_TIMEOUT_S, PMTA_MONITOR_BASE_URL, PMTA_MONITOR_SCHEME, PMTA_MONITOR_API_KEY, PMTA_HEALTH_REQUIRED
         global PMTA_DIAG_ON_ERROR, PMTA_DIAG_RATE_S, PMTA_QUEUE_TOP_N
@@ -12577,6 +12582,11 @@ def reload_runtime_config() -> dict:
         SPAMD_HOST = (cfg_get_str("SPAMD_HOST", "127.0.0.1") or "127.0.0.1").strip()
         SPAMD_PORT = int(cfg_get_int("SPAMD_PORT", 783))
         SPAMD_TIMEOUT = float(cfg_get_float("SPAMD_TIMEOUT", 5.0))
+
+        # Recipient filter
+        RECIPIENT_FILTER_ENABLE_ROUTE_CHECK = bool(
+            cfg_get_bool("RECIPIENT_FILTER_ENABLE_ROUTE_CHECK", bool(RECIPIENT_FILTER_ENABLE_ROUTE_CHECK))
+        )
 
         # DNSBL
         _RBL_ZONES_RAW = (cfg_get_str("RBL_ZONES", "zen.spamhaus.org,bl.spamcop.net,cbl.abuseat.org") or "").strip()
