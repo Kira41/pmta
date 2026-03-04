@@ -108,6 +108,7 @@ if dns is not None:
 # MX/A cache to avoid repeated DNS queries
 _MX_CACHE: Dict[str, dict] = {}
 _MX_CACHE_EXPIRES_AT: Dict[str, float] = {}
+_MX_CACHE_LOCK = threading.Lock()
 MX_CACHE_TTL_OK = 3600.0
 MX_CACHE_TTL_SOFT_FAIL = 120.0
 
@@ -147,6 +148,16 @@ try:
     RECIPIENT_FILTER_SMTP_TIMEOUT = float((os.getenv("RECIPIENT_FILTER_SMTP_TIMEOUT", "5") or "5").strip())
 except Exception:
     RECIPIENT_FILTER_SMTP_TIMEOUT = 5.0
+try:
+    RECIPIENT_FILTER_ROUTE_THREADS = int((os.getenv("RECIPIENT_FILTER_ROUTE_THREADS", "24") or "24").strip())
+except Exception:
+    RECIPIENT_FILTER_ROUTE_THREADS = 24
+RECIPIENT_FILTER_ROUTE_THREADS = max(1, min(128, RECIPIENT_FILTER_ROUTE_THREADS))
+try:
+    RECIPIENT_FILTER_SMTP_THREADS = int((os.getenv("RECIPIENT_FILTER_SMTP_THREADS", "8") or "8").strip())
+except Exception:
+    RECIPIENT_FILTER_SMTP_THREADS = 8
+RECIPIENT_FILTER_SMTP_THREADS = max(1, min(64, RECIPIENT_FILTER_SMTP_THREADS))
 
 # Extract emails from messy text (handles weird separators / pasted content)
 EMAIL_FIND_RE = re.compile(
@@ -7517,17 +7528,19 @@ def domain_mail_route(domain: str) -> dict:
         return {"domain": d, "status": "none", "mx_hosts": []}
 
     now_ts = time.time()
-    exp = float(_MX_CACHE_EXPIRES_AT.get(d, 0.0) or 0.0)
-    if d in _MX_CACHE and exp > now_ts:
-        return _MX_CACHE[d]
-    if d in _MX_CACHE and exp <= now_ts:
-        _MX_CACHE.pop(d, None)
-        _MX_CACHE_EXPIRES_AT.pop(d, None)
+    with _MX_CACHE_LOCK:
+        exp = float(_MX_CACHE_EXPIRES_AT.get(d, 0.0) or 0.0)
+        if d in _MX_CACHE and exp > now_ts:
+            return _MX_CACHE[d]
+        if d in _MX_CACHE and exp <= now_ts:
+            _MX_CACHE.pop(d, None)
+            _MX_CACHE_EXPIRES_AT.pop(d, None)
 
     def _cache_and_return(out: dict) -> dict:
         ttl = MX_CACHE_TTL_OK if out.get("status") in {"mx", "a_fallback"} else MX_CACHE_TTL_SOFT_FAIL
-        _MX_CACHE[d] = out
-        _MX_CACHE_EXPIRES_AT[d] = time.time() + float(ttl)
+        with _MX_CACHE_LOCK:
+            _MX_CACHE[d] = out
+            _MX_CACHE_EXPIRES_AT[d] = time.time() + float(ttl)
         return out
 
     mx_hosts: List[str] = []
@@ -7645,6 +7658,11 @@ def _smtp_rcpt_probe(email: str, route: dict) -> dict:
             pass
 
 
+def _smtp_probe_input(item: Tuple[str, dict]) -> dict:
+    email, route = item
+    return _smtp_rcpt_probe(email, route)
+
+
 def pre_send_recipient_filter(emails: List[str], *, smtp_probe: bool = True) -> Tuple[List[str], List[str], dict]:
     """Pre-send recipient filter with syntax/domain checks + optional SMTP probes."""
     ok: List[str] = []
@@ -7660,39 +7678,75 @@ def pre_send_recipient_filter(emails: List[str], *, smtp_probe: bool = True) -> 
         "domains": {},
     }
 
-    seen_domain_probe: Set[str] = set()
-
+    cleaned: List[str] = []
+    email_domains: Dict[str, str] = {}
+    domain_first_email: Dict[str, str] = {}
+    ordered_domains: List[str] = []
     for e in emails or []:
         em = (e or "").strip()
         d = _extract_domain_from_email(em)
         if not d:
             bad.append(em)
             continue
+        cleaned.append(em)
+        email_domains[em] = d
+        if d not in domain_first_email:
+            domain_first_email[d] = em
+            ordered_domains.append(d)
 
-        route = domain_mail_route(d)
+    route_by_domain: Dict[str, dict] = {}
+    if ordered_domains:
+        route_workers = min(len(ordered_domains), int(RECIPIENT_FILTER_ROUTE_THREADS or 1))
+        if route_workers <= 1:
+            for d in ordered_domains:
+                route_by_domain[d] = domain_mail_route(d)
+        else:
+            with ThreadPoolExecutor(max_workers=route_workers) as pool:
+                for d, route in zip(ordered_domains, pool.map(domain_mail_route, ordered_domains)):
+                    route_by_domain[d] = route
+
+    smtp_probe_by_domain: Dict[str, dict] = {}
+    probe_domains: List[str] = []
+    if report["smtp_probe"] and int(report["smtp_probe_limit"] or 0) > 0:
+        for d in ordered_domains:
+            route = route_by_domain.get(d) or {"domain": d, "status": "unknown", "mx_hosts": []}
+            if route.get("status") in {"mx", "a_fallback"}:
+                probe_domains.append(d)
+            if len(probe_domains) >= int(report["smtp_probe_limit"] or 0):
+                break
+
+    if probe_domains:
+        probe_workers = min(len(probe_domains), int(RECIPIENT_FILTER_SMTP_THREADS or 1))
+        probe_inputs = [(domain_first_email[d], route_by_domain[d]) for d in probe_domains]
+        if probe_workers <= 1:
+            for d in probe_domains:
+                smtp_probe_by_domain[d] = _smtp_rcpt_probe(domain_first_email[d], route_by_domain[d])
+        else:
+            with ThreadPoolExecutor(max_workers=probe_workers) as pool:
+                probe_results = pool.map(_smtp_probe_input, probe_inputs)
+                for d, probe in zip(probe_domains, probe_results):
+                    smtp_probe_by_domain[d] = probe
+        report["smtp_probe_used"] = len(smtp_probe_by_domain)
+
+    for em in cleaned:
+        d = email_domains.get(em, "")
+        route = route_by_domain.get(d) or {"domain": d, "status": "unknown", "mx_hosts": []}
         status = route.get("status", "unknown")
-        report["domains"][d] = route
+        dom_report = route
+        probe = smtp_probe_by_domain.get(d)
+        if probe is not None:
+            dom_report = {**route, "smtp_probe": probe}
+        report["domains"][d] = dom_report
 
         if status == "none":
             bad.append(em)
             report["rejected"]["no_route"] += 1
             continue
 
-        do_probe = (
-            report["smtp_probe"]
-            and status in {"mx", "a_fallback"}
-            and d not in seen_domain_probe
-            and int(report["smtp_probe_used"] or 0) < int(report["smtp_probe_limit"] or 0)
-        )
-        if do_probe:
-            probe = _smtp_rcpt_probe(em, route)
-            seen_domain_probe.add(d)
-            report["smtp_probe_used"] = int(report["smtp_probe_used"] or 0) + 1
-            report["domains"][d] = {**route, "smtp_probe": probe}
-            if not probe.get("ok") and int(probe.get("code") or 0) >= 500:
-                bad.append(em)
-                report["rejected"]["smtp"] += 1
-                continue
+        if probe is not None and (not probe.get("ok")) and int(probe.get("code") or 0) >= 500:
+            bad.append(em)
+            report["rejected"]["smtp"] += 1
+            continue
 
         ok.append(em)
 
@@ -13450,10 +13504,26 @@ def start():
     valid, invalid = filter_valid_emails(recipients)
     syntax_valid = list(valid)
 
-    # Pre-send recipient filter (syntax/domain + optional SMTP probe)
-    valid, mx_invalid, recipient_filter = pre_send_recipient_filter(valid, smtp_probe=True)
+    # Safe list (optional whitelist)
+    safe_text = request.form.get("maillist_safe") or ""
+    safe_raw = parse_recipients(safe_text)
+    safe_valid, safe_invalid = filter_valid_emails(safe_raw)
+
+    # Pre-send filter: run recipients + safe list validation in parallel.
+    recipient_filter: Dict[str, Any]
+    safe_filter: Dict[str, Any]
+    mx_invalid: List[str]
+    safe_mx_invalid: List[str]
+    with ThreadPoolExecutor(max_workers=2) as _preflight_pool:
+        _future_rcpt = _preflight_pool.submit(pre_send_recipient_filter, valid, smtp_probe=True)
+        _future_safe = _preflight_pool.submit(pre_send_recipient_filter, safe_valid, smtp_probe=True)
+        valid, mx_invalid, recipient_filter = _future_rcpt.result()
+        safe_valid, safe_mx_invalid, safe_filter = _future_safe.result()
+
     if mx_invalid:
         invalid.extend(mx_invalid)
+    if safe_mx_invalid:
+        safe_invalid.extend(safe_mx_invalid)
 
     # Safety fallback: if DNS/probe temporarily rejects everything, do not hard-block
     # a send that already passed syntax validation. This avoids false negatives after
@@ -13461,16 +13531,6 @@ def start():
     if syntax_valid and not valid:
         valid = syntax_valid
         recipient_filter = {**recipient_filter, "degraded_fallback": True, "degraded_reason": "all_filtered_by_route_checks"}
-
-    # Safe list (optional whitelist)
-    safe_text = request.form.get("maillist_safe") or ""
-    safe_raw = parse_recipients(safe_text)
-    safe_valid, safe_invalid = filter_valid_emails(safe_raw)
-
-    # Apply the same pre-send filter for safe list
-    safe_valid, safe_mx_invalid, safe_filter = pre_send_recipient_filter(safe_valid, smtp_probe=True)
-    if safe_mx_invalid:
-        safe_invalid.extend(safe_mx_invalid)
 
     safe_skipped = 0
     if safe_valid:
