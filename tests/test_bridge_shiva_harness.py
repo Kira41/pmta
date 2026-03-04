@@ -94,6 +94,26 @@ class BridgeShivaHarnessTests(unittest.TestCase):
         self.assertLess(p95_ms, 50.0)
 
 
+
+    def test_backoff_failure_classification_types(self):
+        t, i = shiva._classify_backoff_failure(spam_blocked=False, blacklist_blocked=False, pmta_reason="temporary timeout on provider")
+        self.assertEqual(t, "transient_delay")
+        self.assertEqual(i, "")
+
+        t, i = shiva._classify_backoff_failure(spam_blocked=False, blacklist_blocked=False, pmta_reason="provider policy block")
+        self.assertEqual(t, "reputation")
+        self.assertIn("reputation", i)
+
+        t, i = shiva._classify_backoff_failure(spam_blocked=False, blacklist_blocked=False, pmta_reason="hard blocked by remote")
+        self.assertEqual(t, "block")
+
+    def test_backoff_wait_is_shorter_for_transient_and_longer_for_reputation(self):
+        transient = shiva._compute_backoff_wait_seconds(attempt=2, base_s=60.0, max_s=1800.0, failure_type="transient_delay")
+        blocked = shiva._compute_backoff_wait_seconds(attempt=2, base_s=60.0, max_s=1800.0, failure_type="block")
+        reputation = shiva._compute_backoff_wait_seconds(attempt=2, base_s=60.0, max_s=1800.0, failure_type="reputation")
+
+        self.assertLess(transient, blocked)
+        self.assertGreater(reputation, blocked)
     def test_bridge_url_resolution_uses_campaign_smtp_host_and_configured_port(self):
         old_host = os.environ.get("SHIVA_HOST")
         old_port = shiva.PMTA_BRIDGE_PULL_PORT
