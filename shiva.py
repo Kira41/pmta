@@ -2935,54 +2935,18 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
   </form>
 
   <div class="card" id="domainsCard" style="margin-top:14px">
-    <h2>Domain States</h2>
-    <div class="muted">
-      Shows pre-start safety checks for <b>sender domains</b> extracted from Sender Emails (from-address domains).
-    </div>
+    <h2>Save Domains</h2>
 
     <div class="actions" style="margin-top:12px">
       <input id="domQ" placeholder="Search domain..." style="max-width:320px" />
       <button class="btn secondary" type="button" id="btnDomains">🌐 Refresh</button>
       <div class="mini" id="domStatus">—</div>
-      <div class="mini" id="domLive">Live: —</div>
     </div>
 
     <div class="hint" style="margin-top:12px">
-      <div class="mini"><b>Sender emails:</b> <span id="domRecTotals">—</span></div>
       <div class="mini"><b>Safe domains:</b> <span id="domSafeTotals">—</span></div>
-      <div class="mini"><b>Live sending:</b> <span id="domJobTotals">—</span></div>
-      <div class="mini"><b>Pre-start checks:</b> <span id="domFilterTotals">—</span></div>
-      <div class="mini">Live numbers come from the latest active Job for this campaign (running/backoff).</div>
     </div>
 
-    <div style="overflow:auto; margin-top:12px">
-      <table>
-        <thead>
-          <tr>
-            <th>Sender domain</th>
-            <th>Planned</th>
-            <th>Sent</th>
-            <th>Failed</th>
-            <th style="min-width:180px">Progress</th>
-            <th>PMTA queued</th>
-            <th>PMTA deferred</th>
-            <th>PMTA active</th>
-            <th>MX</th>
-            <th>MX hosts</th>
-            <th>Mail IP(s)</th>
-            <th>Listed</th>
-            <th>SPF</th>
-            <th>DKIM</th>
-            <th>DMARC</th>
-          </tr>
-        </thead>
-        <tbody id="domTblRec">
-          <tr><td colspan="15" class="muted">Click “Refresh” to load sender-domain states.</td></tr>
-        </tbody>
-      </table>
-    </div>
-
-    <h2 style="margin-top:14px">Safe domains</h2>
     <div style="overflow:auto; margin-top:12px">
       <table>
         <thead>
@@ -3587,11 +3551,9 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
   // Clear-saved button removed (campaign data is auto-saved in SQLite).
 
   // -------------------------
-  // Domains stats (in-page) + LIVE progress overlay
+  // Save domains stats (in-page)
   // -------------------------
   let _domCache = null;
-  let _domLiveJob = null;
-  let _domLiveTimer = null;
 
   function domStatusBadge(mx){
     if(mx === 'mx') return '<span style="color:var(--good); font-weight:800">MX</span>';
@@ -3612,106 +3574,21 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
     return '<span style="color:var(--warn); font-weight:800">UNKNOWN</span>';
   }
 
-  function domProgressBar(pct){
-    const w = Math.max(0, Math.min(100, Number(pct||0)));
-    return `<div class="smallBar"><div style="width:${w}%"></div></div>`;
-  }
-
   function renderDomainsTables(){
     const qv = (document.getElementById('domQ')?.value || '').trim().toLowerCase();
-    const recBody = document.getElementById('domTblRec');
     const safeBody = document.getElementById('domTblSafe');
-    const recTotals = document.getElementById('domRecTotals');
     const safeTotals = document.getElementById('domSafeTotals');
 
-    const jobTotals = document.getElementById('domJobTotals');
-    const filterTotals = document.getElementById('domFilterTotals');
-
     if(!_domCache || !_domCache.ok){
-      if(recBody) recBody.innerHTML = `<tr><td colspan="15" class="muted">No data yet. Click “Refresh”.</td></tr>`;
       if(safeBody) safeBody.innerHTML = `<tr><td colspan="9" class="muted">—</td></tr>`;
-      if(recTotals) recTotals.textContent = '—';
       if(safeTotals) safeTotals.textContent = '—';
-      if(jobTotals) jobTotals.textContent = '—';
-      if(filterTotals) filterTotals.textContent = '—';
       return;
     }
 
-    const rec = _domCache.recipients || {};
     const safe = _domCache.safe || {};
-
-    if(recTotals){
-      recTotals.textContent = `${rec.total_emails || 0} emails · ${rec.unique_domains || 0} domains · invalid=${rec.invalid_emails || 0}`;
-    }
     if(safeTotals){
       safeTotals.textContent = `${safe.total_emails || 0} emails · ${safe.unique_domains || 0} domains · invalid=${safe.invalid_emails || 0}`;
     }
-
-    const filter = rec.filter || {};
-    if(filterTotals){
-      const checks = Array.isArray(filter.checks) ? filter.checks.join('+') : 'sender_domain+mx+dnsbl+spf+dkim+dmarc';
-      filterTotals.textContent = `valid=${filter.kept || 0} · invalid=${filter.dropped || 0} · checks=${checks}`;
-    }
-
-    const live = (_domLiveJob && _domLiveJob.ok && _domLiveJob.job) ? _domLiveJob.job : null;
-    const planMap = live ? (live.domain_plan || {}) : {};
-    const sentMap = live ? (live.domain_sent || {}) : {};
-    const failMap = live ? (live.domain_failed || {}) : {};
-
-    const pmtaDom = live ? (live.pmta_domains || {}) : {};
-    const pmtaOk = !!pmtaDom.ok;
-    const pmtaMap = pmtaDom.domains || {};
-
-    if(jobTotals){
-      if(live){
-        jobTotals.textContent = `Job ${live.id} · status=${live.status} · sent=${live.sent}/${live.total} · failed=${live.failed} · skipped=${live.skipped}`;
-      } else {
-        jobTotals.textContent = '—';
-      }
-    }
-
-    function rows(items){
-      const arr = Array.isArray(items) ? items : [];
-      const out = [];
-      for(const it of arr){
-        const dom = (it.domain || '').toString();
-        if(qv && !dom.toLowerCase().includes(qv)) continue;
-
-        const mxHosts = (it.mx_hosts || []).slice(0,4).join(', ');
-        const ips = (it.mail_ips || []).join(', ');
-
-        const planned = (live && (dom in planMap)) ? Number(planMap[dom]||0) : Number(it.count || 0);
-        const sent = live ? Number(sentMap[dom]||0) : 0;
-        const failed = live ? Number(failMap[dom]||0) : 0;
-        const done = sent + failed;
-        const pct = planned ? Math.min(100, Math.round((done/planned)*100)) : 0;
-
-        out.push(
-          `<tr>`+
-            `<td><code>${escHtml(dom)}</code></td>`+
-            `<td style="font-weight:800">${planned}</td>`+
-            `<td style="font-weight:800; color:var(--good)">${sent}</td>`+
-            `<td style="font-weight:800; color:var(--bad)">${failed}</td>`+
-            `<td>${domProgressBar(pct)}<div class="muted" style="font-size:12px; margin-top:4px">${done}/${planned} (${pct}%)</div></td>`+
-            `<td style="font-weight:800">${(pmtaOk && pmtaMap[dom]) ? (pmtaMap[dom].queued ?? '—') : '—'}</td>`+
-            `<td style="font-weight:800">${(pmtaOk && pmtaMap[dom]) ? (pmtaMap[dom].deferred ?? '—') : '—'}</td>`+
-            `<td style="font-weight:800">${(pmtaOk && pmtaMap[dom]) ? (pmtaMap[dom].active ?? '—') : '—'}</td>`+
-            `<td>${domStatusBadge(it.mx_status)}</td>`+
-            `<td class="muted">${escHtml(mxHosts || '—')}</td>`+
-            `<td class="muted">${escHtml(ips || '—')}</td>`+
-            `<td>${domListedBadge(!!(it.listed ?? it.any_listed))}</td>`+
-            `<td>${domPolicyBadge((it.spf || {}).status)}</td>`+
-            `<td>${domPolicyBadge((it.dkim || {}).status)}</td>`+
-            `<td>${domPolicyBadge((it.dmarc || {}).status)}</td>`+
-          `</tr>`
-        );
-      }
-      return out.join('') || `<tr><td colspan="15" class="muted">No results.</td></tr>`;
-    }
-
-    if(recBody) recBody.innerHTML = rows(rec.domains);
-
-    // Safe table stays the same (planned only)
     function safeRows(items){
       const arr = Array.isArray(items) ? items : [];
       const out = [];
@@ -3754,11 +3631,11 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
         _domCache = j;
         if(status) status.textContent = `OK · ${new Date().toLocaleTimeString()}`;
         renderDomainsTables();
-        toast('Domain States', 'Updated sender-domain checks. Live progress updates automatically.', 'good');
+        toast('Save Domains', 'Updated safe domains.', 'good');
       } else {
         const msg = (j && (j.error || j.detail)) ? (j.error || j.detail) : ('HTTP ' + r.status);
         if(status) status.textContent = 'Failed';
-        toast('Domain States failed', msg, 'bad');
+        toast('Save Domains failed', msg, 'bad');
       }
     }catch(e){
       if(status) status.textContent = 'Failed';
@@ -3768,42 +3645,13 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
     }
   }
 
-  async function refreshDomainsLive(){
-    const liveEl = document.getElementById('domLive');
-    try{
-      const r = await fetch(`/api/campaign/${CAMPAIGN_ID}/active_job`);
-      const j = await r.json().catch(()=>({}));
-
-      if(r.ok && j && j.ok && j.job){
-        _domLiveJob = j;
-        const job = j.job;
-        if(liveEl) liveEl.textContent = `Live: ${job.status} · sent=${job.sent}/${job.total} · failed=${job.failed} · skipped=${job.skipped}`;
-        renderDomainsTables();
-      } else {
-        _domLiveJob = null;
-        if(liveEl) liveEl.textContent = 'Live: no active job';
-        renderDomainsTables();
-      }
-    }catch(e){
-      _domLiveJob = null;
-      if(liveEl) liveEl.textContent = 'Live: unavailable';
-    }
-  }
-
-  function startDomainsLivePolling(){
-    if(_domLiveTimer) clearInterval(_domLiveTimer);
-    _domLiveTimer = setInterval(refreshDomainsLive, 1200);
-    refreshDomainsLive();
-  }
-
   const domBtn = document.getElementById('btnDomains');
   if(domBtn){ domBtn.addEventListener('click', refreshDomainsStats); }
   const domQ = document.getElementById('domQ');
   if(domQ){ domQ.addEventListener('input', renderDomainsTables); }
 
-  // auto-load planned stats once, then live poll will keep progress updated
+  // auto-load safe domains stats once
   refreshDomainsStats();
-  startDomainsLivePolling();
 
   // Range value UI
   const scoreEl = document.getElementById('score_range');
