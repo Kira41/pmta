@@ -2935,9 +2935,9 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
   </form>
 
   <div class="card" id="domainsCard" style="margin-top:14px">
-    <h2>Domains stats</h2>
+    <h2>Domain States</h2>
     <div class="muted">
-      Shows how many emails will be sent to each <b>recipient domain</b> (based on current Recipients + Safe list for this campaign).
+      Shows pre-start safety checks for <b>sender domains</b> extracted from Sender Emails (from-address domains).
     </div>
 
     <div class="actions" style="margin-top:12px">
@@ -2948,10 +2948,10 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
     </div>
 
     <div class="hint" style="margin-top:12px">
-      <div class="mini"><b>Recipients:</b> <span id="domRecTotals">—</span></div>
-      <div class="mini"><b>Safe list:</b> <span id="domSafeTotals">—</span></div>
+      <div class="mini"><b>Sender emails:</b> <span id="domRecTotals">—</span></div>
+      <div class="mini"><b>Safe domains:</b> <span id="domSafeTotals">—</span></div>
       <div class="mini"><b>Live sending:</b> <span id="domJobTotals">—</span></div>
-      <div class="mini"><b>Recipient filter:</b> <span id="domFilterTotals">—</span></div>
+      <div class="mini"><b>Pre-start checks:</b> <span id="domFilterTotals">—</span></div>
       <div class="mini">Live numbers come from the latest active Job for this campaign (running/backoff).</div>
     </div>
 
@@ -2959,7 +2959,7 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
       <table>
         <thead>
           <tr>
-            <th>Recipient domain</th>
+            <th>Sender domain</th>
             <th>Planned</th>
             <th>Sent</th>
             <th>Failed</th>
@@ -2971,29 +2971,35 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
             <th>MX hosts</th>
             <th>Mail IP(s)</th>
             <th>Listed</th>
+            <th>SPF</th>
+            <th>DKIM</th>
+            <th>DMARC</th>
           </tr>
         </thead>
         <tbody id="domTblRec">
-          <tr><td colspan="12" class="muted">Click “Refresh” to load domains stats.</td></tr>
+          <tr><td colspan="15" class="muted">Click “Refresh” to load sender-domain states.</td></tr>
         </tbody>
       </table>
     </div>
 
-    <h2 style="margin-top:14px">Safe list domains</h2>
+    <h2 style="margin-top:14px">Safe domains</h2>
     <div style="overflow:auto; margin-top:12px">
       <table>
         <thead>
           <tr>
-            <th>Safe domain</th>
+            <th>Sender domain</th>
             <th>Emails</th>
             <th>MX</th>
             <th>MX hosts</th>
             <th>Mail IP(s)</th>
             <th>Listed</th>
+            <th>SPF</th>
+            <th>DKIM</th>
+            <th>DMARC</th>
           </tr>
         </thead>
         <tbody id="domTblSafe">
-          <tr><td colspan="6" class="muted">—</td></tr>
+          <tr><td colspan="9" class="muted">—</td></tr>
         </tbody>
       </table>
     </div>
@@ -3598,6 +3604,14 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
     return v ? '<span style="color:var(--bad); font-weight:800">Listed</span>' : '<span style="color:var(--good); font-weight:800">Not listed</span>';
   }
 
+  function domPolicyBadge(v){
+    const st = (v || '').toString().toLowerCase();
+    if(st === 'pass') return '<span style="color:var(--good); font-weight:800">PASS</span>';
+    if(st === 'missing') return '<span style="color:var(--warn); font-weight:800">MISSING</span>';
+    if(st === 'unknown_selector') return '<span style="color:var(--warn); font-weight:800">UNKNOWN SELECTOR</span>';
+    return '<span style="color:var(--warn); font-weight:800">UNKNOWN</span>';
+  }
+
   function domProgressBar(pct){
     const w = Math.max(0, Math.min(100, Number(pct||0)));
     return `<div class="smallBar"><div style="width:${w}%"></div></div>`;
@@ -3614,8 +3628,8 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
     const filterTotals = document.getElementById('domFilterTotals');
 
     if(!_domCache || !_domCache.ok){
-      if(recBody) recBody.innerHTML = `<tr><td colspan="9" class="muted">No data yet. Click “Refresh”.</td></tr>`;
-      if(safeBody) safeBody.innerHTML = `<tr><td colspan="6" class="muted">—</td></tr>`;
+      if(recBody) recBody.innerHTML = `<tr><td colspan="15" class="muted">No data yet. Click “Refresh”.</td></tr>`;
+      if(safeBody) safeBody.innerHTML = `<tr><td colspan="9" class="muted">—</td></tr>`;
       if(recTotals) recTotals.textContent = '—';
       if(safeTotals) safeTotals.textContent = '—';
       if(jobTotals) jobTotals.textContent = '—';
@@ -3635,8 +3649,8 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
 
     const filter = rec.filter || {};
     if(filterTotals){
-      const checks = Array.isArray(filter.checks) ? filter.checks.join('+') : 'syntax+mx';
-      filterTotals.textContent = `kept=${filter.kept || 0} · dropped=${filter.dropped || 0} · smtp_probe=${filter.smtp_probe_used || 0}/${filter.smtp_probe_limit || 0} · checks=${checks}`;
+      const checks = Array.isArray(filter.checks) ? filter.checks.join('+') : 'sender_domain+mx+dnsbl+spf+dkim+dmarc';
+      filterTotals.textContent = `valid=${filter.kept || 0} · invalid=${filter.dropped || 0} · checks=${checks}`;
     }
 
     const live = (_domLiveJob && _domLiveJob.ok && _domLiveJob.job) ? _domLiveJob.job : null;
@@ -3685,11 +3699,14 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
             `<td>${domStatusBadge(it.mx_status)}</td>`+
             `<td class="muted">${escHtml(mxHosts || '—')}</td>`+
             `<td class="muted">${escHtml(ips || '—')}</td>`+
-            `<td>${domListedBadge(!!it.any_listed)}</td>`+
+            `<td>${domListedBadge(!!(it.listed ?? it.any_listed))}</td>`+
+            `<td>${domPolicyBadge((it.spf || {}).status)}</td>`+
+            `<td>${domPolicyBadge((it.dkim || {}).status)}</td>`+
+            `<td>${domPolicyBadge((it.dmarc || {}).status)}</td>`+
           `</tr>`
         );
       }
-      return out.join('') || `<tr><td colspan="12" class="muted">No results.</td></tr>`;
+      return out.join('') || `<tr><td colspan="15" class="muted">No results.</td></tr>`;
     }
 
     if(recBody) recBody.innerHTML = rows(rec.domains);
@@ -3710,11 +3727,14 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
             `<td>${domStatusBadge(it.mx_status)}</td>`+
             `<td class="muted">${escHtml(mxHosts || '—')}</td>`+
             `<td class="muted">${escHtml(ips || '—')}</td>`+
-            `<td>${domListedBadge(!!it.any_listed)}</td>`+
+            `<td>${domListedBadge(!!(it.listed ?? it.any_listed))}</td>`+
+            `<td>${domPolicyBadge((it.spf || {}).status)}</td>`+
+            `<td>${domPolicyBadge((it.dkim || {}).status)}</td>`+
+            `<td>${domPolicyBadge((it.dmarc || {}).status)}</td>`+
           `</tr>`
         );
       }
-      return out.join('') || `<tr><td colspan="6" class="muted">No results.</td></tr>`;
+      return out.join('') || `<tr><td colspan="9" class="muted">No results.</td></tr>`;
     }
 
     if(safeBody) safeBody.innerHTML = safeRows(safe.domains);
@@ -3734,11 +3754,11 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
         _domCache = j;
         if(status) status.textContent = `OK · ${new Date().toLocaleTimeString()}`;
         renderDomainsTables();
-        toast('Domains stats', 'Updated domains distribution (planned). Live progress updates automatically.', 'good');
+        toast('Domain States', 'Updated sender-domain checks. Live progress updates automatically.', 'good');
       } else {
         const msg = (j && (j.error || j.detail)) ? (j.error || j.detail) : ('HTTP ' + r.status);
         if(status) status.textContent = 'Failed';
-        toast('Domains stats failed', msg, 'bad');
+        toast('Domain States failed', msg, 'bad');
       }
     }catch(e){
       if(status) status.textContent = 'Failed';
@@ -6638,7 +6658,7 @@ PAGE_DOMAINS = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Domains Stats</title>
+  <title>Domain States</title>
   <style>
     body{font-family:system-ui; margin:0; background:#0b1020; color:#fff;}
     .wrap{max-width: 1200px; margin: 0 auto; padding:18px 14px;}
@@ -6659,8 +6679,8 @@ PAGE_DOMAINS = r"""
   <div class="wrap">
     <div class="row" style="justify-content:space-between; margin-bottom:12px;">
       <div>
-        <h2 style="margin:0">Domains stats</h2>
-        <div class="muted"><a href="/campaigns" id="backLink">← Back</a> · This page analyzes <b>Recipients</b> and <b>Maillist Safe</b> for the selected campaign (SQLite).</div>
+        <h2 style="margin:0">Domain States</h2>
+        <div class="muted"><a href="/campaigns" id="backLink">← Back</a> · This page analyzes <b>Sender Emails</b> domains for the selected campaign (SQLite).</div>
       </div>
       <div class="row">
         <input id="q" placeholder="Search domain..." />
@@ -6670,14 +6690,14 @@ PAGE_DOMAINS = r"""
 
     <div class="card">
       <div class="row">
-        <div><b>Recipients:</b> <span id="rTotals" class="muted">—</span></div>
-        <div><b>Safe list:</b> <span id="sTotals" class="muted">—</span></div>
-        <div class="muted">MX check is best-effort: MX → A fallback → none/unknown.</div>
+        <div><b>Sender emails:</b> <span id="rTotals" class="muted">—</span></div>
+        <div><b>Safe domains:</b> <span id="sTotals" class="muted">—</span></div>
+        <div class="muted">Checks: MX + blacklist + SPF/DKIM/DMARC (best-effort DNS).</div>
       </div>
     </div>
 
     <div class="card">
-      <h3 style="margin:0 0 10px">Recipients domains</h3>
+      <h3 style="margin:0 0 10px">Sender domains</h3>
       <div style="overflow:auto">
         <table>
           <thead>
@@ -6688,6 +6708,9 @@ PAGE_DOMAINS = r"""
               <th>MX hosts</th>
               <th>Mail IP(s)</th>
               <th>Listed</th>
+            <th>SPF</th>
+            <th>DKIM</th>
+            <th>DMARC</th>
             </tr>
           </thead>
           <tbody id="tblR"></tbody>
@@ -6696,7 +6719,7 @@ PAGE_DOMAINS = r"""
     </div>
 
     <div class="card">
-      <h3 style="margin:0 0 10px">Safe list domains</h3>
+      <h3 style="margin:0 0 10px">Safe domains</h3>
       <div style="overflow:auto">
         <table>
           <thead>
@@ -6707,6 +6730,9 @@ PAGE_DOMAINS = r"""
               <th>MX hosts</th>
               <th>Mail IP(s)</th>
               <th>Listed</th>
+            <th>SPF</th>
+            <th>DKIM</th>
+            <th>DMARC</th>
             </tr>
           </thead>
           <tbody id="tblS"></tbody>
@@ -6719,8 +6745,8 @@ PAGE_DOMAINS = r"""
   // Saved values are stored server-side in SQLite per campaign (no localStorage).
   const CAMPAIGN_ID = new URLSearchParams(location.search).get('c') || '';
   if(!CAMPAIGN_ID){
-    document.getElementById('tblR').innerHTML = `<tr><td colspan="6" class="bad">Missing campaign id. Open Domains from a campaign.</td></tr>`;
-    document.getElementById('tblS').innerHTML = `<tr><td colspan="6" class="bad">Missing campaign id. Open Domains from a campaign.</td></tr>`;
+    document.getElementById('tblR').innerHTML = `<tr><td colspan="9" class="bad">Missing campaign id. Open Domains from a campaign.</td></tr>`;
+    document.getElementById('tblS').innerHTML = `<tr><td colspan="9" class="bad">Missing campaign id. Open Domains from a campaign.</td></tr>`;
   }
   const back = document.getElementById('backLink');
   if(back && CAMPAIGN_ID){ back.href = `/campaign/${CAMPAIGN_ID}`; }
@@ -6735,6 +6761,14 @@ PAGE_DOMAINS = r"""
 
   function listedBadge(v){
     return v ? '<span class="bad">Listed</span>' : '<span class="good">Not listed</span>';
+  }
+
+  function policyBadge(v){
+    const st = (v || '').toString().toLowerCase();
+    if(st === 'pass') return '<span class="good">PASS</span>';
+    if(st === 'missing') return '<span class="warn">MISSING</span>';
+    if(st === 'unknown_selector') return '<span class="warn">UNKNOWN SELECTOR</span>';
+    return '<span class="warn">UNKNOWN</span>';
   }
 
   async function loadSaved(){
@@ -6753,8 +6787,7 @@ PAGE_DOMAINS = r"""
     const q = (document.getElementById('q').value || '').trim().toLowerCase();
 
     const payload = {
-      recipients: saved.recipients || '',
-      maillist_safe: saved.maillist_safe || ''
+      from_email: saved.from_email || ''
     };
 
     const r = await fetch('/api/domains_stats', {
@@ -6765,8 +6798,8 @@ PAGE_DOMAINS = r"""
     const j = await r.json();
 
     if(!j.ok){
-      document.getElementById('tblR').innerHTML = `<tr><td colspan="6" class="bad">${esc(j.error || 'error')}</td></tr>`;
-      document.getElementById('tblS').innerHTML = `<tr><td colspan="6" class="bad">${esc(j.error || 'error')}</td></tr>`;
+      document.getElementById('tblR').innerHTML = `<tr><td colspan="9" class="bad">${esc(j.error || 'error')}</td></tr>`;
+      document.getElementById('tblS').innerHTML = `<tr><td colspan="9" class="bad">${esc(j.error || 'error')}</td></tr>`;
       return;
     }
 
@@ -6785,10 +6818,13 @@ PAGE_DOMAINS = r"""
           `<td>${statusBadge(it.mx_status)}</td>`+
           `<td class="muted">${esc(mxHosts || '—')}</td>`+
           `<td class="muted">${esc(ips || '—')}</td>`+
-          `<td>${listedBadge(!!it.any_listed)}</td>`+
+          `<td>${listedBadge(!!(it.listed ?? it.any_listed))}</td>`+
+          `<td>${policyBadge((it.spf || {}).status)}</td>`+
+          `<td>${policyBadge((it.dkim || {}).status)}</td>`+
+          `<td>${policyBadge((it.dmarc || {}).status)}</td>`+
         `</tr>`);
       }
-      return rows.join('') || `<tr><td colspan="6" class="muted">No results.</td></tr>`;
+      return rows.join('') || `<tr><td colspan="9" class="muted">No results.</td></tr>`;
     }
 
     document.getElementById('tblR').innerHTML = renderRows(j.recipients.domains);
@@ -7839,6 +7875,154 @@ def resolve_sender_domain_ips(domain: str) -> List[str]:
                 out.append(ip)
 
     return out
+
+
+def sender_domain_counts(sender_emails_text: str) -> dict:
+    """Parse sender emails textarea and return unique domain counts + syntax stats."""
+    emails = parse_multiline(sender_emails_text or "", dedupe_lower=True)
+    valid, invalid = filter_valid_emails(emails)
+    counts: Dict[str, int] = {}
+    for em in valid:
+        d = _extract_domain_from_email(em)
+        if not d:
+            continue
+        counts[d] = counts.get(d, 0) + 1
+    return {
+        "emails_total": len(emails),
+        "emails_invalid": len(invalid),
+        "counts": counts,
+        "valid_emails": valid,
+    }
+
+
+def _dns_txt_lookup(name: str) -> dict:
+    q = (name or "").strip().lower().strip(".")
+    if not q:
+        return {"ok": False, "records": [], "error": "empty"}
+    if DNS_RESOLVER is None:
+        return {"ok": False, "records": [], "error": "resolver_unavailable"}
+    try:
+        ans = DNS_RESOLVER.resolve(q, "TXT")  # type: ignore
+        records: List[str] = []
+        for r in ans:
+            parts = getattr(r, "strings", None)
+            if parts:
+                try:
+                    txt = "".join(
+                        p.decode("utf-8", errors="ignore") if isinstance(p, (bytes, bytearray)) else str(p)
+                        for p in parts
+                    )
+                except Exception:
+                    txt = str(r)
+            else:
+                txt = str(r)
+            txt = txt.strip().strip('"')
+            if txt:
+                records.append(txt)
+        return {"ok": True, "records": records[:12], "error": ""}
+    except Exception as e:
+        return {"ok": False, "records": [], "error": str(e)[:180]}
+
+
+def _dkim_selectors_from_env() -> List[str]:
+    raw = [
+        os.getenv("DKIM_SELECTOR", "") or "",
+        os.getenv("DKIM_SELECTORS", "") or "",
+        os.getenv("DEFAULT_DKIM_SELECTOR", "") or "",
+    ]
+    out: List[str] = []
+    for item in raw:
+        for part in str(item).replace(";", ",").split(","):
+            s = (part or "").strip().lower().strip(".")
+            if s and s not in out:
+                out.append(s)
+    return out
+
+
+def compute_sender_domain_states(domain_counts: Dict[str, int]) -> List[dict]:
+    """Domain States = sender domains used for sending (from-address domains)."""
+    out_items: List[dict] = []
+    selectors = _dkim_selectors_from_env()
+    domains_sorted = sorted((domain_counts or {}).items(), key=lambda x: x[1], reverse=True)
+
+    for dom, cnt in domains_sorted:
+        route = domain_mail_route(dom)
+        mx_status = str(route.get("status") or "unknown")
+        mx_hosts = list(route.get("mx_hosts") or [])
+        mx_host = mx_hosts[0] if mx_hosts else ""
+        mail_ips = resolve_sender_domain_ips(dom)
+
+        listing_details: List[dict] = []
+        if SHIVA_DISABLE_BLACKLIST:
+            _log_blacklist_disabled_once()
+        else:
+            for hit in check_domain_dnsbl(dom):
+                listing_details.append({"target": "domain", **hit})
+            if mx_host:
+                for hit in check_domain_dnsbl(mx_host):
+                    listing_details.append({"target": "mx_host", **hit})
+            for ip in mail_ips:
+                for hit in check_ip_dnsbl(ip):
+                    listing_details.append({"target": f"ip:{ip}", **hit})
+
+        spf_txt = _dns_txt_lookup(dom)
+        spf_hits = [x for x in (spf_txt.get("records") or []) if str(x).lower().startswith("v=spf1")]
+        spf = {
+            "status": (
+                "pass" if spf_hits
+                else ("missing" if spf_txt.get("ok") else "unknown")
+            ),
+            "record": (spf_hits[0] if spf_hits else ""),
+            "error": ("" if spf_txt.get("ok") else spf_txt.get("error", "")),
+        }
+
+        dmarc_txt = _dns_txt_lookup(f"_dmarc.{dom}")
+        dmarc_hits = [x for x in (dmarc_txt.get("records") or []) if str(x).lower().startswith("v=dmarc1")]
+        dmarc = {
+            "status": (
+                "pass" if dmarc_hits
+                else ("missing" if dmarc_txt.get("ok") else "unknown")
+            ),
+            "record": (dmarc_hits[0] if dmarc_hits else ""),
+            "error": ("" if dmarc_txt.get("ok") else dmarc_txt.get("error", "")),
+        }
+
+        dkim = {"status": "unknown_selector", "record": "", "selector": "", "error": ""}
+        if selectors:
+            found = None
+            last_err = ""
+            for sel in selectors:
+                txt = _dns_txt_lookup(f"{sel}._domainkey.{dom}")
+                hits = [x for x in (txt.get("records") or []) if str(x).lower().startswith("v=dkim1")]
+                if hits:
+                    found = (sel, hits[0])
+                    break
+                if not txt.get("ok"):
+                    last_err = str(txt.get("error") or "")
+            if found:
+                dkim = {"status": "pass", "record": found[1], "selector": found[0], "error": ""}
+            else:
+                dkim = {"status": "missing", "record": "", "selector": selectors[0], "error": last_err}
+
+        out_items.append(
+            {
+                "domain": dom,
+                "count": cnt,
+                "mx_status": mx_status,
+                "mx_hosts": mx_hosts,
+                "mail_ips": mail_ips,
+                "any_listed": bool(listing_details),
+                "mx": {"status": mx_status, "records": mx_hosts},
+                "mx_host": mx_host,
+                "mail_ip": mail_ips,
+                "listed": bool(listing_details),
+                "blacklist_details": listing_details[:30],
+                "spf": spf,
+                "dkim": dkim,
+                "dmarc": dmarc,
+            }
+        )
+    return out_items
 
 
 def db_mark_job_recipient(job_id: str, campaign_id: str, rcpt: str) -> None:
@@ -12592,9 +12776,9 @@ def api_campaign_form_clear(campaign_id: str):
 
 @app.get("/api/campaign/<campaign_id>/domains_stats")
 def api_campaign_domains_stats(campaign_id: str):
-    """Compute domains stats for this campaign (reads recipients from SQLite).
+    """Compute sender-domain states for this campaign (reads sender emails from SQLite).
 
-    Shows planned distribution: how many emails will be sent to each *recipient domain*.
+    Domain States = sender domains used for sending (from-address domains), not recipient domains.
     """
     bid, is_new = get_or_create_browser_id()
     cid = (campaign_id or "").strip()
@@ -12604,71 +12788,26 @@ def api_campaign_domains_stats(campaign_id: str):
         return attach_browser_cookie(resp, bid, is_new), 404
 
     form = db_get_campaign_form(bid, cid)
-    rec_text = str((form or {}).get("recipients") or "")
-    safe_text = str((form or {}).get("maillist_safe") or "")
+    sender_text = str((form or {}).get("from_email") or "")
+    parsed = sender_domain_counts(sender_text)
+    domains = compute_sender_domain_states(parsed.get("counts") or {})
 
-    def compute(text: str) -> dict:
-        emails = parse_recipients(text)
-        valid_syntax, invalid_syntax = filter_valid_emails(emails)
-        valid_mx, invalid_mx, filter_report = pre_send_recipient_filter(valid_syntax, smtp_probe=True)
+    payload = {
+        "total_emails": int(parsed.get("emails_total") or 0),
+        "invalid_emails": int(parsed.get("emails_invalid") or 0),
+        "unique_domains": len(parsed.get("counts") or {}),
+        "domains": domains,
+        "filter": {
+            "checks": ["sender_domain", "mx", "dnsbl", "spf", "dkim", "dmarc"],
+            "kept": int(len(parsed.get("valid_emails") or [])),
+            "dropped": int(parsed.get("emails_invalid") or 0),
+            "smtp_probe_used": 0,
+            "smtp_probe_limit": 0,
+        },
+    }
 
-        invalid_all = list(invalid_syntax) + list(invalid_mx)
-
-        # Count domains (recipient domains)
-        counts: Dict[str, int] = {}
-        for e in valid_mx:
-            d = _extract_domain_from_email(e)
-            if not d:
-                continue
-            counts[d] = counts.get(d, 0) + 1
-
-        domains_sorted = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-
-        # Limit expensive checks to top N domains
-        MAX_CHECKS = 200
-        out_items: List[dict] = []
-
-        for idx, (dom, cnt) in enumerate(domains_sorted):
-            route = filter_report.get("domains", {}).get(dom) or domain_mail_route(dom)
-            mx_status = route.get("status", "unknown")
-            mx_hosts = route.get("mx_hosts", [])
-
-            mail_ips: List[str] = []
-            any_listed = False
-
-            if idx < MAX_CHECKS:
-                if SHIVA_DISABLE_BLACKLIST:
-                    _log_blacklist_disabled_once()
-                else:
-                    mail_ips = resolve_sender_domain_ips(dom)
-                    dbl = check_domain_dnsbl(dom)
-                    if dbl:
-                        any_listed = True
-                    for ip in mail_ips:
-                        if check_ip_dnsbl(ip):
-                            any_listed = True
-                            break
-
-            out_items.append(
-                {
-                    "domain": dom,
-                    "count": cnt,
-                    "mx_status": mx_status,
-                    "mx_hosts": mx_hosts,
-                    "mail_ips": mail_ips,
-                    "any_listed": any_listed,
-                }
-            )
-
-        return {
-            "total_emails": len(emails),
-            "invalid_emails": len(invalid_all),
-            "unique_domains": len(counts),
-            "domains": out_items,
-            "filter": filter_report,
-        }
-
-    resp = jsonify({"ok": True, "campaign": {"id": c["id"], "name": c["name"]}, "recipients": compute(rec_text), "safe": compute(safe_text)})
+    # Backward-compatible response keys (`recipients` / `safe`) are preserved.
+    resp = jsonify({"ok": True, "campaign": {"id": c["id"], "name": c["name"]}, "recipients": payload, "safe": payload})
     return attach_browser_cookie(resp, bid, is_new)
 
 
@@ -13018,77 +13157,15 @@ def api_ai_rewrite():
 @app.post("/api/domains_stats")
 def api_domains_stats():
     data = request.get_json(silent=True) or {}
-
-    rec_text = str(data.get("recipients") or "")
-    safe_text = str(data.get("maillist_safe") or "")
-
-    def compute(text: str) -> dict:
-        emails = parse_recipients(text)
-        valid_syntax, invalid_syntax = filter_valid_emails(emails)
-        valid_mx, invalid_mx, meta = filter_emails_by_mx(valid_syntax)
-
-        invalid_all = list(invalid_syntax) + list(invalid_mx)
-
-        # Count domains
-        counts: Dict[str, int] = {}
-        for e in valid_mx:
-            d = _extract_domain_from_email(e)
-            if not d:
-                continue
-            counts[d] = counts.get(d, 0) + 1
-
-        # Sort by count desc
-        domains_sorted = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-
-        # Limit expensive checks to top N domains
-        MAX_CHECKS = 200
-        out_items: List[dict] = []
-
-        for idx, (dom, cnt) in enumerate(domains_sorted):
-            route = meta.get("domains", {}).get(dom) or domain_mail_route(dom)
-            mx_status = route.get("status", "unknown")
-            mx_hosts = route.get("mx_hosts", [])
-
-            mail_ips: List[str] = []
-            any_listed = False
-
-            if idx < MAX_CHECKS:
-                if SHIVA_DISABLE_BLACKLIST:
-                    _log_blacklist_disabled_once()
-                else:
-                    mail_ips = resolve_sender_domain_ips(dom)
-                    dbl = check_domain_dnsbl(dom)
-                    if dbl:
-                        any_listed = True
-                    # IP DNSBL
-                    for ip in mail_ips:
-                        if check_ip_dnsbl(ip):
-                            any_listed = True
-                            break
-            else:
-                # skip heavy checks
-                mail_ips = []
-                any_listed = False
-
-            out_items.append(
-                {
-                    "domain": dom,
-                    "count": cnt,
-                    "mx_status": mx_status,
-                    "mx_hosts": mx_hosts,
-                    "mail_ips": mail_ips,
-                    "any_listed": any_listed,
-                }
-            )
-
-        return {
-            "total_emails": len(emails),
-            "invalid_emails": len(invalid_all),
-            "unique_domains": len(counts),
-            "domains": out_items,
-        }
-
-    return jsonify({"ok": True, "recipients": compute(rec_text), "safe": compute(safe_text)})
+    sender_text = str(data.get("from_email") or "")
+    parsed = sender_domain_counts(sender_text)
+    payload = {
+        "total_emails": int(parsed.get("emails_total") or 0),
+        "invalid_emails": int(parsed.get("emails_invalid") or 0),
+        "unique_domains": len(parsed.get("counts") or {}),
+        "domains": compute_sender_domain_states(parsed.get("counts") or {}),
+    }
+    return jsonify({"ok": True, "recipients": payload, "safe": payload})
 
 
 @app.post("/api/preflight")
@@ -13553,6 +13630,17 @@ def start():
     job.domain_plan = count_recipient_domains(valid)
     job.domain_sent = {}
     job.domain_failed = {}
+
+    # Domain States pre-start check scope:
+    # sender domains used for sending (from-address domains), not recipient domains.
+    sender_counts: Dict[str, int] = {}
+    for em in valid_sender_emails:
+        d = _extract_domain_from_email(em)
+        if not d:
+            continue
+        sender_counts[d] = sender_counts.get(d, 0) + 1
+    sender_domain_states = compute_sender_domain_states(sender_counts)
+
     # MX stats note
     job.log(
         "INFO",
@@ -13588,6 +13676,20 @@ def start():
         job.log("INFO", f"Spam score BEFORE send: score={spam_score} limit={spam_threshold}")
         if spam_detail:
             job.log("INFO", f"Spam detail (truncated): {spam_detail[:600]}")
+    job.log(
+        "INFO",
+        "Domain States scope: sender domains used for sending (from-address domains), not recipient domains.",
+    )
+    if sender_domain_states:
+        listed_domains = [x.get("domain") for x in sender_domain_states if x.get("listed")]
+        job.log(
+            "INFO",
+            f"Sender-domain precheck: domains={len(sender_domain_states)} listed={len(listed_domains)} "
+            f"spf_pass={sum(1 for x in sender_domain_states if ((x.get('spf') or {}).get('status') == 'pass'))} "
+            f"dmarc_pass={sum(1 for x in sender_domain_states if ((x.get('dmarc') or {}).get('status') == 'pass'))} "
+            f"dkim_pass={sum(1 for x in sender_domain_states if ((x.get('dkim') or {}).get('status') == 'pass'))}.",
+        )
+
     job.log(
         "INFO",
         f"Sender inputs: names={len(from_names)} emails_valid={len(valid_sender_emails)} emails_invalid={len(invalid_sender_emails)} subjects={len(subjects)}. "
