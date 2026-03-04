@@ -11640,6 +11640,9 @@ def smtp_send_job(
         # Per-provider sender rotation cursor: if a provider has many recipients,
         # chunk#1 can use sender/IP-A, chunk#2 sender/IP-B, ... then wrap.
         provider_sender_cursor: Dict[str, int] = {}
+        # Global sender cursor to keep sender-domain usage balanced across providers.
+        # This prevents many single-chunk providers from all starting with sender#0.
+        global_sender_cursor = 0
         provider_retry_chunks: Dict[str, List[dict]] = {}
 
         def _sender_domain_rotation(emails: List[str], start_idx: int) -> Tuple[List[str], Dict[str, List[int]]]:
@@ -11820,7 +11823,12 @@ def smtp_send_job(
                 attempt = int(retry_item.get("attempt") or 0)
                 chunk_subjects = list(retry_item.get("chunk_subjects") or subjects2 or subjects)
                 chunk_body_variants = list(retry_item.get("chunk_body_variants") or body_variants2 or split_body_variants(body))
-                sender_cursor_base = int(retry_item.get("sender_cursor_base") or provider_sender_cursor.get(target_domain, 0) or 0)
+                sender_cursor_base = int(
+                    retry_item.get("sender_cursor_base")
+                    or provider_sender_cursor.get(target_domain, global_sender_cursor)
+                    or global_sender_cursor
+                    or 0
+                )
                 sender_domain_cursor = int(retry_item.get("sender_domain_cursor") or 0)
                 sender_attempt_in_domain = int(retry_item.get("sender_attempt_in_domain") or 0)
                 exhausted_sender_domains = list(retry_item.get("exhausted_sender_domains") or [])
@@ -11832,7 +11840,7 @@ def smtp_send_job(
                 if not chunk:
                     continue
                 attempt = 0
-                sender_cursor_base = int(provider_sender_cursor.get(target_domain, 0) or 0)
+                sender_cursor_base = int(provider_sender_cursor.get(target_domain, global_sender_cursor) or global_sender_cursor or 0)
                 sender_domain_cursor = 0
                 sender_attempt_in_domain = 0
                 exhausted_sender_domains: List[str] = []
@@ -12141,7 +12149,9 @@ def smtp_send_job(
                             })
                             job.log("ERROR", f"Chunk {chunk_idx_local+1} [{target_domain}]: ABANDONED after exhausting sender domains ({rtxt})")
                             if from_emails2:
-                                provider_sender_cursor[target_domain] = (sender_cursor_base + 1) % max(1, len(from_emails2))
+                                next_sender_cursor = (sender_cursor_base + 1) % max(1, len(from_emails2))
+                                provider_sender_cursor[target_domain] = next_sender_cursor
+                                global_sender_cursor = next_sender_cursor
                         db_finalize_email_learning(
                             job_id=job_id,
                             campaign_id=job.campaign_id,
@@ -12286,7 +12296,9 @@ def smtp_send_job(
                         "reason": "",
                     })
                 if from_emails2:
-                    provider_sender_cursor[target_domain] = (sender_idx + 1) % max(1, len(from_emails2))
+                    next_sender_cursor = (sender_idx + 1) % max(1, len(from_emails2))
+                    provider_sender_cursor[target_domain] = next_sender_cursor
+                    global_sender_cursor = next_sender_cursor
                 chunk_finished = True
                 break
 
