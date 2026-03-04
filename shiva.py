@@ -3831,6 +3831,17 @@ PAGE_JOBS = r"""
     .triageBadge.good{border-color: rgba(53,228,154,.35); color: var(--good);}
     .triageBadge.warn{border-color: rgba(255,193,77,.35); color: var(--warn);}
     .triageBadge.bad{border-color: rgba(255,94,115,.35); color: var(--bad);}
+    .bridgeConnBadge{gap:7px;}
+    .statusDot{
+      width:9px;
+      height:9px;
+      border-radius:50%;
+      display:inline-block;
+      box-shadow:0 0 0 2px rgba(255,255,255,.12);
+      flex:0 0 auto;
+    }
+    .statusDot.good{background: var(--good);}
+    .statusDot.bad{background: var(--bad);}
 
     .kpiWrap{margin-top:12px; border:1px solid rgba(255,255,255,.10); background: rgba(0,0,0,.10); border-radius: 14px; padding: 10px 12px;}
     .kpiRow{display:grid; grid-template-columns: repeat(6, minmax(0,1fr)); gap:8px;}
@@ -4117,6 +4128,7 @@ PAGE_JOBS = r"""
               <div class="triageBadge" data-k="badgeFreshness">—</div>
               <div class="triageBadge" data-k="badgeHealth">—</div>
               <div class="triageBadge" data-k="badgeRisk">—</div>
+              <div class="triageBadge bridgeConnBadge" data-k="badgeBridgeConn">—</div>
               <div class="triageBadge" data-k="badgeIntegrity" style="display:none">INTEGRITY</div>
             </div>
             <div class="mini">Created: <span class="muted">{{j.created_at}}</span></div>
@@ -4523,6 +4535,8 @@ PAGE_JOBS = r"""
       riskEl.textContent = `RISK ${risk}`;
     }
 
+    renderBridgeConnectionBadge(card, state.latestBridgeState);
+
     const dup = Number(j.duplicates_dropped || 0);
     const jnf = Number(j.job_not_found || 0);
     const dbf = Number(j.db_write_failures || 0);
@@ -4534,6 +4548,16 @@ PAGE_JOBS = r"""
       intEl.className = hasIntegrity ? 'triageBadge bad' : 'triageBadge';
       intEl.textContent = hasIntegrity ? `INTEGRITY (${dup + jnf + dbf + miss})` : 'INTEGRITY';
     }
+  }
+
+  function renderBridgeConnectionBadge(card, bridgeState){
+    const bridgeEl = qk(card, 'badgeBridgeConn');
+    if(!bridgeEl) return;
+    const connected = !!(bridgeState && bridgeState.connected === true);
+    const label = connected ? 'Bridge↔Shiva connected' : 'Bridge↔Shiva disconnected';
+    bridgeEl.className = `triageBadge bridgeConnBadge ${connected ? 'good' : 'bad'}`;
+    bridgeEl.innerHTML = `<span class="statusDot ${connected ? 'good' : 'bad'}" aria-hidden="true"></span><span>${label}</span>`;
+    bridgeEl.title = label;
   }
 
   function statusPillClass(st){
@@ -5844,6 +5868,7 @@ This will remove it from Jobs history.`);
         cards.forEach(card => {
           const jid = (card.dataset.jobid || "").toString();
           const snapshot = state.lastJobPayload[jid];
+          renderBridgeConnectionBadge(card, b);
           if(snapshot) renderBridgeReceiver(card, snapshot, b);
         });
         console.log('[Bridge↔Shiva Debug]', {
@@ -5871,6 +5896,7 @@ This will remove it from Jobs history.`);
       cards.forEach(card => {
         const jid = (card.dataset.jobid || "").toString();
         const snapshot = state.lastJobPayload[jid] || {};
+        renderBridgeConnectionBadge(card, null);
         renderBridgeReceiver(card, snapshot, null);
       });
       console.error('[Bridge↔Shiva Debug] bridge status exception', e);
