@@ -4160,6 +4160,28 @@ PAGE_JOBS = r"""
     .toast.good{ border-color: rgba(53,228,154,.35); }
     .toast.bad{ border-color: rgba(255,94,115,.35); }
     .toast.warn{ border-color: rgba(255,193,77,.35); }
+
+    .labelTip{ display:inline-flex; align-items:center; gap:6px; }
+    .tip{display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; border-radius:999px;
+      border:1px solid rgba(255,255,255,.18); background: rgba(0,0,0,.18); color: rgba(255,255,255,.86);
+      font-size: 12px; cursor: help; position: relative; user-select:none}
+    .tip:hover::after{
+      content: attr(data-tip);
+      position: absolute;
+      left: 0;
+      top: 24px;
+      min-width: 240px;
+      max-width: 420px;
+      background: rgba(0,0,0,.72);
+      border: 1px solid rgba(255,255,255,.18);
+      box-shadow: 0 18px 55px rgba(0,0,0,.35);
+      backdrop-filter: blur(10px);
+      color: rgba(255,255,255,.92);
+      padding: 10px 12px;
+      border-radius: 14px;
+      z-index: 999;
+      white-space: normal;
+    }
   </style>
 </head>
 <body>
@@ -4189,7 +4211,7 @@ PAGE_JOBS = r"""
 
     <div class="filterBar" id="jobsFilterBar">
       <div class="filterCell">
-        <label for="fltStatus">Status</label>
+        <label for="fltStatus" class="labelTip">Status <span class="tip" data-tip="Filter jobs by current execution state (running/done/paused/backoff).">ⓘ</span></label>
         <select id="fltStatus">
           <option value="all">All</option>
           <option value="running">running</option>
@@ -4199,7 +4221,7 @@ PAGE_JOBS = r"""
         </select>
       </div>
       <div class="filterCell">
-        <label for="fltMode">Mode</label>
+        <label for="fltMode" class="labelTip">Mode <span class="tip" data-tip="Show jobs by bridge polling mode: counts or legacy.">ⓘ</span></label>
         <select id="fltMode">
           <option value="all">All</option>
           <option value="counts">counts</option>
@@ -4207,7 +4229,7 @@ PAGE_JOBS = r"""
         </select>
       </div>
       <div class="filterCell">
-        <label for="fltRisk">Risk</label>
+        <label for="fltRisk" class="labelTip">Risk <span class="tip" data-tip="Highlight jobs with health/risk signals such as stale updates or degraded internals.">ⓘ</span></label>
         <select id="fltRisk">
           <option value="all">All</option>
           <option value="internal_degraded">internal degraded</option>
@@ -4216,7 +4238,7 @@ PAGE_JOBS = r"""
         </select>
       </div>
       <div class="filterCell">
-        <label for="fltProvider">Provider</label>
+        <label for="fltProvider" class="labelTip">Provider <span class="tip" data-tip="Filter by recipient provider bucket (gmail/yahoo/outlook/icloud/other).">ⓘ</span></label>
         <select id="fltProvider">
           <option value="all">All</option>
           <option value="gmail">gmail</option>
@@ -4227,7 +4249,7 @@ PAGE_JOBS = r"""
         </select>
       </div>
       <div class="filterCell">
-        <label for="fltSort">Sort</label>
+        <label for="fltSort" class="labelTip">Sort <span class="tip" data-tip="Control card order: newest first, highest risk first, or stalest first.">ⓘ</span></label>
         <select id="fltSort">
           <option value="newest">newest first</option>
           <option value="highest_risk">highest risk first</option>
@@ -6206,6 +6228,27 @@ PAGE_CAMPAIGNS = r"""
     }
 
     .dangerTitle{ font-weight:900; color: var(--warn); }
+
+    .titleTip{ display:inline-flex; align-items:center; gap:6px; }
+    .tip{display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; border-radius:999px;
+      border:1px solid rgba(255,255,255,.18); background: rgba(0,0,0,.18); color: rgba(255,255,255,.86);
+      font-size: 12px; cursor: help; position: relative; user-select:none}
+    .tip:hover::after{
+      content: attr(data-tip);
+      position: absolute;
+      left: 0;
+      top: 24px;
+      min-width: 240px;
+      max-width: 420px;
+      background: rgba(0,0,0,.72);
+      border: 1px solid rgba(255,255,255,.18);
+      box-shadow: 0 18px 55px rgba(0,0,0,.35);
+      color: rgba(255,255,255,.92);
+      padding: 10px 12px;
+      border-radius: 14px;
+      z-index: 999;
+      white-space: normal;
+    }
   </style>
 </head>
 <body>
@@ -6213,7 +6256,7 @@ PAGE_CAMPAIGNS = r"""
 
     <div class="top">
       <div>
-        <h1>Campaigns</h1>
+        <h1 class="titleTip">Campaigns <span class="tip" data-tip="Manage saved campaigns. Each campaign keeps its own SMTP/message/recipient settings.">ⓘ</span></h1>
         <div class="sub">
           Create multiple saved campaigns. Each campaign stores its own SMTP settings, message, controls, recipients, etc (SQLite).
         </div>
@@ -6236,6 +6279,7 @@ PAGE_CAMPAIGNS = r"""
 
         <div class="actions" style="margin-top:12px">
           <a class="btn" href="/campaign/{{c.id}}">Open</a>
+          <span class="tip" data-tip="Open this campaign to edit settings and start a new job.">ⓘ</span>
 
           <form method="post" action="/campaign/{{c.id}}/rename" class="inline">
             <input name="name" value="{{c.name}}" />
@@ -6934,6 +6978,27 @@ PAGE_JOB = r"""
 
     .smallBar{height:8px; border-radius:999px; background:rgba(255,255,255,.10); border:1px solid rgba(255,255,255,.12); overflow:hidden}
     .smallBar > div{height:100%; width:0%; background: rgba(53,228,154,.55);}
+
+    .titleTip{display:inline-flex; align-items:center; gap:6px}
+    .tip{display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; border-radius:999px;
+      border:1px solid rgba(255,255,255,.18); background: rgba(0,0,0,.18); color: rgba(255,255,255,.86);
+      font-size: 12px; cursor: help; position: relative; user-select:none}
+    .tip:hover::after{
+      content: attr(data-tip);
+      position: absolute;
+      left: 0;
+      top: 24px;
+      min-width: 240px;
+      max-width: 420px;
+      background: rgba(0,0,0,.72);
+      border: 1px solid rgba(255,255,255,.18);
+      box-shadow: 0 18px 55px rgba(0,0,0,.35);
+      color: rgba(255,255,255,.92);
+      padding: 10px 12px;
+      border-radius: 14px;
+      z-index: 999;
+      white-space: normal;
+    }
   </style>
 </head>
 <body>
@@ -7013,7 +7078,7 @@ PAGE_JOB = r"""
     </div>
 
     <div class="card">
-      <h3 style="margin:0 0 10px">Recent Results</h3>
+      <h3 style="margin:0 0 10px" class="titleTip">Recent Results <span class="tip" data-tip="Browse job results in pages. Use Prev/Next to navigate the latest processed recipients.">ⓘ</span></h3>
       <div class="row" style="margin-bottom:8px; align-items:center; gap:8px">
         <button class="navBtn" id="resultsPrevBtn" type="button">← Prev</button>
         <button class="navBtn" id="resultsNextBtn" type="button">Next →</button>
