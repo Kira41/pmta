@@ -160,6 +160,13 @@
 
 ## 4) Recipient Filtering (SMTP Probe)
 
+### `RECIPIENT_FILTER_ENABLE_ROUTE_CHECK`
+- **الافتراضي:** `1`
+- **الخلفية:** تفعيل/إيقاف فلتر التحقق من route الخاص بدومين المستلم (`MX` أو `A fallback`).
+- **التأثير:**
+  - `1`: سلوك الفلترة الحالي كما هو (syntax + MX/A + SMTP probe حسب الإعدادات).
+  - `0`: تعطيل فلتر route بالكامل (لا MX/A ولا SMTP probe) والاعتماد فقط على syntax validation لصيغة الإيميل.
+
 ### `RECIPIENT_FILTER_ENABLE_SMTP_PROBE`
 - **الافتراضي:** `1`
 - **الخلفية:** تشغيل فحص SMTP probe للتحقق المسبق من صلاحية المستلمين.

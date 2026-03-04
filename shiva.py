@@ -147,6 +147,7 @@ SMTP_CODE_RE = re.compile(r"\b([245])\d{2}\b")
 SMTP_ENHANCED_CODE_RE = re.compile(r"\b([245])\.\d\.\d{1,3}\b")
 
 RECIPIENT_FILTER_ENABLE_SMTP_PROBE = (os.getenv("RECIPIENT_FILTER_ENABLE_SMTP_PROBE", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+RECIPIENT_FILTER_ENABLE_ROUTE_CHECK = (os.getenv("RECIPIENT_FILTER_ENABLE_ROUTE_CHECK", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
 try:
     RECIPIENT_FILTER_SMTP_PROBE_LIMIT = int((os.getenv("RECIPIENT_FILTER_SMTP_PROBE_LIMIT", "25") or "25").strip())
 except Exception:
@@ -7901,9 +7902,26 @@ def pre_send_recipient_filter(emails: List[str], *, smtp_probe: bool = True) -> 
     ok: List[str] = []
     bad: List[str] = []
 
+    if not RECIPIENT_FILTER_ENABLE_ROUTE_CHECK:
+        cleaned = [(e or "").strip() for e in (emails or []) if (e or "").strip()]
+        report: Dict[str, Any] = {
+            "enabled": True,
+            "checks": ["syntax"],
+            "route_check": False,
+            "smtp_probe": False,
+            "smtp_probe_limit": 0,
+            "smtp_probe_used": 0,
+            "rejected": {"no_route": 0, "smtp": 0},
+            "domains": {},
+            "kept": len(cleaned),
+            "dropped": 0,
+        }
+        return cleaned, [], report
+
     report: Dict[str, Any] = {
         "enabled": True,
         "checks": ["syntax", "mx_or_a"],
+        "route_check": True,
         "smtp_probe": bool(smtp_probe and RECIPIENT_FILTER_ENABLE_SMTP_PROBE),
         "smtp_probe_limit": int(max(0, RECIPIENT_FILTER_SMTP_PROBE_LIMIT or 0)),
         "smtp_probe_used": 0,
