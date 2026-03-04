@@ -4165,6 +4165,7 @@ PAGE_JOBS = r"""
     .tip{display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; border-radius:999px;
       border:1px solid rgba(255,255,255,.18); background: rgba(0,0,0,.18); color: rgba(255,255,255,.86);
       font-size: 12px; cursor: help; position: relative; user-select:none}
+    .triageBadge .tip{ width:14px; height:14px; font-size:10px; }
     .tip:hover::after{
       content: attr(data-tip);
       position: absolute;
@@ -4453,6 +4454,13 @@ PAGE_JOBS = r"""
 
 <script>
   const esc = (s) => (s ?? '').toString().replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+  const escAttr = (s) => esc(s).replaceAll('"','&quot;');
+
+  function badgeWithTip(label, tip){
+    const safeLabel = esc(label || '—');
+    const safeTip = escAttr(tip || '—');
+    return `<span>${safeLabel}</span> <span class="tip" data-tip="${safeTip}">ⓘ</span>`;
+  }
 
   function toast(title, msg, kind){
     const wrap = document.getElementById('toastWrap');
@@ -4622,7 +4630,13 @@ PAGE_JOBS = r"""
 
     const modeEl = qk(card, 'badgeMode');
     if(modeEl){
-      modeEl.textContent = isCounts ? 'COUNTS' : (isLegacy ? 'LEGACY' : '—');
+      const modeLabel = isCounts ? 'COUNTS' : (isLegacy ? 'LEGACY' : '—');
+      const modeTip = isCounts
+        ? 'Bridge polling mode uses aggregated accounting counters (fast/low overhead).'
+        : (isLegacy
+          ? 'Bridge polling mode uses legacy event stream with ingestion lag tracking.'
+          : 'Bridge mode not available yet for this job.');
+      modeEl.innerHTML = badgeWithTip(modeLabel, modeTip);
       modeEl.className = 'triageBadge';
     }
 
@@ -4656,7 +4670,7 @@ PAGE_JOBS = r"""
           cls = mins > 15 ? 'triageBadge warn' : 'triageBadge';
         }
       }
-      freshEl.textContent = txt;
+      freshEl.innerHTML = badgeWithTip(txt, 'Freshness signal: how recent accounting or legacy ingestion updates are for this job.');
       freshEl.className = cls;
     }
 
@@ -4668,9 +4682,14 @@ PAGE_JOBS = r"""
       const ok = known ? failN <= 0 : null;
       healthEl.className = healthBadgeClass(ok);
       if(known){
-        healthEl.textContent = ok ? 'OK (0)' : `DEGRADED (${Math.max(0, Math.floor(failN))})`;
+        const failures = Math.max(0, Math.floor(failN));
+        const label = ok ? 'OK (0)' : `DEGRADED (${failures})`;
+        const tip = ok
+          ? 'Internal health checks are clean (no bridge/runtime failure counters).'
+          : `Internal health degraded: ${failures} bridge/runtime failures were detected.`;
+        healthEl.innerHTML = badgeWithTip(label, tip);
       }else{
-        healthEl.textContent = '—';
+        healthEl.innerHTML = badgeWithTip('—', 'Internal health state is not available yet.');
       }
     }
 
@@ -4678,7 +4697,7 @@ PAGE_JOBS = r"""
     const riskEl = qk(card, 'badgeRisk');
     if(riskEl){
       riskEl.className = riskBadgeClass(risk);
-      riskEl.textContent = `RISK ${risk}`;
+      riskEl.innerHTML = badgeWithTip(`RISK ${risk}`, 'Deliverability risk derived from bounce, complaint, and deferred rates.');
     }
 
     renderBridgeConnectionBadge(card, state.latestBridgeState);
@@ -4692,7 +4711,11 @@ PAGE_JOBS = r"""
     if(intEl){
       intEl.style.display = hasIntegrity ? 'inline-flex' : 'none';
       intEl.className = hasIntegrity ? 'triageBadge bad' : 'triageBadge';
-      intEl.textContent = hasIntegrity ? `INTEGRITY (${dup + jnf + dbf + miss})` : 'INTEGRITY';
+      const integrityTotal = dup + jnf + dbf + miss;
+      const integrityTip = hasIntegrity
+        ? `Data integrity issues found: duplicates=${dup}, job_not_found=${jnf}, missing_fields=${miss}, db_write_failures=${dbf}.`
+        : 'Data integrity counters are clean.';
+      intEl.innerHTML = badgeWithTip(hasIntegrity ? `INTEGRITY (${integrityTotal})` : 'INTEGRITY', integrityTip);
     }
   }
 
@@ -4702,7 +4725,7 @@ PAGE_JOBS = r"""
     const connected = !!(bridgeState && bridgeState.connected === true);
     const label = connected ? 'Bridge↔Shiva connected' : 'Bridge↔Shiva disconnected';
     bridgeEl.className = `triageBadge bridgeConnBadge ${connected ? 'good' : 'bad'}`;
-    bridgeEl.innerHTML = `<span class="statusDot ${connected ? 'good' : 'bad'}" aria-hidden="true"></span><span>${label}</span>`;
+    bridgeEl.innerHTML = `<span class="statusDot ${connected ? 'good' : 'bad'}" aria-hidden="true"></span><span>${esc(label)}</span><span class="tip" data-tip="Real-time bridge transport status between PMTA accounting bridge and Shiva receiver.">ⓘ</span>`;
     bridgeEl.title = label;
   }
 
