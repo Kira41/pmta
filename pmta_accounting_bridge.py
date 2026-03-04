@@ -991,7 +991,7 @@ def _calculate_job_outcomes(jid: str) -> Dict[str, Any]:
     """Return unique recipient outcomes for one job id."""
 
     patterns = ALLOWED_KINDS.get("acct") or ["acct-*.csv"]
-    by_recipient: Dict[str, str] = {}
+    by_recipient: Dict[str, Dict[str, Any]] = {}
     status_rank = {"deferred": 1, "delivered": 2, "bounced": 2, "complained": 2}
 
     for ev in _walk_accounting_events(patterns):
@@ -1020,12 +1020,22 @@ def _calculate_job_outcomes(jid: str) -> Dict[str, Any]:
             )
             continue
 
+        item = {
+            "email": rcpt,
+            "outcome": typ,
+            "message_id": _event_value(ev, "msgid", "message-id", "message_id", "messageid"),
+            "dsn_status": _event_value(ev, "dsnStatus", "dsn_status", "enhanced-status", "enhanced_status"),
+            "dsn_diag": _event_value(ev, "dsnDiag", "dsn_diag", "diag", "diagnostic", "smtp-diagnostic"),
+            "response": _event_value(ev, "response", "smtp-response", "smtp_response"),
+        }
+
         prev = by_recipient.get(rcpt)
         if not prev:
-            by_recipient[rcpt] = typ
+            by_recipient[rcpt] = item
             continue
-        if status_rank.get(typ, 0) >= status_rank.get(prev, 0):
-            by_recipient[rcpt] = typ
+        prev_typ = str(prev.get("outcome") or "")
+        if status_rank.get(typ, 0) >= status_rank.get(prev_typ, 0):
+            by_recipient[rcpt] = item
 
     buckets: Dict[str, List[str]] = {
         "delivered": [],
@@ -1033,16 +1043,29 @@ def _calculate_job_outcomes(jid: str) -> Dict[str, Any]:
         "bounced": [],
         "complained": [],
     }
-    for email, typ in by_recipient.items():
+    for email, row in by_recipient.items():
+        typ = str(row.get("outcome") or "")
         buckets[typ].append(email)
 
     for k in buckets:
         buckets[k] = sorted(set(buckets[k]))
 
+    all_rows = []
+    for email in sorted(by_recipient.keys()):
+        row = by_recipient[email]
+        all_rows.append({
+            "email": email,
+            "outcome": row.get("outcome") or "",
+            "message_id": row.get("message_id") or "",
+            "dsn_status": row.get("dsn_status") or "",
+            "dsn_diag": row.get("dsn_diag") or "",
+            "response": row.get("response") or "",
+        })
+
     total_unique = sum(len(v) for v in buckets.values())
     return {
         "total_unique": total_unique,
-        "all_emails": sorted(by_recipient.keys()),
+        "all_emails": all_rows,
         "buckets": buckets,
     }
 

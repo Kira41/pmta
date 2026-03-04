@@ -233,6 +233,54 @@ class BridgeShivaHarnessTests(unittest.TestCase):
         self.assertEqual(rows, [("a@example.com", "bounced"), ("d@example.com", "complained")])
 
 
+
+    def test_bridge_outcomes_include_accounting_error_details(self):
+        with TemporaryDirectory() as td:
+            log_dir = Path(td)
+            (log_dir / "acct-20260101.csv").write_text(self.sample.read_text(), encoding="utf-8")
+            bridge.PMTA_LOG_DIR = log_dir
+            bridge._CSV_HEADER_STATE.clear()
+
+            payload = bridge.get_job_outcomes(job_id="abcdef123456", _=None)
+            rows = payload.get("emails") or []
+            bounced = next((x for x in rows if str(x.get("outcome") or "") == "bounced"), None)
+
+            self.assertTrue(isinstance(rows, list) and rows)
+            self.assertIsNotNone(bounced)
+            self.assertTrue(str(bounced.get("dsn_status") or ""))
+            self.assertTrue(str(bounced.get("dsn_diag") or ""))
+
+    def test_bridge_sync_outcomes_persists_dsn_diag_for_error_rows(self):
+        self._prepare_job()
+        payload = {
+            "ok": True,
+            "job_id": "abcdef123456",
+            "emails": [
+                {
+                    "email": "b@example.com",
+                    "outcome": "bounced",
+                    "dsn_status": "5.1.1",
+                    "dsn_diag": "550 5.1.1 user unknown",
+                }
+            ],
+            "bounced": {
+                "count": 1,
+                "emails": ["b@example.com"],
+            },
+        }
+
+        shiva._bridge_sync_job_outcomes("abcdef123456", payload)
+
+        conn = shiva._db_conn()
+        try:
+            row = conn.execute(
+                "SELECT last_dsn_status, last_dsn_diag FROM job_outcomes WHERE job_id=? AND rcpt=?",
+                ("abcdef123456", "b@example.com"),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(row, ("5.1.1", "550 5.1.1 user unknown"))
     def test_bridge_poller_skips_outcomes_when_disabled(self):
         old_port = shiva.PMTA_BRIDGE_PULL_PORT
         old_host = os.environ.get("SHIVA_HOST")
