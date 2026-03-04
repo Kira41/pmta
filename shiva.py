@@ -298,6 +298,7 @@ class SendJob:
     created_at: str
     campaign_id: str = ""
     pmta_job_id: str = ""
+    bridge_mode: str = ""
 
     # SMTP host used for this job (also used to derive PMTA monitor base URL)
     smtp_host: str = ""
@@ -1135,6 +1136,7 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "id": job.id,
         "campaign_id": job.campaign_id,
         "pmta_job_id": job.pmta_job_id or "",
+        "bridge_mode": str(job.bridge_mode or ""),
         "smtp_host": job.smtp_host or "",
         "pmta_live": job.pmta_live or {},
         "pmta_live_ts": job.pmta_live_ts or "",
@@ -1524,6 +1526,7 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job = SendJob(id=jid, created_at=str(s.get("created_at") or now_iso()))
         job.campaign_id = str(s.get("campaign_id") or "")
         job.pmta_job_id = str(s.get("pmta_job_id") or jid)
+        job.bridge_mode = str(s.get("bridge_mode") or "")
         job.smtp_host = str(s.get("smtp_host") or "")
         job.pmta_live = (s.get("pmta_live") if isinstance(s.get("pmta_live"), dict) else {}) or {}
         job.pmta_live_ts = str(s.get("pmta_live_ts") or "")
@@ -4035,6 +4038,8 @@ PAGE_JOBS = r"""
     lastAdaptive: {},
     lastRoute: {},
     lastPmtaMonitor: {},
+    lastJobPayload: {},
+    latestBridgeState: null,
   };
 
   async function controlJob(jobId, action){
@@ -4958,6 +4963,9 @@ This will remove it from Jobs history.`);
     if(btnPause) btnPause.disabled = !!j.paused || (st||'').toLowerCase() === 'done' || (st||'').toLowerCase() === 'error' || (st||'').toLowerCase() === 'stopped';
     if(btnResume) btnResume.disabled = !j.paused || (st||'').toLowerCase() === 'done' || (st||'').toLowerCase() === 'error' || (st||'').toLowerCase() === 'stopped';
     if(btnStop) btnStop.disabled = (st||'').toLowerCase() === 'done' || (st||'').toLowerCase() === 'error' || (st||'').toLowerCase() === 'stopped';
+
+    state.lastJobPayload[jobId] = j;
+    renderBridgeReceiver(card, j, state.latestBridgeState);
   }
 
   async function tickCard(card){
@@ -5021,7 +5029,12 @@ This will remove it from Jobs history.`);
       const j = await r.json().catch(()=>({}));
       if(r.ok && j && j.ok && j.bridge){
         const b = j.bridge || {};
-        cards.forEach(card => renderBridgeReceiver(card, b));
+        state.latestBridgeState = b;
+        cards.forEach(card => {
+          const jid = (card.dataset.jobid || "").toString();
+          const snapshot = state.lastJobPayload[jid];
+          if(snapshot) renderBridgeReceiver(card, snapshot, b);
+        });
         console.log('[Bridge↔Shiva Debug]', {
           connected: !!b.connected,
           last_ok: !!b.last_ok,
@@ -5043,46 +5056,75 @@ This will remove it from Jobs history.`);
         console.warn('[Bridge↔Shiva Debug] bridge status failed', {http_status: r.status, payload: j});
       }
     }catch(e){
-      cards.forEach(card => renderBridgeReceiver(card, null));
+      state.latestBridgeState = null;
+      cards.forEach(card => {
+        const jid = (card.dataset.jobid || "").toString();
+        const snapshot = state.lastJobPayload[jid] || {};
+        renderBridgeReceiver(card, snapshot, null);
+      });
       console.error('[Bridge↔Shiva Debug] bridge status exception', e);
     }
   }
 
-  function renderBridgeReceiver(card, b){
+  function _fmtTsAge(ts){
+    const raw = (ts || '').toString().trim();
+    if(!raw) return '—';
+    const mins = ageMin(raw);
+    if(mins === null) return esc(raw);
+    if(mins < 1) return `${esc(raw)} (just now)`;
+    if(mins < 60) return `${esc(raw)} (${mins}m ago)`;
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    return `${esc(raw)} (${h}h ${m}m ago)`;
+  }
+
+  function _shortCursor(v){
+    const raw = (v || '').toString().trim();
+    if(!raw) return '—';
+    if(raw.length <= 44) return raw;
+    return `${raw.slice(0, 22)}…${raw.slice(-16)}`;
+  }
+
+  function renderBridgeReceiver(card, j, b){
     const el = qk(card, 'bridgeReceiver');
     if(!el){ return; }
 
-    if(!b || typeof b !== 'object'){
-      el.textContent = 'Unable to fetch bridge receiver data.';
+    const modeRaw = (j && j.bridge_mode ? j.bridge_mode : (b && b.bridge_mode ? b.bridge_mode : 'counts')).toString().trim().toLowerCase();
+    const isLegacy = modeRaw === 'legacy';
+    const isCounts = !isLegacy;
+
+    const pollSuccessTs = (j && j.bridge_last_success_ts) || (b && b.last_success_ts) || '';
+    const accountingTs = (j && j.accounting_last_update_ts) || (j && j.accounting_last_ts) || '';
+
+    if(isCounts){
+      el.innerHTML = [
+        'Data source: <b>Bridge snapshot</b>',
+        `Last poll success: <b>${_fmtTsAge(pollSuccessTs)}</b>`,
+        `Last accounting update: <b>${_fmtTsAge(accountingTs)}</b>`,
+      ].join('<br>');
       return;
     }
 
-    const linesSample = Array.isArray(b.last_lines_sample) ? b.last_lines_sample : [];
-    const processed = Number(b.last_processed || 0);
-    const accepted = Number(b.last_accepted || 0);
-    const received = Number(b.events_received || 0);
-    const ingested = Number(b.events_ingested || 0);
-    const duplicates = Number(b.duplicates_dropped || 0);
-    const notFound = Number(b.job_not_found || 0);
-    const bridgeCount = Number(b.last_bridge_count || 0);
+    const hasMore = !!(j && j.bridge_has_more);
+    const cursorShort = _shortCursor((j && j.bridge_last_cursor) || '');
+    const received = Number((j && j.received) || 0);
+    const ingested = Number((j && j.ingested) || 0);
+    const duplicates = Number((j && j.duplicates_dropped) || 0);
+    const notFound = Number((j && j.job_not_found) || 0);
+    const lagSecRaw = Number(j && j.ingestion_lag_seconds);
+    const lagMins = Number.isFinite(lagSecRaw) && lagSecRaw >= 0
+      ? Math.floor(lagSecRaw / 60)
+      : ageMin((j && j.ingestion_last_event_ts) || '');
+    const lagTxt = (lagMins === null) ? '—' : (lagMins <= 1 ? 'caught up' : `${lagMins}m`);
 
-    const rows = [
-      `Last poll: <b>${esc((b.last_attempt_ts || '—').toString())}</b> · Last success: <b>${esc((b.last_success_ts || '—').toString())}</b>`,
-      `Bridge rows: <b>${bridgeCount}</b> · Processed by Shiva: <b>${processed}</b> · Accepted: <b>${accepted}</b>`,
-      `Receiver totals → received: <b>${received}</b> · ingested: <b>${ingested}</b> · duplicates: <b>${duplicates}</b> · job_not_found: <b>${notFound}</b>`,
-      `Cursor: <code>${esc((b.last_cursor || '—').toString())}</code>`,
-      `Source URL: <code>${esc((b.last_req_url || b.pull_url_masked || '—').toString())}</code>`,
-    ];
-
-    if(linesSample.length){
-      rows.push('Latest data from Bridge.py:');
-      rows.push(linesSample.map(x => `• <code>${esc((x ?? '').toString())}</code>`).join('<br>'));
-    }else{
-      rows.push('Latest data from Bridge.py: —');
-    }
-
-    el.innerHTML = rows.join('<br>');
+    el.innerHTML = [
+      'Data source: <b>Event ingestion</b>',
+      `Cursor progress: has_more=<b>${hasMore ? 'yes' : 'no'}</b> · last_cursor=<code>${esc(cursorShort)}</code>`,
+      `Ingestion stats: received=<b>${received}</b> · ingested=<b>${ingested}</b> · duplicates=<b>${duplicates}</b> · job_not_found=<b>${notFound}</b>`,
+      `Ingestion last event: <b>${_fmtTsAge((j && j.ingestion_last_event_ts) || '')}</b> · lag: <b>${esc(lagTxt)}</b>`,
+    ].join('<br>');
   }
+
 
   document.getElementById('btnRefreshAll')?.addEventListener('click', tickAll);
 
@@ -11123,13 +11165,17 @@ def job_api(job_id: str):
                 "recent_page_size": recent_page_size,
                 "recent_total": total_recent,
                 "recent_total_pages": recent_total_pages,
-                "bridge_mode": str(BRIDGE_MODE or "counts"),
+                "bridge_mode": str(getattr(job, "bridge_mode", "") or BRIDGE_MODE or "counts"),
                 "accounting_last_update_ts": job.accounting_last_ts,
                 "bridge_last_success_ts": str(bridge_state.get("last_success_ts") or ""),
                 "bridge_failure_count": int(bridge_state.get("failure_count") or 0),
                 "bridge_last_error_message": str(bridge_state.get("last_error_message") or ""),
+                "bridge_last_cursor": str(bridge_state.get("last_cursor") or ""),
+                "bridge_has_more": bool(bridge_state.get("has_more") or False),
                 "ingestion_last_event_ts": job.accounting_last_ts,
                 "ingestion_lag_seconds": None,
+                "received": int(bridge_state.get("events_received") or 0),
+                "ingested": int(bridge_state.get("events_ingested") or 0),
                 "duplicates_dropped": int(bridge_state.get("duplicates_dropped") or 0),
                 "job_not_found": int(bridge_state.get("job_not_found") or 0),
                 "db_write_failures": int(bridge_state.get("db_write_failures") or 0),
@@ -12236,6 +12282,7 @@ def start():
         updated_at=now_iso(),
         campaign_id=campaign_id,
         pmta_job_id=job_id,
+        bridge_mode=str(BRIDGE_MODE or "counts"),
         smtp_host=smtp_host,
         total=len(valid),
         invalid=len(invalid),

@@ -529,6 +529,57 @@ class BridgeShivaHarnessTests(unittest.TestCase):
         self.assertEqual(jobs[0].get("last_update_time"), "2026-01-01T00:00:00Z")
         self.assertIn("outcomes_sync_enabled", jobs[0])
 
+    def test_job_api_exposes_mode_specific_snapshot_fields_counts(self):
+        client = shiva.app.test_client()
+        job = self._prepare_job()
+        job.bridge_mode = "counts"
+        job.accounting_last_ts = "2026-01-01T00:00:00Z"
+
+        with shiva._BRIDGE_DEBUG_LOCK:
+            shiva._BRIDGE_DEBUG_STATE["last_success_ts"] = "2026-01-01T01:00:00Z"
+            shiva._BRIDGE_DEBUG_STATE["last_cursor"] = "cursor-hidden-in-counts"
+            shiva._BRIDGE_DEBUG_STATE["has_more"] = True
+            shiva._BRIDGE_DEBUG_STATE["events_received"] = 10
+            shiva._BRIDGE_DEBUG_STATE["events_ingested"] = 8
+
+        resp = client.get(f"/api/job/{job.id}")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+
+        self.assertEqual(body.get("bridge_mode"), "counts")
+        self.assertEqual(body.get("accounting_last_update_ts"), "2026-01-01T00:00:00Z")
+        self.assertEqual(body.get("bridge_last_success_ts"), "2026-01-01T01:00:00Z")
+        self.assertEqual(body.get("bridge_last_cursor"), "cursor-hidden-in-counts")
+        self.assertTrue(body.get("bridge_has_more"))
+        self.assertEqual(body.get("received"), 10)
+        self.assertEqual(body.get("ingested"), 8)
+
+    def test_job_api_exposes_mode_specific_snapshot_fields_legacy(self):
+        client = shiva.app.test_client()
+        job = self._prepare_job("deadbeef9999")
+        job.bridge_mode = "legacy"
+        job.accounting_last_ts = "2026-01-02T00:00:00Z"
+
+        with shiva._BRIDGE_DEBUG_LOCK:
+            shiva._BRIDGE_DEBUG_STATE["last_cursor"] = "legacy-cursor-value"
+            shiva._BRIDGE_DEBUG_STATE["has_more"] = False
+            shiva._BRIDGE_DEBUG_STATE["events_received"] = 77
+            shiva._BRIDGE_DEBUG_STATE["events_ingested"] = 70
+            shiva._BRIDGE_DEBUG_STATE["duplicates_dropped"] = 3
+            shiva._BRIDGE_DEBUG_STATE["job_not_found"] = 2
+
+        resp = client.get(f"/api/job/{job.id}")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+
+        self.assertEqual(body.get("bridge_mode"), "legacy")
+        self.assertEqual(body.get("bridge_last_cursor"), "legacy-cursor-value")
+        self.assertFalse(body.get("bridge_has_more"))
+        self.assertEqual(body.get("received"), 77)
+        self.assertEqual(body.get("ingested"), 70)
+        self.assertEqual(body.get("duplicates_dropped"), 3)
+        self.assertEqual(body.get("job_not_found"), 2)
+
     def test_manual_bridge_pull_response_has_job_totals_and_per_job_details(self):
         old_port = shiva.PMTA_BRIDGE_PULL_PORT
         old_host = os.environ.get("SHIVA_HOST")
