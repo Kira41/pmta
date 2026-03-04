@@ -2684,6 +2684,50 @@ PAGE_FORM = r"""
     }
     .inline-status.show{ display:block; }
     .inline-status b{ color: rgba(255,255,255,.88); }
+
+    .info-wrap{ position:relative; display:inline-flex; align-items:center; margin-inline-start:6px; vertical-align:middle; }
+    .info-dot{
+      width:17px;
+      height:17px;
+      border-radius:999px;
+      border:1px solid rgba(122,167,255,.55);
+      background: rgba(122,167,255,.18);
+      color: rgba(255,255,255,.95);
+      font-size:11px;
+      font-weight:800;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      cursor:help;
+      line-height:1;
+      user-select:none;
+    }
+    .info-tip{
+      position:absolute;
+      bottom: calc(100% + 8px);
+      left: 50%;
+      transform: translateX(-50%) translateY(4px);
+      min-width: 220px;
+      max-width: min(340px, 75vw);
+      padding: 9px 10px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,.2);
+      background: rgba(3,7,17,.96);
+      color: rgba(255,255,255,.92);
+      font-size: 12px;
+      line-height: 1.5;
+      box-shadow: 0 12px 30px rgba(0,0,0,.35);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .12s ease, transform .12s ease;
+      z-index: 30;
+      white-space: normal;
+    }
+    .info-wrap:hover .info-tip,
+    .info-wrap:focus-within .info-tip{
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
   </style>
 </head>
 <body>
@@ -3012,6 +3056,84 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
 
 <script>
   function q(name){ return document.querySelector(`[name="${name}"]`); }
+
+  function labelForElement(el){
+    if(!el) return '';
+    const raw = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    return raw.replace(/^[-•\s]+/, '');
+  }
+
+  function helpTextForElement(el){
+    const txt = labelForElement(el).toLowerCase();
+    const name = (el.getAttribute('name') || '').toLowerCase();
+    const id = (el.id || '').toLowerCase();
+
+    if(id === 'btnstart') return 'يبدأ إنشاء Job جديدة ويرسل الرسائل حسب الإعدادات الحالية.';
+    if(id === 'btntest') return 'يتحقق من الاتصال بخادم SMTP وبيانات الدخول قبل الإرسال الفعلي.';
+    if(id === 'btnpreflight') return 'يفحص الرسالة والإعدادات (DNS/Headers/Spam) قبل البدء.';
+    if(id === 'btnairewrite') return 'يعيد كتابة Subject وBody باستخدام الذكاء الاصطناعي ثم يملأ الحقول.';
+    if(id === 'btndomains') return 'يجلب أحدث حالة للدومينات (MX/SPF/DKIM/DMARC/Blacklist).';
+    if(id === 'domq') return 'ابحث باسم الدومين لتصفية جدول Save Domains بسرعة.';
+
+    if(name === 'smtp_host') return 'عنوان السيرفر SMTP الذي سيتم إرسال الرسائل من خلاله.';
+    if(name === 'smtp_port') return 'رقم منفذ SMTP. اختر المنفذ المتوافق مع نوع التشفير.';
+    if(name === 'smtp_security') return 'يحدد طريقة تشفير الاتصال: STARTTLS أو SSL/TLS أو بدون تشفير.';
+    if(name === 'smtp_timeout') return 'أقصى مدة انتظار قبل اعتبار اتصال SMTP فاشلاً.';
+    if(name === 'smtp_user' || name === 'smtp_pass') return 'بيانات المصادقة لخادم SMTP إذا كان يتطلب تسجيل دخول.';
+    if(name === 'rotate_every' || name === 'chunk_size') return 'التحكم في عدد الرسائل قبل تدوير المرسل أو الروابط.';
+    if(name === 'delay_seconds') return 'فاصل زمني بين الرسائل لتقليل الضغط وتحسين التسليم.';
+    if(name === 'from_name' || name === 'from_email') return 'المرسل الظاهر للمستلم (يمكن إدخال أكثر من قيمة للتدوير).';
+    if(name === 'subject') return 'عنوان الرسالة (يمكن وضع عدة أسطر للتدوير بين الرسائل).';
+    if(name === 'body') return 'محتوى الرسالة الأساسي. يمكنك استخدام المتغيرات مثل [URL] و [SRC].';
+    if(name === 'body_format') return 'تحديد ما إذا كان المحتوى Text عادي أو HTML.';
+    if(name === 'reply_to') return 'العنوان الذي تصل إليه ردود المستلمين عند الضغط على Reply.';
+    if(name === 'score_range') return 'الحد الأعلى لنقاط السبام؛ إذا تجاوزه المحتوى يتم إيقاف الإرسال.';
+    if(name === 'urls_list' || name === 'src_list') return 'قوائم ديناميكية تُستبدل داخل الرسالة لكل Chunk أثناء الإرسال.';
+    if(name === 'recipients' || name === 'recipients_file') return 'قائمة المستلمين أو ملف الاستيراد الذي سيتم الإرسال إليه.';
+    if(name === 'maillist_safe') return 'Whitelist اختيارية: يتم الإرسال فقط للعناوين الموجودة داخلها.';
+    if(name === 'ai_token') return 'مفتاح OpenRouter المطلوب لتفعيل ميزة إعادة الصياغة بالذكاء الاصطناعي.';
+
+    if(txt.includes('jobs')) return 'يفتح صفحة الوظائف السابقة والحالية لهذه الحملة.';
+    if(txt.includes('config')) return 'يفتح صفحة إعدادات الحملة التفصيلية.';
+    if(txt.includes('save domains')) return 'قسم تحليل سمعة الدومينات الخاصة بالمرسلين.';
+    if(txt.includes('recipients')) return 'قسم إدارة وتنظيف مستلمي الحملة.';
+
+    const clean = labelForElement(el);
+    if(!clean) return '';
+    return `شرح سريع: ${clean} — هذا العنصر يتحكم في هذا الجزء من عملية الإرسال.`;
+  }
+
+  function addHelpIcons(){
+    const targets = document.querySelectorAll(
+      '#mainForm label, #mainForm .btn, #mainForm .mini, #domainsCard h2, #domainsCard th, #domainsCard .mini, #domainsCard .btn, #domainsCard #domQ, .top h1, .top .badge'
+    );
+    targets.forEach((el) => {
+      if(el.classList.contains('info-processed')) return;
+      const tip = helpTextForElement(el);
+      if(!tip) return;
+
+      const wrap = document.createElement('span');
+      wrap.className = 'info-wrap';
+      const dot = document.createElement('span');
+      dot.className = 'info-dot';
+      dot.setAttribute('tabindex', '0');
+      dot.setAttribute('role', 'button');
+      dot.setAttribute('aria-label', `معلومة: ${tip}`);
+      dot.textContent = 'i';
+      const bubble = document.createElement('span');
+      bubble.className = 'info-tip';
+      bubble.textContent = tip;
+      wrap.appendChild(dot);
+      wrap.appendChild(bubble);
+
+      if(el.matches('input, textarea, select')){
+        el.insertAdjacentElement('afterend', wrap);
+      } else {
+        el.appendChild(wrap);
+      }
+      el.classList.add('info-processed');
+    });
+  }
 
   // -------------------------
   // Persist form values (SQLite via server API)
@@ -3699,6 +3821,8 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
     sync();
     scoreEl.addEventListener('input', sync);
   }
+
+  addHelpIcons();
 </script>
 </body>
 </html>
