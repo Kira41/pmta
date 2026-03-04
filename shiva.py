@@ -3419,6 +3419,14 @@ PAGE_JOBS = r"""
     .panel{border:1px solid rgba(255,255,255,.10); background: rgba(0,0,0,.10); border-radius: 14px; padding: 10px 12px;}
     .panel h4{margin:0 0 8px; font-size: 13px; color: rgba(255,255,255,.86)}
 
+    .quickIssues{margin-top:10px; font-size:12px; color:var(--warn);}
+    .quickIssues:empty{display:none;}
+    .more{margin-top:10px;}
+    .more > summary{cursor:pointer; user-select:none; font-weight:800; color:rgba(255,255,255,.88);}
+    .moreBlock{margin-top:10px;}
+    .errorFold{margin-top:8px;}
+    .errorFold summary{cursor:pointer; color:rgba(255,255,255,.75); font-size:12px;}
+
     /* PMTA Live Panel (Jobs) — clearer layout */
     .pmtaLive{ margin-top:10px; }
     .pmtaGrid{ display:grid; grid-template-columns: repeat(7, minmax(0,1fr)); gap:10px; }
@@ -3655,29 +3663,31 @@ PAGE_JOBS = r"""
           </div>
         </div>
 
-        <!-- 2) Current chunk + 3) backoff info -->
-        <div class="twoCol">
-          <div class="panel">
-            <h4>Current chunk</h4>
-            <div class="mini" data-k="chunkLine">—</div>
-            <div class="mini" data-k="chunkDomains">—</div>
-          </div>
-          <div class="panel">
-            <h4>Backoff</h4>
-            <div class="mini" data-k="backoffLine">—</div>
-          </div>
-        </div>
-
-        <div class="panel" style="margin-top:10px">
-          <h4>PMTA Live Panel</h4>
-          <div class="pmtaLive" data-k="pmtaLine">—</div>
-          <div class="mini" style="margin-top:6px" data-k="pmtaNote">Note: <b>sent</b> = accepted by PMTA (client-side). Delivery may still be queued/deferred.</div>
-          <div class="mini" style="margin-top:6px" data-k="pmtaDiag">Diag: —</div>
-        </div>
+        <div class="quickIssues" data-k="quickIssues"></div>
 
         <details class="more">
           <summary>More details</summary>
-          <div class="moreGrid">
+          <div class="moreBlock twoCol">
+            <!-- 2) Current chunk + 3) backoff info -->
+            <div class="panel">
+              <h4>Current chunk</h4>
+              <div class="mini" data-k="chunkLine">—</div>
+              <div class="mini" data-k="chunkDomains">—</div>
+            </div>
+            <div class="panel">
+              <h4>Backoff</h4>
+              <div class="mini" data-k="backoffLine">—</div>
+            </div>
+          </div>
+
+          <div class="panel moreBlock">
+            <h4>PMTA Live Panel</h4>
+            <div class="pmtaLive" data-k="pmtaLine">—</div>
+            <div class="mini" style="margin-top:6px" data-k="pmtaNote">Note: <b>sent</b> = accepted by PMTA (client-side). Delivery may still be queued/deferred.</div>
+            <div class="mini" style="margin-top:6px" data-k="pmtaDiag">Diag: —</div>
+          </div>
+
+          <div class="moreGrid moreBlock">
 
             <!-- 5) Top domains -->
             <div class="panel">
@@ -3709,17 +3719,20 @@ PAGE_JOBS = r"""
               <div class="mini"><b>Error 1 (summary)</b></div>
               <div class="mini" data-k="lastErrors">—</div>
 
-              <div style="height:10px"></div>
-              <div class="mini"><b>Error 2 (details)</b></div>
-              <div class="mini" data-k="lastErrors2">—</div>
+              <details class="errorFold">
+                <summary>Error 2 (details)</summary>
+                <div class="mini" style="margin-top:8px" data-k="lastErrors2">—</div>
+              </details>
 
-              <div style="height:10px"></div>
-              <div class="mini"><b>Internal errors (local network only)</b></div>
-              <div class="mini" data-k="internalErrors">—</div>
+              <details class="errorFold">
+                <summary>Internal errors (local network only)</summary>
+                <div class="mini" style="margin-top:8px" data-k="internalErrors">—</div>
+              </details>
 
-              <div style="height:10px"></div>
-              <div class="mini"><b>Last connection review (Shiva bridge)</b></div>
-              <div class="mini" data-k="bridgeReceiver">—</div>
+              <details class="errorFold">
+                <summary>Last connection review (Shiva bridge)</summary>
+                <div class="mini" style="margin-top:8px" data-k="bridgeReceiver">—</div>
+              </details>
             </div>
 
           </div>
@@ -4652,7 +4665,17 @@ This will remove it from Jobs history.`);
     if(done >= 20 && failRatio >= 0.1) alerts.push('⚠ high fail rate');
     if(nearSpam) alerts.push('⚠ spam near limit');
 
-    alertsEl.textContent = alerts.length ? ('Alerts: ' + alerts.join(' · ')) : 'Alerts: —';
+    const quickEl = qk(card,'quickIssues');
+    if(alerts.length){
+      const txt = 'Quick issues: ' + alerts.join(' · ');
+      alertsEl.textContent = txt;
+      alertsEl.style.display = '';
+      if(quickEl) quickEl.textContent = txt;
+    }else{
+      alertsEl.textContent = '';
+      alertsEl.style.display = 'none';
+      if(quickEl) quickEl.textContent = '';
+    }
 
     // Notifications
     const pm = j.pmta_live || null;
@@ -4782,8 +4805,26 @@ This will remove it from Jobs history.`);
     });
   }
 
+  function bindDetailState(card){
+    const jobId = card.dataset.jobid;
+    const more = card.querySelector('details.more');
+    if(!jobId || !more) return;
+    const storageKey = `jobs-more-${jobId}`;
+    try{
+      if(sessionStorage.getItem(storageKey) === '1'){
+        more.open = true;
+      }
+    }catch(e){ /* ignore */ }
+    more.addEventListener('toggle', () => {
+      try{
+        sessionStorage.setItem(storageKey, more.open ? '1' : '0');
+      }catch(e){ /* ignore */ }
+    });
+  }
+
   const cards = Array.from(document.querySelectorAll('.job[data-jobid]'));
   cards.forEach(bindControls);
+  cards.forEach(bindDetailState);
 
   async function tickAll(){
     for(const c of cards){
