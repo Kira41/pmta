@@ -3372,6 +3372,27 @@ PAGE_JOBS = r"""
     .pill.bad{border-color: rgba(255,94,115,.35); color: var(--bad); font-weight:900}
     .pill.warn{border-color: rgba(255,193,77,.35); color: var(--warn); font-weight:900}
 
+    .triageRow{display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-top:8px; max-width:100%;}
+    .triageBadge{
+      display:inline-flex;
+      align-items:center;
+      max-width:100%;
+      border:1px solid rgba(255,255,255,.14);
+      background:rgba(255,255,255,.06);
+      border-radius:999px;
+      padding:4px 9px;
+      font-size:11px;
+      font-weight:800;
+      line-height:1.2;
+      color:rgba(255,255,255,.88);
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+    .triageBadge.good{border-color: rgba(53,228,154,.35); color: var(--good);}
+    .triageBadge.warn{border-color: rgba(255,193,77,.35); color: var(--warn);}
+    .triageBadge.bad{border-color: rgba(255,94,115,.35); color: var(--bad);}
+
     .grid{display:grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap:10px; margin-top:12px;}
     @media (max-width: 1050px){ .grid{grid-template-columns: 1fr 1fr;} }
     @media (max-width: 560px){ .grid{grid-template-columns: 1fr;} }
@@ -3571,6 +3592,13 @@ PAGE_JOBS = r"""
               <div class="pill" data-k="speed">0 epm</div>
               <div class="pill" data-k="eta">ETA —</div>
             </div>
+            <div class="triageRow">
+              <div class="triageBadge" data-k="badgeMode">—</div>
+              <div class="triageBadge" data-k="badgeFreshness">—</div>
+              <div class="triageBadge" data-k="badgeHealth">—</div>
+              <div class="triageBadge" data-k="badgeRisk">—</div>
+              <div class="triageBadge" data-k="badgeIntegrity" style="display:none">INTEGRITY</div>
+            </div>
             <div class="mini">Created: <span class="muted">{{j.created_at}}</span></div>
             <div class="mini" data-k="alerts">—</div>
           </div>
@@ -3752,6 +3780,127 @@ PAGE_JOBS = r"""
     if(h > 0) return `ETA ${h}h ${m}m`;
     if(m > 0) return `ETA ${m}m ${ss}s`;
     return `ETA ${ss}s`;
+  }
+
+  function tsToMs(ts){
+    const s = (ts || '').toString().trim();
+    if(!s) return null;
+    const n = Date.parse(s);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function ageMin(ts){
+    const ms = tsToMs(ts);
+    if(ms === null) return null;
+    return Math.max(0, Math.floor((Date.now() - ms) / 60000));
+  }
+
+  function riskBadgeClass(level){
+    const lv = (level || '').toString().toLowerCase();
+    if(lv === 'low') return 'triageBadge good';
+    if(lv === 'med') return 'triageBadge warn';
+    if(lv === 'high') return 'triageBadge bad';
+    return 'triageBadge';
+  }
+
+  function healthBadgeClass(ok){
+    if(ok === true) return 'triageBadge good';
+    if(ok === false) return 'triageBadge bad';
+    return 'triageBadge';
+  }
+
+  function computeDeliverabilityRisk(j){
+    const sent = Number(j.sent || 0);
+    const delivered = Number(j.delivered || 0);
+    const bounced = Number(j.bounced || 0);
+    const complained = Number(j.complained || 0);
+    const deferred = Number(j.deferred || 0);
+    if(sent <= 0) return '—';
+    const bRate = bounced / sent;
+    const cRate = complained / sent;
+    const dRate = deferred / sent;
+    if(bRate >= 0.12 || cRate >= 0.01 || (delivered <= 0 && sent >= 30)) return 'HIGH';
+    if(bRate >= 0.05 || cRate >= 0.003 || dRate >= 0.2) return 'MED';
+    return 'LOW';
+  }
+
+  function renderTriageBadges(card, j){
+    const modeRaw = (j.bridge_mode || '—').toString().trim().toLowerCase();
+    const isCounts = modeRaw === 'counts';
+    const isLegacy = modeRaw === 'legacy';
+
+    const modeEl = qk(card, 'badgeMode');
+    if(modeEl){
+      modeEl.textContent = isCounts ? 'COUNTS' : (isLegacy ? 'LEGACY' : '—');
+      modeEl.className = 'triageBadge';
+    }
+
+    const freshEl = qk(card, 'badgeFreshness');
+    if(freshEl){
+      let txt = '—';
+      let cls = 'triageBadge';
+      if(isCounts){
+        const mins = ageMin(j.accounting_last_update_ts || j.accounting_last_ts);
+        if(mins === null){
+          txt = 'acct: —';
+        }else if(mins > 10){
+          txt = `STALE: ${mins}m`;
+          cls = 'triageBadge warn';
+        }else{
+          txt = `acct: ${mins}m ago`;
+          cls = 'triageBadge good';
+        }
+      }else if(isLegacy){
+        const lagSecRaw = Number(j.ingestion_lag_seconds);
+        const mins = Number.isFinite(lagSecRaw) && lagSecRaw >= 0
+          ? Math.floor(lagSecRaw / 60)
+          : ageMin(j.ingestion_last_event_ts || j.accounting_last_ts);
+        if(mins === null){
+          txt = 'lag: —';
+        }else if(mins <= 1){
+          txt = 'caught up';
+          cls = 'triageBadge good';
+        }else{
+          txt = `lag: ${mins}m`;
+          cls = mins > 15 ? 'triageBadge warn' : 'triageBadge';
+        }
+      }
+      freshEl.textContent = txt;
+      freshEl.className = cls;
+    }
+
+    const failureCount = Number(j.bridge_failure_count);
+    const failN = Number.isFinite(failureCount) ? failureCount : Number(j.internal_health_failures || 0);
+    const healthEl = qk(card, 'badgeHealth');
+    if(healthEl){
+      const known = Number.isFinite(failN);
+      const ok = known ? failN <= 0 : null;
+      healthEl.className = healthBadgeClass(ok);
+      if(known){
+        healthEl.textContent = ok ? 'OK (0)' : `DEGRADED (${Math.max(0, Math.floor(failN))})`;
+      }else{
+        healthEl.textContent = '—';
+      }
+    }
+
+    const risk = computeDeliverabilityRisk(j);
+    const riskEl = qk(card, 'badgeRisk');
+    if(riskEl){
+      riskEl.className = riskBadgeClass(risk);
+      riskEl.textContent = `RISK ${risk}`;
+    }
+
+    const dup = Number(j.duplicates_dropped || 0);
+    const jnf = Number(j.job_not_found || 0);
+    const dbf = Number(j.db_write_failures || 0);
+    const miss = Number(j.missing_fields || 0);
+    const hasIntegrity = (dup + jnf + dbf + miss) > 0;
+    const intEl = qk(card, 'badgeIntegrity');
+    if(intEl){
+      intEl.style.display = hasIntegrity ? 'inline-flex' : 'none';
+      intEl.className = hasIntegrity ? 'triageBadge bad' : 'triageBadge';
+      intEl.textContent = hasIntegrity ? `INTEGRITY (${dup + jnf + dbf + miss})` : 'INTEGRITY';
+    }
   }
 
   function statusPillClass(st){
@@ -4082,6 +4231,8 @@ This will remove it from Jobs history.`);
       etaEl.className = 'pill';
       etaEl.textContent = fmtEta(j.eta_s);
     }
+
+    renderTriageBadges(card, j);
 
     // Core counters
     qk(card,'total').textContent = j.total || 0;
@@ -10555,6 +10706,9 @@ def job_api(job_id: str):
         if (not job) or getattr(job, 'deleted', False):
             return jsonify({"error": "not found"}), 404
 
+        with _BRIDGE_DEBUG_LOCK:
+            bridge_state = dict(_BRIDGE_DEBUG_STATE)
+
         # Dashboard/API outcome counters must come from SQLite (source of truth).
         _sync_job_outcome_counters_from_db(job)
 
@@ -10632,6 +10786,17 @@ def job_api(job_id: str):
                 "recent_page_size": recent_page_size,
                 "recent_total": total_recent,
                 "recent_total_pages": recent_total_pages,
+                "bridge_mode": str(BRIDGE_MODE or "counts"),
+                "accounting_last_update_ts": job.accounting_last_ts,
+                "bridge_last_success_ts": str(bridge_state.get("last_success_ts") or ""),
+                "bridge_failure_count": int(bridge_state.get("failure_count") or 0),
+                "bridge_last_error_message": str(bridge_state.get("last_error_message") or ""),
+                "ingestion_last_event_ts": job.accounting_last_ts,
+                "ingestion_lag_seconds": None,
+                "duplicates_dropped": int(bridge_state.get("duplicates_dropped") or 0),
+                "job_not_found": int(bridge_state.get("job_not_found") or 0),
+                "db_write_failures": int(bridge_state.get("db_write_failures") or 0),
+                "missing_fields": int(bridge_state.get("missing_fields") or 0),
             }
         )
 
