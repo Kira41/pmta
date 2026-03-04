@@ -3724,7 +3724,7 @@ PAGE_JOBS = r"""
           </div>
           <details class="qualityMini">
             <summary>Quality</summary>
-            <div class="qualityLine">Failed: <span data-k="failed">—</span> · Skipped: <span data-k="skipped">—</span> · Invalid: <span data-k="invalid">—</span> · Total: <span data-k="total">—</span></div>
+            <div class="qualityLine">Final-fail: <span data-k="failed">—</span> · Skipped: <span data-k="skipped">—</span> · Invalid: <span data-k="invalid">—</span> · Total: <span data-k="total">—</span></div>
           </details>
         </div>
 
@@ -3769,7 +3769,7 @@ PAGE_JOBS = r"""
 
             <!-- 5) Top domains -->
             <div class="panel">
-              <h4>Top domains (Top 10)</h4>
+              <h4 data-k="domainsPanelTitle">Top domains (Top 10)</h4>
               <div class="mini" data-k="topDomains">—</div>
               <div class="mini" style="margin-top:10px"><b>Domain progress (bars)</b></div>
               <div data-k="topDomainsBars"></div>
@@ -4097,14 +4097,103 @@ This will remove it from Jobs history.`);
       return {dom, pp, ss, ff, done, pct: pct(done, pp), active: (dom in currDom)};
     }).sort((a,b)=>b.pp - a.pp).slice(0,10);
 
+    const totalRecipients = Number(j.total || 0);
+    const domainsCount = Object.keys(plan).length;
+    const showProviders = (totalRecipients <= 50) || (domainsCount <= 5);
+
+    const titleEl = qk(card, 'domainsPanelTitle');
     const elLine = qk(card,'topDomains');
     const elBars = qk(card,'topDomainsBars');
+    const barsLabelEl = elBars ? elBars.previousElementSibling : null;
+
+    function providerForDomain(dom){
+      const d = (dom || '').toString().trim().toLowerCase();
+      if(!d) return 'Other';
+
+      if(
+        d === 'gmail.com' || d.endsWith('.gmail.com') ||
+        d === 'googlemail.com' || d.endsWith('.googlemail.com')
+      ) return 'Gmail';
+
+      if(
+        d === 'yahoo.com' || d.endsWith('.yahoo.com') ||
+        d.endsWith('.yahoo.co.jp') ||
+        d === 'ymail.com' || d.endsWith('.ymail.com') ||
+        d === 'rocketmail.com' || d.endsWith('.rocketmail.com') ||
+        d === 'yahoo.co.jp'
+      ) return 'Yahoo';
+
+      if(
+        d === 'outlook.com' || d.endsWith('.outlook.com') ||
+        d === 'hotmail.com' || d.endsWith('.hotmail.com') ||
+        d === 'live.com' || d.endsWith('.live.com') ||
+        d === 'msn.com' || d.endsWith('.msn.com') ||
+        d === 'passport.com' || d.endsWith('.passport.com')
+      ) return 'Outlook';
+
+      if(
+        d === 'icloud.com' || d.endsWith('.icloud.com') ||
+        d === 'me.com' || d.endsWith('.me.com') ||
+        d === 'mac.com' || d.endsWith('.mac.com')
+      ) return 'iCloud';
+
+      return 'Other';
+    }
+
+    function renderProviderBreakdown(){
+      const buckets = {Gmail: 0, Yahoo: 0, Outlook: 0, iCloud: 0, Other: 0};
+      const hasPlan = Object.keys(plan).length > 0;
+      if(!hasPlan){
+        if(elLine) elLine.textContent = '—';
+        if(elBars) elBars.innerHTML = '';
+        if(titleEl) titleEl.textContent = 'Top providers';
+        if(barsLabelEl) barsLabelEl.style.display = 'none';
+        return;
+      }
+
+      for(const [dom, rawCount] of Object.entries(plan)){
+        const cnt = Number(rawCount || 0);
+        const provider = providerForDomain(dom);
+        buckets[provider] = Number(buckets[provider] || 0) + Math.max(0, cnt);
+      }
+      const ordered = ['Gmail', 'Yahoo', 'Outlook', 'iCloud', 'Other'].map(name => ({
+        name,
+        count: Number(buckets[name] || 0)
+      }));
+
+      if(titleEl) titleEl.textContent = 'Top providers';
+      if(barsLabelEl) barsLabelEl.style.display = 'none';
+
+      if(elLine){
+        elLine.innerHTML = ordered.map(x => `${x.name}: <b>${x.count}</b>`).join(' · ');
+      }
+      if(elBars){
+        const maxCount = Math.max(1, ...ordered.map(x => x.count));
+        elBars.innerHTML = ordered.map(x => {
+          const width = Math.round((x.count / maxCount) * 100);
+          return `<div style="margin-top:10px">`+
+            `<div class="mini"><b>${x.name}</b> · ${x.count}</div>`+
+            `<div class="smallBar"><div style="width:${width}%"></div></div>`+
+          `</div>`;
+        }).join('');
+      }
+    }
 
     if(!entries.length){
       if(elLine) elLine.textContent = '—';
       if(elBars) elBars.innerHTML = '';
+      if(titleEl) titleEl.textContent = showProviders ? 'Top providers' : 'Top domains (Top 10)';
+      if(barsLabelEl) barsLabelEl.style.display = showProviders ? 'none' : '';
       return;
     }
+
+    if(showProviders){
+      renderProviderBreakdown();
+      return;
+    }
+
+    if(titleEl) titleEl.textContent = 'Top domains (Top 10)';
+    if(barsLabelEl) barsLabelEl.style.display = '';
 
     if(elLine){
       elLine.innerHTML = entries.map(x => {
@@ -4114,7 +4203,7 @@ This will remove it from Jobs history.`);
         const d = (pm && pm.deferred !== undefined && pm.deferred !== null) ? pm.deferred : '—';
         const a = (pm && pm.active !== undefined && pm.active !== null) ? pm.active : '—';
         const pmInfo = (pmtaOk && (x.dom in pmtaMap)) ? ` · pmta(q=${q} def=${d} act=${a})` : '';
-        return `${esc(x.dom)}: <span class="ok">${x.ss}</span>/<b>${x.pp}</b> (fail <span class="no">${x.ff}</span>)${flag}${pmInfo}`;
+        return `${esc(x.dom)}: <span class="ok">${x.ss}</span>/<b>${x.pp}</b> (final-fail <span class="no">${x.ff}</span>)${flag}${pmInfo}`;
       }).join('<br>');
     }
 
