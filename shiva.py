@@ -111,6 +111,26 @@ _MX_CACHE_EXPIRES_AT: Dict[str, float] = {}
 MX_CACHE_TTL_OK = 3600.0
 MX_CACHE_TTL_SOFT_FAIL = 120.0
 
+# DNS TXT fallback endpoints (free public DNS-over-HTTPS APIs)
+DNS_TXT_DOH_ENDPOINTS = (
+    "https://dns.google/resolve",
+    "https://cloudflare-dns.com/dns-query",
+)
+
+# Common DKIM selectors used by mainstream ESPs and default mail setups.
+# We only use this list as a best-effort fallback when no selector is configured.
+COMMON_DKIM_SELECTORS = (
+    "default",
+    "selector1",
+    "selector2",
+    "google",
+    "k1",
+    "s1",
+    "s2",
+    "dkim",
+    "mail",
+)
+
 # =========================
 # Safety / Validation
 # =========================
@@ -7769,7 +7789,51 @@ def _dns_txt_lookup(name: str) -> dict:
                 records.append(txt)
         return {"ok": True, "records": records[:12], "error": ""}
     except Exception as e:
-        return {"ok": False, "records": [], "error": str(e)[:180]}
+        fallback = _dns_txt_lookup_doh(q)
+        if fallback.get("ok"):
+            return fallback
+        base_error = str(e)[:180]
+        fb_error = str(fallback.get("error") or "")[:180]
+        combined = f"{base_error}; doh={fb_error}" if fb_error else base_error
+        return {"ok": False, "records": [], "error": combined}
+
+
+def _dns_txt_lookup_doh(name: str) -> dict:
+    q = (name or "").strip().lower().strip(".")
+    if not q:
+        return {"ok": False, "records": [], "error": "empty"}
+
+    headers = {
+        "accept": "application/dns-json, application/json",
+        "user-agent": "shiva-dns-check/1.0",
+    }
+    last_error = ""
+    for endpoint in DNS_TXT_DOH_ENDPOINTS:
+        try:
+            url = f"{endpoint}?name={quote_plus(q)}&type=TXT"
+            req = Request(url, headers=headers)
+            with urlopen(req, timeout=4) as resp:
+                raw = resp.read()
+            payload = json.loads(raw.decode("utf-8", errors="ignore") or "{}")
+            answers = payload.get("Answer") or []
+            records: List[str] = []
+            for item in answers:
+                data = str((item or {}).get("data") or "").strip()
+                if not data:
+                    continue
+                data = data.strip('"')
+                if data:
+                    records.append(data)
+            if records:
+                return {"ok": True, "records": records[:12], "error": ""}
+
+            status = int(payload.get("Status", -1)) if str(payload.get("Status", "")).isdigit() else -1
+            if status in (0, 3):
+                return {"ok": True, "records": [], "error": ""}
+            last_error = f"doh_status_{status}"
+        except Exception as e:
+            last_error = str(e)[:180]
+    return {"ok": False, "records": [], "error": (last_error or "doh_failed")}
 
 
 def _dkim_selectors_from_env() -> List[str]:
@@ -7787,10 +7851,17 @@ def _dkim_selectors_from_env() -> List[str]:
     return out
 
 
+def _dkim_selectors_for_domain() -> List[str]:
+    configured = _dkim_selectors_from_env()
+    if configured:
+        return configured
+    return list(COMMON_DKIM_SELECTORS)
+
+
 def compute_sender_domain_states(domain_counts: Dict[str, int]) -> List[dict]:
     """Domain States = sender domains used for sending (from-address domains)."""
     out_items: List[dict] = []
-    selectors = _dkim_selectors_from_env()
+    selectors = _dkim_selectors_for_domain()
     domains_sorted = sorted((domain_counts or {}).items(), key=lambda x: x[1], reverse=True)
 
     for dom, cnt in domains_sorted:
