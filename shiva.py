@@ -7605,7 +7605,8 @@ PAGE_JOBS = r"""
 
           <!-- 8) Preflight history per chunk -->
           <div class="panel" style="margin-top:10px">
-            <h4>Chunk preflight history (last 12)</h4>
+            <h4>Chunk preflight</h4>
+            <div class="mini" style="margin-top:6px"><b>Active / Live chunk</b></div>
             <div style="overflow:auto; margin-top:8px">
               <table>
                 <thead>
@@ -7613,6 +7614,26 @@ PAGE_JOBS = r"""
                     <th>Chunk</th>
                     <th>Status</th>
                     <th>Size</th>
+                    <th>Sender mail</th>
+                    <th>Receiver domain</th>
+                    <th>Spam</th>
+                    <th>Blacklist</th>
+                  </tr>
+                </thead>
+                <tbody data-k="chunkLive"></tbody>
+              </table>
+            </div>
+
+            <div class="mini" style="margin-top:10px"><b>History chunk (last 12)</b></div>
+            <div style="overflow:auto; margin-top:8px">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Chunk</th>
+                    <th>Status</th>
+                    <th>Size</th>
+                    <th>Sender mail</th>
+                    <th>Receiver domain</th>
                     <th>Spam</th>
                     <th>Blacklist</th>
                     <th>Attempt</th>
@@ -8434,13 +8455,16 @@ This will remove it from Jobs history.`);
     if(!tb) return;
     const cs = (j.chunk_states || []).slice().reverse().slice(0,12);
     if(!cs.length){
-      tb.innerHTML = `<tr><td colspan="8" class="mini">No chunk states yet.</td></tr>`;
+      tb.innerHTML = `<tr><td colspan="10" class="mini">No chunk states yet.</td></tr>`;
       return;
     }
     tb.innerHTML = cs.map(x => {
       const next = x.next_retry_ts ? new Date(Number(x.next_retry_ts)*1000).toLocaleTimeString() : '';
       const bl = (x.blacklist || '').toString();
       const blShort = bl.length > 30 ? (bl.slice(0,30) + '…') : bl;
+      const sender = (x.sender || '').toString();
+      const senderShort = sender.length > 30 ? (sender.slice(0,30) + '…') : sender;
+      const receiverDomain = (x.target_domain || x.provider_domain || '').toString();
       const spam = (x.spam_score === null || x.spam_score === undefined) ? '' : Number(x.spam_score).toFixed(2);
       const reason = (x.reason || '').toString();
       const reasonShort = reason.length > 40 ? (reason.slice(0,40) + '…') : reason;
@@ -8449,6 +8473,8 @@ This will remove it from Jobs history.`);
         `<td>${Number(x.chunk)+1}</td>`+
         `<td>${esc(x.status || '')}</td>`+
         `<td>${Number(x.size||0)}</td>`+
+        `<td title="${esc(sender)}">${esc(senderShort)}</td>`+
+        `<td>${esc(receiverDomain)}</td>`+
         `<td>${esc(spam)}</td>`+
         `<td title="${esc(bl)}">${esc(blShort)}</td>`+
         `<td>${esc(String(x.attempt ?? ''))}</td>`+
@@ -8456,6 +8482,33 @@ This will remove it from Jobs history.`);
         `<td title="${esc(reason)}">${esc(reasonShort)}</td>`+
       `</tr>`;
     }).join('');
+  }
+
+  function renderChunkLive(card, j){
+    const tb = qk(card,'chunkLive');
+    if(!tb) return;
+    const ci = j.current_chunk_info || {};
+    const hasChunk = (ci && ci.chunk !== undefined && ci.chunk !== null && Number(ci.size || 0) > 0);
+    if(!hasChunk){
+      tb.innerHTML = `<tr><td colspan="7" class="mini">No active chunk right now.</td></tr>`;
+      return;
+    }
+    const sender = (ci.sender || '').toString();
+    const senderShort = sender.length > 30 ? (sender.slice(0,30) + '…') : sender;
+    const receiverDomain = (ci.target_domain || '').toString();
+    const spam = (ci.spam_score === null || ci.spam_score === undefined) ? '—' : Number(ci.spam_score).toFixed(2);
+    const bl = (ci.blacklist || '').toString();
+    const blShort = bl.length > 30 ? (bl.slice(0,30) + '…') : bl;
+    const status = ((j.status || '').toString().toLowerCase() === 'backoff') ? 'backoff' : 'running';
+    tb.innerHTML = `<tr>`+
+      `<td>${Number(ci.chunk)+1}</td>`+
+      `<td>${esc(status)}</td>`+
+      `<td>${Number(ci.size||0)}</td>`+
+      `<td title="${esc(sender)}">${esc(senderShort || '—')}</td>`+
+      `<td>${esc(receiverDomain || '—')}</td>`+
+      `<td>${esc(spam)}</td>`+
+      `<td title="${esc(bl)}">${esc(blShort || '—')}</td>`+
+    `</tr>`;
   }
 
   function updateCard(card, j){
@@ -8914,6 +8967,7 @@ This will remove it from Jobs history.`);
     renderIssueBlocks(card, j);
 
     // 8) Chunk history
+    renderChunkLive(card, j);
     renderChunkHist(card, j);
 
     // 10) Alerts (simple)
@@ -16753,6 +16807,7 @@ def smtp_send_job(
                             "attempt": attempt,
                             "next_retry_ts": 0,
                             "reason": "all_sender_domains_exhausted",
+                            "target_domain": target_domain,
                         })
                         job.log("ERROR", f"Chunk {chunk_idx_local+1} [{target_domain}]: ABANDONED after exhausting all sender domains.")
                     db_finalize_email_learning(
@@ -16918,6 +16973,7 @@ def smtp_send_job(
                                 "attempt": attempt,
                                 "next_retry_ts": 0,
                                 "reason": "all_sender_domains_exhausted",
+                                "target_domain": target_domain,
                             })
                             job.log("ERROR", f"Chunk {chunk_idx_local+1} [{target_domain}]: ABANDONED after exhausting sender domains ({rtxt})")
                         db_finalize_email_learning(
@@ -16976,7 +17032,7 @@ def smtp_send_job(
                         job.status = "backoff"
                         job.chunks_backoff += 1
                         job.push_backoff(entry)
-                        job.push_chunk_state({**entry, "status": "backoff"})
+                        job.push_chunk_state({**entry, "status": "backoff", "target_domain": target_domain})
                     msg = (
                         f"Chunk {chunk_idx_local+1} [{target_domain}]: BACKOFF retry#{attempt} "
                         f"wait={int(wait_s)}s type={failure_type} ({rtxt}) trend={recommendation.get('provider_trend','unknown')}"
@@ -17049,6 +17105,7 @@ def smtp_send_job(
                         "attempt": attempt,
                         "next_retry_ts": 0,
                         "reason": "",
+                        "target_domain": target_domain,
                     })
                     job.log("INFO", f"Chunk {chunk_idx_local+1} [{target_domain}]: sending size={len(chunk)} sender={fe} workers={workers2}")
 
@@ -17148,6 +17205,7 @@ def smtp_send_job(
                         "attempt": attempt,
                         "next_retry_ts": 0,
                         "reason": "",
+                        "target_domain": target_domain,
                     })
                 _lane_metrics_export_snapshot()
                 chunk_finished = True
