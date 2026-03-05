@@ -7076,12 +7076,17 @@ PAGE_JOBS = r"""
     .filterToggleBtn{
       position: fixed;
       top: 86px;
-      right: 18px;
+      right: -34px;
       z-index: 45;
-      border-radius: 999px;
-      padding: 11px 14px;
+      border-radius: 999px 0 0 999px;
+      padding: 11px 16px 11px 12px;
       box-shadow: var(--shadow);
+      background: rgba(10,16,34,.95);
+      border: 1px solid rgba(255,255,255,.24);
+      border-right: 0;
+      transition: right .2s ease;
     }
+    body.filterMenuOpen .filterToggleBtn{ right: 14px; border-radius: 999px; border-right:1px solid rgba(255,255,255,.24); }
 
     .filterDrawerBackdrop{
       position: fixed;
@@ -7472,7 +7477,7 @@ PAGE_JOBS = r"""
       </div>
     </div>
 
-    <button class="btn secondary filterToggleBtn" type="button" id="btnToggleFilters">🧰 Filters</button>
+    <button class="btn secondary filterToggleBtn" type="button" id="btnToggleFilters">🎛️ Filters</button>
     <div class="filterDrawerBackdrop" id="jobsFilterBackdrop"></div>
     <aside class="filterDrawer" id="jobsFilterDrawer" aria-hidden="true">
       <div class="filterBar" id="jobsFilterBar">
@@ -7484,7 +7489,7 @@ PAGE_JOBS = r"""
             <option value="done">done</option>
             <option value="paused">paused</option>
             <option value="backoff">backoff</option>
-            <option value="stop">stop</option>
+            <option value="stop">stopped</option>
           </select>
         </div>
         <div class="filterCell">
