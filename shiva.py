@@ -1123,10 +1123,8 @@ class PolicyPackLoader:
 
     @staticmethod
     def _i(v: Any, default: int, min_v: int, max_v: int) -> int:
-        try:
-            out = int(v)
-        except Exception:
-            out = int(default)
+        out = _coerce_scalar_number(v, as_type="int", default=default)
+        out = _coerce_scalar_number(out, as_type="int", default=default)
         return max(min_v, min(max_v, out))
 
     @classmethod
@@ -1241,10 +1239,15 @@ class PolicyPackApplier:
             if not pset:
                 continue
             if budget_config is not None:
-                cur_max = int((budget_config.provider_max_inflight_map or {}).get(provider_key, budget_config.provider_max_inflight_default))
+                cur_max = _coerce_scalar_number(
+                    (budget_config.provider_max_inflight_map or {}).get(provider_key, budget_config.provider_max_inflight_default),
+                    as_type="int",
+                    default=budget_config.provider_max_inflight_default,
+                )
                 cur_gap = float((budget_config.provider_min_gap_s_map or {}).get(provider_key, budget_config.provider_min_gap_s_default))
                 cur_cd = float((budget_config.provider_cooldown_s_map or {}).get(provider_key, budget_config.provider_cooldown_s_default))
-                budget_config.provider_max_inflight_map[provider_key] = min(int(cur_max), int(pset.get("max_inflight", cur_max)))
+                pset_max_inflight = _coerce_scalar_number(pset.get("max_inflight", cur_max), as_type="int", default=cur_max)
+                budget_config.provider_max_inflight_map[provider_key] = min(int(cur_max), int(pset_max_inflight))
                 budget_config.provider_min_gap_s_map[provider_key] = max(float(cur_gap), float(pset.get("min_gap_s", cur_gap)))
                 budget_config.provider_cooldown_s_map[provider_key] = max(float(cur_cd), float(pset.get("cooldown_s", cur_cd)))
                 applied["budget_manager"][provider_key] = {
@@ -1256,9 +1259,13 @@ class PolicyPackApplier:
             caps_clamps = job_context.setdefault("policy_pack_caps_clamps", {})
             lane_clamp = dict(caps_clamps.get(provider_key) or {})
             if pset.get("chunk_cap") is not None:
-                lane_clamp["chunk_size_cap"] = min(int(lane_clamp.get("chunk_size_cap") or 50000), int(pset.get("chunk_cap") or 50000))
+                lane_chunk_cap = _coerce_scalar_number(lane_clamp.get("chunk_size_cap") or 50000, as_type="int", default=50000)
+                pset_chunk_cap = _coerce_scalar_number(pset.get("chunk_cap") or 50000, as_type="int", default=50000)
+                lane_clamp["chunk_size_cap"] = min(int(lane_chunk_cap), int(pset_chunk_cap))
             if pset.get("workers_cap") is not None:
-                lane_clamp["workers_cap"] = min(int(lane_clamp.get("workers_cap") or 200), int(pset.get("workers_cap") or 200))
+                lane_workers_cap = _coerce_scalar_number(lane_clamp.get("workers_cap") or 200, as_type="int", default=200)
+                pset_workers_cap = _coerce_scalar_number(pset.get("workers_cap") or 200, as_type="int", default=200)
+                lane_clamp["workers_cap"] = min(int(lane_workers_cap), int(pset_workers_cap))
             if pset.get("delay_floor") is not None:
                 lane_clamp["delay_floor"] = max(float(lane_clamp.get("delay_floor") or 0.0), float(pset.get("delay_floor") or 0.0))
             caps_clamps[provider_key] = lane_clamp
@@ -1279,7 +1286,9 @@ class PolicyPackApplier:
         if resource_governor is not None:
             cfg = dict(self.pack.get("resource_governor") or {})
             if cfg.get("max_total_workers") is not None:
-                resource_governor.max_total_workers = min(int(resource_governor.max_total_workers), int(cfg.get("max_total_workers") or resource_governor.max_total_workers))
+                governor_current = _coerce_scalar_number(resource_governor.max_total_workers, as_type="int", default=40)
+                governor_cap = _coerce_scalar_number(cfg.get("max_total_workers") or governor_current, as_type="int", default=governor_current)
+                resource_governor.max_total_workers = min(int(governor_current), int(governor_cap))
                 applied["resource_governor"] = {"max_total_workers": int(resource_governor.max_total_workers)}
 
         fb_thresholds = job_context.get("fallback_thresholds")
