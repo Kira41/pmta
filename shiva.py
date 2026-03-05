@@ -15772,7 +15772,7 @@ def smtp_send_job(
         )
         probe_provider_domains = [
             (provider_canon.group_for_domain(d) if provider_canon.enforce else str(d or "").strip().lower())
-            for d, cnt in (provider_buckets or {}).items()
+            for d, cnt in (provider_counts or {}).items()
             if str(d or "").strip() and int(cnt or 0) > 0
         ]
         provider_domain_count = len(set(probe_provider_domains))
