@@ -23,7 +23,7 @@ from email import policy as email_policy
 from email.message import EmailMessage
 from email.utils import formataddr, format_datetime
 from typing import Optional, Any, Tuple, Dict, List, Set, Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, Future, TimeoutError
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus, urlsplit, urlencode, parse_qsl
@@ -1359,6 +1359,91 @@ class ProbeController:
         }
 
 
+class LaneExecutor:
+    """Concurrent lane-task runner (job-scoped)."""
+
+    def __init__(self, max_parallel_lanes: int, lane_picker_v2: Optional[LanePickerV2], budget_mgr: Optional[BudgetManager], locks: dict, debug: bool = False):
+        self.max_parallel_lanes = max(1, int(max_parallel_lanes or 1))
+        self.lane_picker_v2 = lane_picker_v2
+        self.budget_mgr = budget_mgr
+        self.debug = bool(debug)
+        self._locks = dict(locks or {})
+        self._executor = ThreadPoolExecutor(max_workers=self.max_parallel_lanes)
+        self._inflight: Dict[Tuple[int, str], dict] = {}
+        self._recent: deque = deque(maxlen=10)
+
+    def submit_ready_tasks(self, now_ts: float, job_context: dict) -> int:
+        submitted = 0
+        picker = job_context.get("pick_lane")
+        task_fn = job_context.get("task_fn")
+        max_scan_attempts = max(1, int(job_context.get("max_scan_attempts") or (self.max_parallel_lanes * 3)))
+        attempts = 0
+        while len(self._inflight) < self.max_parallel_lanes and attempts < max_scan_attempts:
+            attempts += 1
+            lane_key, meta = picker(float(now_ts or time.time()))
+            if not lane_key:
+                break
+            if lane_key in self._inflight:
+                continue
+            is_retry = str((meta or {}).get("pick_type") or "") == "retry"
+            is_probe = bool((meta or {}).get("probe_active"))
+            if self.budget_mgr:
+                allowed, reason = self.budget_mgr.can_start(lane_key, now_ts, is_retry, is_probe)
+                if not allowed:
+                    if self.debug:
+                        job_context.get("debug_log", lambda *_: None)(f"LaneExecutor deny {lane_key[0]}|{lane_key[1]} reason={reason}")
+                    continue
+                self.budget_mgr.on_start(lane_key, now_ts)
+            fut = self._executor.submit(task_fn, lane_key, now_ts, bool(is_probe), meta or {})
+            self._inflight[lane_key] = {"future": fut, "started_ts": float(now_ts or time.time()), "meta": dict(meta or {})}
+            submitted += 1
+        return submitted
+
+    def poll_completed_tasks(self, timeout_s: float, on_result: Callable[[Tuple[int, str], dict], None], on_error: Callable[[Tuple[int, str], Exception], None]) -> None:
+        now_ts = time.time()
+        for lane_key, info in list(self._inflight.items()):
+            fut = info.get("future")
+            started_ts = float(info.get("started_ts") or 0.0)
+            if isinstance(fut, Future) and fut.done():
+                try:
+                    res = fut.result()
+                    self._recent.append({"lane": f"{lane_key[0]}|{lane_key[1]}", "status": str((res or {}).get("status") or "ok"), "ts": now_ts})
+                    on_result(lane_key, res if isinstance(res, dict) else {"status": "ok"})
+                except Exception as e:
+                    self._recent.append({"lane": f"{lane_key[0]}|{lane_key[1]}", "status": "exception", "error": str(e), "ts": now_ts})
+                    on_error(lane_key, e)
+                finally:
+                    if self.budget_mgr:
+                        self.budget_mgr.on_finish(lane_key, time.time())
+                    self._inflight.pop(lane_key, None)
+                continue
+            if started_ts > 0 and timeout_s > 0 and (now_ts - started_ts) > timeout_s:
+                try:
+                    if isinstance(fut, Future):
+                        fut.cancel()
+                except Exception:
+                    pass
+                self._recent.append({"lane": f"{lane_key[0]}|{lane_key[1]}", "status": "timeout", "ts": now_ts})
+                on_error(lane_key, TimeoutError(f"lane task timeout > {int(timeout_s)}s"))
+                if self.budget_mgr:
+                    self.budget_mgr.on_finish(lane_key, time.time())
+                self._inflight.pop(lane_key, None)
+
+    def snapshot(self) -> dict:
+        return {
+            "inflight_count": len(self._inflight),
+            "inflight_lanes": [
+                {"lane": f"{k[0]}|{k[1]}", "started_ts": float(v.get("started_ts") or 0.0), "meta": dict(v.get("meta") or {})}
+                for k, v in sorted(self._inflight.items(), key=lambda x: (x[0][0], x[0][1]))
+            ],
+            "recent_completions": list(self._recent),
+            "budget": self.budget_mgr.snapshot() if self.budget_mgr else {},
+        }
+
+    def stop_gracefully(self) -> None:
+        self._executor.shutdown(wait=True, cancel_futures=False)
+
+
 def map_provider_domains_to_sender_indexes(provider_domains: List[str], sender_emails: List[str]) -> Dict[str, int]:
     """Distribute provider domains evenly across sender emails.
 
@@ -1440,6 +1525,7 @@ class SendJob:
     debug_lane_states_snapshot: dict = field(default_factory=dict)
     debug_probe_status: dict = field(default_factory=dict)
     debug_budget_status: dict = field(default_factory=dict)
+    debug_lane_executor: dict = field(default_factory=dict)
 
     # PMTA diagnostics snapshot (optional; helps classify failures quickly)
     pmta_diag: dict = field(default_factory=dict)
@@ -2349,6 +2435,7 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "lane_states": job.debug_lane_states_snapshot or {},
         "debug_probe_status": job.debug_probe_status or {},
         "debug_budget_status": job.debug_budget_status or {},
+        "debug_lane_executor": job.debug_lane_executor or {},
         "pmta_diag": job.pmta_diag or {},
         "pmta_diag_ts": job.pmta_diag_ts or "",
         "created_at": job.created_at,
@@ -3090,6 +3177,8 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job.debug_lane_metrics_snapshot = (s.get("lane_metrics") if isinstance(s.get("lane_metrics"), dict) else {}) or {}
         job.debug_lane_states_snapshot = (s.get("lane_states") if isinstance(s.get("lane_states"), dict) else {}) or {}
         job.debug_probe_status = (s.get("debug_probe_status") if isinstance(s.get("debug_probe_status"), dict) else {}) or {}
+        job.debug_budget_status = (s.get("debug_budget_status") if isinstance(s.get("debug_budget_status"), dict) else {}) or {}
+        job.debug_lane_executor = (s.get("debug_lane_executor") if isinstance(s.get("debug_lane_executor"), dict) else {}) or {}
         job.pmta_diag = (s.get("pmta_diag") if isinstance(s.get("pmta_diag"), dict) else {}) or {}
         job.pmta_diag_ts = str(s.get("pmta_diag_ts") or "")
         job.updated_at = str(s.get("updated_at") or "")
@@ -12356,6 +12445,11 @@ def smtp_send_job(
     lane_v2_use_budgets = bool(get_env_bool("SHIVA_LANE_V2_USE_BUDGETS", True))
     lane_v2_use_soft_bias = bool(get_env_bool("SHIVA_LANE_V2_USE_SOFT_BIAS", True))
     lane_v2_max_scan = max(1, int(get_env_int("SHIVA_LANE_V2_MAX_SCAN", 50)))
+    lane_concurrency_enabled = bool(get_env_bool("SHIVA_LANE_CONCURRENCY", False))
+    lane_max_parallel = max(1, int(get_env_int("SHIVA_MAX_PARALLEL_LANES", 5)))
+    lane_task_timeout_s = max(30, int(get_env_int("SHIVA_LANE_TASK_TIMEOUT_S", 900)))
+    lane_concurrency_debug = bool(get_env_bool("SHIVA_LANE_CONCURRENCY_DEBUG", False))
+    lane_concurrency_export = bool(get_env_bool("SHIVA_LANE_CONCURRENCY_EXPORT", False))
     lane_thresholds_raw = str(get_env("SHIVA_LANE_THRESHOLDS_JSON", "") or "").strip()
     lane_quarantine_base_s = max(1, int(get_env_int("SHIVA_LANE_QUARANTINE_BASE_S", 120)))
     lane_quarantine_max_s = max(lane_quarantine_base_s, int(get_env_int("SHIVA_LANE_QUARANTINE_MAX_S", 1800)))
@@ -12426,6 +12520,9 @@ def smtp_send_job(
     if lane_v2_export:
         with JOBS_LOCK:
             job.debug_last_lane_pick = {}
+    if lane_concurrency_export:
+        with JOBS_LOCK:
+            job.debug_lane_executor = {}
 
     budget_config = BudgetConfig(
         enabled=budget_manager_enabled,
@@ -13021,6 +13118,10 @@ def smtp_send_job(
             lane_weight_multiplier=_lane_weight_multiplier,
             debug_log=lambda msg: job.log("INFO", msg),
         ) if scheduler_mode == "lane_v2" else None
+        if lane_concurrency_enabled and scheduler_mode != "lane_v2":
+            lane_concurrency_enabled = False
+            with JOBS_LOCK:
+                job.log("WARN", "SHIVA_LANE_CONCURRENCY requires SHIVA_SCHEDULER_MODE=lane_v2; keeping sequential mode.")
         provider_buckets = build_provider_buckets([
             rcpt
             for domains in sender_bucket_by_idx.values()
@@ -14162,6 +14263,16 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "If enabled, LanePickerV2 weighted picks apply soft lane-state multipliers."},
     {"key": "SHIVA_LANE_V2_MAX_SCAN", "type": "int", "default": "50", "group": "Scheduler", "restart_required": False,
      "desc": "Maximum domains scanned per sender during LanePickerV2 weighted candidate build."},
+    {"key": "SHIVA_LANE_CONCURRENCY", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Enable concurrent lane executor for inter-lane chunk scheduling (requires lane_v2 mode)."},
+    {"key": "SHIVA_MAX_PARALLEL_LANES", "type": "int", "default": "5", "group": "Scheduler", "restart_required": False,
+     "desc": "Maximum in-flight lane tasks allowed by concurrent lane executor."},
+    {"key": "SHIVA_LANE_TASK_TIMEOUT_S", "type": "int", "default": "900", "group": "Scheduler", "restart_required": False,
+     "desc": "Safety timeout in seconds for each lane task when lane concurrency is enabled."},
+    {"key": "SHIVA_LANE_CONCURRENCY_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Emit concise lane concurrency executor logs."},
+    {"key": "SHIVA_LANE_CONCURRENCY_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Export lane executor snapshot into job debug payload as debug_lane_executor."},
     {"key": "SHIVA_LANE_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Enable lane debug self-check invariants (logging + fatal on hard mismatch)."},
     {"key": "SHIVA_LANE_BASELINE_REPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
