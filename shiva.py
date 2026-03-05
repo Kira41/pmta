@@ -15075,6 +15075,20 @@ def smtp_send_job(
             job.log("WARN", f"Job stopped: {job.stop_reason}")
             job.maybe_persist(force=True)
 
+    def _safe_int(value: Any, default: int = 0) -> int:
+        """Best-effort int parser that tolerates list-like form payloads."""
+        try:
+            if isinstance(value, (list, tuple)):
+                if not value:
+                    return int(default)
+                value = value[0]
+            return int(str(value).strip())
+        except Exception:
+            try:
+                return int(default)
+            except Exception:
+                return 0
+
     def _runtime_overrides() -> dict:
         form = db_get_campaign_form_raw(job.campaign_id)
         if not isinstance(form, dict):
@@ -16064,9 +16078,9 @@ def smtp_send_job(
 
         baseline_rt = _runtime_overrides()
         baseline_health = _accounting_health_policy(
-            workers=int(baseline_rt.get("thread_workers", thread_workers)),
+            workers=_safe_int(baseline_rt.get("thread_workers", thread_workers), _safe_int(thread_workers, 1)),
             delay=float(baseline_rt.get("delay_s", delay_s)),
-            chunk_sz=int(baseline_rt.get("chunk_size", chunk_size)),
+            chunk_sz=_safe_int(baseline_rt.get("chunk_size", chunk_size), _safe_int(chunk_size, 1)),
             sleep_between=float(baseline_rt.get("sleep_chunks", sleep_chunks)),
         )
         baseline_pressure = dict(job.pmta_pressure or {})
@@ -16109,8 +16123,8 @@ def smtp_send_job(
 
             rt = _runtime_overrides()
 
-            cs = int(rt.get("chunk_size", chunk_size))
-            workers2 = int(rt.get("thread_workers", thread_workers))
+            cs = _safe_int(rt.get("chunk_size", chunk_size), _safe_int(chunk_size, 1))
+            workers2 = _safe_int(rt.get("thread_workers", thread_workers), _safe_int(thread_workers, 1))
             sleep2 = float(rt.get("sleep_chunks", sleep_chunks))
             delay2 = float(rt.get("delay_s", delay_s))
             job.spam_threshold = float(rt.get("spam_threshold", job.spam_threshold))
@@ -16138,12 +16152,12 @@ def smtp_send_job(
                 )
                 if health_policy_applied.get("ok"):
                     ap = health_policy_applied.get("applied") or {}
-                    workers2 = int(ap.get("workers") or workers2)
-                    cs = int(ap.get("chunk_size") or cs)
+                    workers2 = _safe_int(ap.get("workers"), workers2)
+                    cs = _safe_int(ap.get("chunk_size"), cs)
                     delay2 = float(ap.get("delay_s") if ap.get("delay_s") is not None else delay2)
                     sleep2 = float(ap.get("sleep_chunks") if ap.get("sleep_chunks") is not None else sleep2)
 
-                    h_lvl = int(health_policy_applied.get("level") or 0)
+                    h_lvl = _safe_int(health_policy_applied.get("level"), 0)
                     if h_lvl != int(last_health_level):
                         last_health_level = h_lvl
                         with JOBS_LOCK:
@@ -16172,7 +16186,7 @@ def smtp_send_job(
 
                     # Apply recommended caps
                     if pmta_pressure_applied and pmta_pressure_applied.get("ok"):
-                        lvl = int(pmta_pressure_applied.get("level") or 0)
+                        lvl = _safe_int(pmta_pressure_applied.get("level"), 0)
                         if lvl > 0:
                             dmin = pmta_pressure_applied.get("delay_min")
                             wmax = pmta_pressure_applied.get("workers_max")
