@@ -407,6 +407,114 @@ def normalize_and_partition_recipients(
     return out, stats
 
 
+def build_baseline_report(
+    job: 'SendJob',
+    sender_buckets: Dict[int, Dict[str, List[str]]],
+    provider_buckets: Dict[str, List[str]],
+    partition_seed: str,
+    overrides: dict,
+    pmta_live: dict,
+    pressure_caps: dict,
+    health_caps: dict,
+    provider_retry_chunks: Dict[str, List[dict]],
+) -> dict:
+    """Build a read-only scheduler baseline snapshot (no mutations)."""
+    sender_counts: Dict[str, Dict[str, int]] = {}
+    sender_totals: Dict[str, int] = {}
+    for sender_idx, domains in (sender_buckets or {}).items():
+        key = str(int(sender_idx))
+        domain_counts = {str(dom): int(len(rcpts or [])) for dom, rcpts in (domains or {}).items() if dom is not None}
+        sender_counts[key] = domain_counts
+        sender_totals[key] = int(sum(domain_counts.values()))
+
+    provider_counts = {str(dom): int(len(rcpts or [])) for dom, rcpts in (provider_buckets or {}).items() if dom is not None}
+
+    retry_key_counts = {str(k): int(len(v or [])) for k, v in (provider_retry_chunks or {}).items()}
+    retry_total_items = int(sum(retry_key_counts.values()))
+    retry_earliest = None
+    for items in (provider_retry_chunks or {}).values():
+        for item in (items or []):
+            try:
+                ts = float(item.get("next_retry_ts") or 0.0)
+            except Exception:
+                ts = 0.0
+            if ts <= 0:
+                continue
+            retry_earliest = ts if (retry_earliest is None or ts < retry_earliest) else retry_earliest
+
+    return {
+        "job_id": str(getattr(job, "id", "") or ""),
+        "campaign_id": str(getattr(job, "campaign_id", "") or ""),
+        "partition_seed": str(partition_seed or ""),
+        "total_valid_recipients": int(sum(provider_counts.values())),
+        "invalid_count": 0,
+        "deduped_count": 0,
+        "sender_email_count": int(len(sender_counts)),
+        "provider_domains": provider_counts,
+        "per_sender_provider_counts": sender_counts,
+        "per_sender_totals": sender_totals,
+        "runtime_overrides": dict(overrides or {}),
+        "pmta_live": dict(pmta_live or {}),
+        "pmta_pressure": dict(pressure_caps or {}),
+        "health_policy": dict(health_caps or {}),
+        "provider_retry_chunks": {
+            "keys": int(len(retry_key_counts)),
+            "items": retry_total_items,
+            "per_key_counts": retry_key_counts,
+            "earliest_next_retry_ts": retry_earliest,
+        },
+    }
+
+
+def lane_debug_self_check(report: dict) -> None:
+    """Validate scheduler baseline invariants in debug mode."""
+    logger = logging.getLogger("shiva")
+    if not isinstance(report, dict):
+        logger.warning("lane_debug_self_check: report missing or invalid")
+        return
+
+    total_valid = int(report.get("total_valid_recipients") or 0)
+    per_sender = report.get("per_sender_provider_counts") if isinstance(report.get("per_sender_provider_counts"), dict) else {}
+    provider_domains = report.get("provider_domains") if isinstance(report.get("provider_domains"), dict) else {}
+
+    sender_sum = 0
+    for sender_idx, dom_counts in per_sender.items():
+        if not str(sender_idx).strip():
+            logger.warning("lane_debug_self_check: empty sender index key")
+        if not isinstance(dom_counts, dict):
+            logger.warning("lane_debug_self_check: sender %s counts are not a dict", sender_idx)
+            continue
+        for dom, cnt in dom_counts.items():
+            if dom in {None, "", "none"}:
+                logger.warning("lane_debug_self_check: sender %s has empty provider domain", sender_idx)
+            n = int(cnt or 0)
+            if n < 0:
+                raise ValueError(f"lane_debug_self_check: negative count sender={sender_idx} domain={dom} count={n}")
+            sender_sum += n
+
+    if sender_sum != total_valid:
+        raise ValueError(f"lane_debug_self_check: sender totals mismatch sender_sum={sender_sum} total_valid={total_valid}")
+
+    for dom, bucket_count in provider_domains.items():
+        b = int(bucket_count or 0)
+        if b < 0:
+            raise ValueError(f"lane_debug_self_check: negative provider bucket domain={dom} count={b}")
+        per_domain_sum = 0
+        for dom_counts in per_sender.values():
+            if not isinstance(dom_counts, dict):
+                continue
+            per_domain_sum += int(dom_counts.get(dom) or 0)
+        if per_domain_sum != b:
+            raise ValueError(
+                f"lane_debug_self_check: provider mismatch domain={dom} sender_sum={per_domain_sum} provider_bucket={b}"
+            )
+
+    partition_seed = str(report.get("partition_seed") or "").strip()
+    if not partition_seed:
+        raise ValueError("lane_debug_self_check: deterministic partition seed missing")
+    logger.info("lane_debug_self_check: partition_seed=%s", partition_seed)
+
+
 def map_provider_domains_to_sender_indexes(provider_domains: List[str], sender_emails: List[str]) -> Dict[str, int]:
     """Distribute provider domains evenly across sender emails.
 
@@ -482,6 +590,8 @@ class SendJob:
     pmta_pressure: dict = field(default_factory=dict)
     pmta_pressure_ts: str = ""
 
+    # Scheduler baseline snapshot (optional; debug-only, additive)
+    debug_baseline_report: dict = field(default_factory=dict)
 
     # PMTA diagnostics snapshot (optional; helps classify failures quickly)
     pmta_diag: dict = field(default_factory=dict)
@@ -1386,6 +1496,7 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "pmta_domains_ts": job.pmta_domains_ts or "",
         "pmta_pressure": job.pmta_pressure or {},
         "pmta_pressure_ts": job.pmta_pressure_ts or "",
+        "debug_baseline_report": job.debug_baseline_report or {},
         "pmta_diag": job.pmta_diag or {},
         "pmta_diag_ts": job.pmta_diag_ts or "",
         "created_at": job.created_at,
@@ -2123,6 +2234,7 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job.pmta_domains_ts = str(s.get("pmta_domains_ts") or "")
         job.pmta_pressure = (s.get("pmta_pressure") if isinstance(s.get("pmta_pressure"), dict) else {}) or {}
         job.pmta_pressure_ts = str(s.get("pmta_pressure_ts") or "")
+        job.debug_baseline_report = (s.get("debug_baseline_report") if isinstance(s.get("debug_baseline_report"), dict) else {}) or {}
         job.pmta_diag = (s.get("pmta_diag") if isinstance(s.get("pmta_diag"), dict) else {}) or {}
         job.pmta_diag_ts = str(s.get("pmta_diag_ts") or "")
         job.updated_at = str(s.get("updated_at") or "")
@@ -11343,6 +11455,12 @@ def smtp_send_job(
     ai_subject_chain = [str(x).strip() for x in (subjects or []) if str(x).strip()] or ["(no subject)"]
     ai_body_chain = str(body or "")
 
+    scheduler_mode = (get_env("SHIVA_SCHEDULER_MODE", "legacy") or "legacy").strip().lower() or "legacy"
+    if scheduler_mode not in {"legacy", "lane_v2"}:
+        scheduler_mode = "legacy"
+    lane_debug_enabled = bool(get_env_bool("SHIVA_LANE_DEBUG", False))
+    lane_baseline_enabled = bool(get_env_bool("SHIVA_LANE_BASELINE_REPORT", False))
+
     smtp_host_ips = _resolve_ipv4(smtp_host) if smtp_host else []
 
     # PMTA live polling (Jobs UI)
@@ -11775,8 +11893,16 @@ def smtp_send_job(
         sender_cursor = 0
         scheduler_rng = random.Random(int(hashlib.sha256(partition_seed.encode("utf-8", errors="ignore")).hexdigest()[:16], 16))
         provider_retry_chunks: Dict[str, List[dict]] = {}
+        provider_buckets = build_provider_buckets([
+            rcpt
+            for domains in sender_bucket_by_idx.values()
+            for bucket in (domains or {}).values()
+            for rcpt in (bucket or [])
+        ])[0]
 
         with JOBS_LOCK:
+            if scheduler_mode != "legacy":
+                job.log("INFO", f"Scheduler mode={scheduler_mode} (no behavior change in this phase; running legacy loop).")
             job.log(
                 "INFO",
                 "Recipient partition stats: "
@@ -11872,6 +11998,44 @@ def smtp_send_job(
             cs0 = max(1, int(chunk_size or 1))
             job.chunks_total = (total + cs0 - 1) // cs0
             job.log("INFO", f"Prepared dynamic chunks (initial chunk_size={cs0}).")
+
+        baseline_rt = _runtime_overrides()
+        baseline_health = _accounting_health_policy(
+            workers=int(baseline_rt.get("thread_workers", thread_workers)),
+            delay=float(baseline_rt.get("delay_s", delay_s)),
+            chunk_sz=int(baseline_rt.get("chunk_size", chunk_size)),
+            sleep_between=float(baseline_rt.get("sleep_chunks", sleep_chunks)),
+        )
+        baseline_pressure = dict(job.pmta_pressure or {})
+        baseline_live = dict(job.pmta_live or {})
+        baseline_report = build_baseline_report(
+            job=job,
+            sender_buckets=sender_bucket_by_idx,
+            provider_buckets=provider_buckets,
+            partition_seed=partition_seed,
+            overrides=baseline_rt,
+            pmta_live=baseline_live,
+            pressure_caps=baseline_pressure,
+            health_caps=baseline_health,
+            provider_retry_chunks=provider_retry_chunks,
+        )
+        baseline_report["invalid_count"] = int(partition_stats.get("invalid_count") or 0)
+        baseline_report["deduped_count"] = int(partition_stats.get("deduplicated_count") or 0)
+
+        if lane_baseline_enabled:
+            with JOBS_LOCK:
+                job.debug_baseline_report = dict(baseline_report)
+                job.log("INFO", f"Lane baseline report: {json.dumps(baseline_report, ensure_ascii=False, sort_keys=True)}")
+
+        if lane_debug_enabled:
+            try:
+                lane_debug_self_check(baseline_report)
+                with JOBS_LOCK:
+                    job.log("INFO", f"Lane debug self-check passed (partition_seed={partition_seed}).")
+            except Exception as e:
+                with JOBS_LOCK:
+                    job.log("ERROR", f"Lane debug self-check fatal invariant: {e}")
+                raise
 
         while _remaining_total() > 0:
             if not _wait_ready():
@@ -12601,6 +12765,14 @@ APP_CONFIG_SCHEMA: List[dict] = [
     {"key": "PMTA_BRIDGE_PULL_MAX_LINES", "type": "int", "default": "2000", "group": "Accounting", "restart_required": False,
      "desc": "max_lines query used when Shiva pulls from bridge endpoint."},
 
+    # Scheduler lane scaffolding (baseline/debug only in this phase)
+    {"key": "SHIVA_SCHEDULER_MODE", "type": "str", "default": "legacy", "group": "Scheduler", "restart_required": False,
+     "desc": "Scheduler mode scaffold: legacy | lane_v2. lane_v2 is non-operative in this phase and keeps legacy behavior."},
+    {"key": "SHIVA_LANE_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Enable lane debug self-check invariants (logging + fatal on hard mismatch)."},
+    {"key": "SHIVA_LANE_BASELINE_REPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Emit one baseline scheduler report at job start (read-only snapshot)."},
+
     # App (restart-only)
     {"key": "SHIVA_HOST", "type": "str", "default": "0.0.0.0", "group": "App", "restart_required": True,
      "desc": "Bind host used by Flask when Shiva starts. Requires restart."},
@@ -12675,6 +12847,21 @@ def cfg_get_bool(key: str, default: bool) -> bool:
     if raw is None:
         return bool(default)
     return _cfg_boolish(str(raw))
+
+
+def get_env(key: str, default: str = "") -> str:
+    """Direct env getter for non-UI debug/feature flags."""
+    try:
+        raw = os.getenv(str(key or "").strip())
+        if raw is None:
+            return str(default)
+        return str(raw)
+    except Exception:
+        return str(default)
+
+
+def get_env_bool(key: str, default: bool = False) -> bool:
+    return _cfg_boolish(get_env(key, "1" if default else "0"))
 
 
 def config_items() -> List[dict]:
