@@ -2848,6 +2848,9 @@ class GuardrailsValidator:
         cfg = dict(config_snapshot or {})
         out = ValidationResult(ok=True)
 
+        def _num(name: str, default: Any, as_type: str = "int") -> Any:
+            return _coerce_scalar_number(cfg.get(name), as_type=as_type, default=default)
+
         def _critical(msg: str) -> None:
             out.critical_issues.append(str(msg))
 
@@ -2860,18 +2863,18 @@ class GuardrailsValidator:
             out.clamps_applied.append({"field": name, "before": before, "after": after, "reason": str(reason)})
             _warn(f"Guardrails clamp applied: {name} {before} -> {after} ({reason})")
 
-        max_parallel_lanes = int(cfg.get("lane_max_parallel") or 1)
-        max_total_workers = int(cfg.get("max_total_workers") or 1)
-        caps_max_workers = int(cfg.get("caps_max_workers") or 1)
-        caps_max_chunk = int(cfg.get("caps_max_chunk") or 1)
-        caps_max_delay_s = float(cfg.get("caps_max_delay_s") or 0.0)
-        provider_min_gap_s = float(cfg.get("provider_min_gap_s") or 0.0)
-        provider_cooldown_s = int(cfg.get("provider_cooldown_s") or 0)
-        wave_max_parallel_single_domain = int(cfg.get("wave_max_parallel_single_domain") or 1)
-        wave_burst_tokens = int(cfg.get("wave_burst_tokens") or 1)
-        wave_refill_per_sec = float(cfg.get("wave_refill_per_sec") or 0.1)
+        max_parallel_lanes = _num("lane_max_parallel", 1, "int")
+        max_total_workers = _num("max_total_workers", 1, "int")
+        caps_max_workers = _num("caps_max_workers", 1, "int")
+        caps_max_chunk = _num("caps_max_chunk", 1, "int")
+        caps_max_delay_s = _num("caps_max_delay_s", 0.0, "float")
+        provider_min_gap_s = _num("provider_min_gap_s", 0.0, "float")
+        provider_cooldown_s = _num("provider_cooldown_s", 0, "int")
+        wave_max_parallel_single_domain = _num("wave_max_parallel_single_domain", 1, "int")
+        wave_burst_tokens = _num("wave_burst_tokens", 1, "int")
+        wave_refill_per_sec = _num("wave_refill_per_sec", 0.1, "float")
         jitter_mode = str(cfg.get("backoff_jitter_mode") or "off").strip().lower() or "off"
-        jitter_pct = max(0.0, float(cfg.get("backoff_jitter_pct") or 0.0))
+        jitter_pct = max(0.0, _num("backoff_jitter_pct", 0.0, "float"))
         rollout_effective_mode = str(cfg.get("rollout_effective_mode") or "legacy").strip().lower() or "legacy"
         fallback_requested = bool(cfg.get("fallback_controller_enabled_requested"))
         resource_gov_requested = bool(cfg.get("resource_governor_enabled_requested"))

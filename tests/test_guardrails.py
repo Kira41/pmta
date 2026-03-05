@@ -82,3 +82,31 @@ def test_guardrails_strict_blocks_critical():
 
     assert result.ok is False
     assert any("Concurrency" in issue for issue in result.critical_issues)
+
+
+def test_guardrails_accepts_list_like_numeric_inputs():
+    validator = shiva.GuardrailsValidator(limits={"max_total_workers": 80}, strict=True)
+    result = validator.validate_plan(
+        _plan(waves_enabled=False),
+        {
+            "lane_max_parallel": ["5"],
+            "max_total_workers": ["200"],
+            "caps_max_workers": ["10"],
+            "caps_max_chunk": ["100"],
+            "caps_max_delay_s": ["1.0"],
+            "provider_min_gap_s": ["1"],
+            "provider_cooldown_s": ["90"],
+            "wave_max_parallel_single_domain": ["1"],
+            "wave_burst_tokens": ["100"],
+            "wave_refill_per_sec": ["1.0"],
+            "backoff_jitter_mode": "deterministic",
+            "backoff_jitter_pct": ["0.1"],
+            "rollout_effective_mode": "legacy",
+            "fallback_controller_enabled_requested": False,
+            "resource_governor_enabled_requested": False,
+            "guardrails_export": True,
+        },
+    )
+
+    assert result.ok is False
+    assert any("Concurrency" in issue for issue in result.critical_issues)
