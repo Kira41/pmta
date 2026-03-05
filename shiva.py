@@ -4020,6 +4020,14 @@ def db_init() -> None:
 def _sanitize_form_data(data: dict) -> dict:
     if not isinstance(data, dict):
         return {}
+    # Keep recipient lists large enough for real campaigns while preserving a soft-guard
+    # against unbounded payload growth.
+    default_field_cap = max(10000, int(get_env_int("SHIVA_FORM_FIELD_MAX_CHARS", 400000) or 400000))
+    recipients_field_cap = max(default_field_cap, int(get_env_int("SHIVA_FORM_RECIPIENTS_MAX_CHARS", 12000000) or 12000000))
+    field_caps = {
+        "recipients": recipients_field_cap,
+        "maillist_safe": recipients_field_cap,
+    }
     out: Dict[str, Any] = {}
     for k, v in data.items():
         if k not in _ALLOWED_FORM_FIELDS:
@@ -4030,10 +4038,40 @@ def _sanitize_form_data(data: dict) -> dict:
             out[k] = ""
         else:
             s = str(v)
-            if len(s) > 200000:
-                s = s[:200000]
+            cap = int(field_caps.get(k, default_field_cap) or default_field_cap)
+            if len(s) > cap:
+                s = s[:cap]
             out[k] = s
     return out
+
+
+def _fit_form_payload(clean: Dict[str, Any]) -> Dict[str, Any]:
+    """Best-effort payload guard that keeps JSON valid and prioritizes recipients.
+
+    Old behavior truncated the serialized JSON string, which could corrupt JSON and lose all
+    restored form data. This helper keeps payload valid and only trims large free-text fields
+    (recipients last) when absolutely necessary.
+    """
+    data = dict(clean or {})
+    payload_max_bytes = max(500000, int(get_env_int("SHIVA_FORM_PAYLOAD_MAX_BYTES", 25000000) or 25000000))
+    if len(json.dumps(data, ensure_ascii=False).encode("utf-8")) <= payload_max_bytes:
+        return data
+
+    trim_order = ["body", "src_list", "urls_list", "subject", "from_name", "from_email", "maillist_safe", "recipients"]
+    for key in trim_order:
+        val = data.get(key)
+        if not isinstance(val, str) or not val:
+            continue
+        target = val
+        while target:
+            target = target[: max(1, int(len(target) * 0.85))]
+            data[key] = target
+            if len(json.dumps(data, ensure_ascii=False).encode("utf-8")) <= payload_max_bytes:
+                return data
+        data[key] = ""
+        if len(json.dumps(data, ensure_ascii=False).encode("utf-8")) <= payload_max_bytes:
+            return data
+    return data
 
 
 def db_get_form(browser_id: str) -> dict:
@@ -4056,10 +4094,8 @@ def db_get_form(browser_id: str) -> dict:
 def db_save_form(browser_id: str, data: dict) -> None:
     if not browser_id:
         return
-    clean = _sanitize_form_data(data)
+    clean = _fit_form_payload(_sanitize_form_data(data))
     payload = json.dumps(clean, ensure_ascii=False)
-    if len(payload) > 800000:
-        payload = payload[:800000]
 
     with DB_LOCK:
         conn = _db_conn()
@@ -5399,10 +5435,8 @@ def db_save_campaign_form(browser_id: str, campaign_id: str, data: dict) -> bool
     if not db_get_campaign(browser_id, campaign_id):
         return False
 
-    clean = _sanitize_form_data(data)
+    clean = _fit_form_payload(_sanitize_form_data(data))
     payload = json.dumps(clean, ensure_ascii=False)
-    if len(payload) > 800000:
-        payload = payload[:800000]
 
     ts = now_iso()
     with DB_LOCK:
