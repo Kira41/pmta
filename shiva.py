@@ -17606,6 +17606,27 @@ def get_env_bool(key: str, default: bool = False) -> bool:
     return _cfg_boolish(get_env(key, "1" if default else "0"))
 
 
+def get_env_int(key: str, default: int = 0) -> int:
+    """Direct env getter that safely parses ints for runtime feature flags."""
+    try:
+        return int(str(get_env(key, str(default))).strip())
+    except Exception:
+        return int(default)
+
+
+def get_env_float(key: str, default: float = 0.0) -> float:
+    """Direct env getter that safely parses floats for runtime feature flags."""
+    try:
+        return float(str(get_env(key, str(default))).strip())
+    except Exception:
+        return float(default)
+
+
+def get_env_rt(key: str, default: str = "") -> str:
+    """Backward-compatible alias used by older runtime paths/logging snippets."""
+    return get_env(key, default)
+
+
 def config_items() -> List[dict]:
     """Return schema + current effective values for the UI."""
     items: List[dict] = []
