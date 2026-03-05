@@ -17,7 +17,7 @@ import uuid
 import threading
 import queue
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from email import policy as email_policy
 from email.message import EmailMessage
@@ -2777,6 +2777,95 @@ class RolloutDecider:
         }
 
 
+@dataclass
+class EffectivePlan:
+    scheduler_mode: str = "legacy"
+    concurrency_enabled: bool = False
+    probe_enabled: bool = False
+    waves_enabled: bool = False
+    provider_canon_enabled: bool = False
+    provider_canon_enforced: bool = False
+    policy_pack_enabled: bool = False
+    policy_pack_enforced: bool = False
+    learning_caps_enabled: bool = False
+    learning_caps_enforced: bool = False
+    backoff_jitter_mode: str = "off"
+    fallback_controller_enabled: bool = False
+    resource_governor_enabled: bool = False
+    accounting_recon_enabled: bool = False
+    ui_telemetry_enabled: bool = False
+
+
+class ModeOrchestrator:
+    """Job-local feature plan resolver with safe dependency ordering."""
+
+    def decide_effective_features(self, job: Any, config: dict, rollout_decision: dict) -> EffectivePlan:
+        cfg = dict(config or {})
+        rd = dict(rollout_decision or {})
+        effective_mode = str(rd.get("effective_mode") or "legacy").strip().lower() or "legacy"
+        force_legacy = bool(cfg.get("force_legacy"))
+
+        scheduler_mode = "legacy"
+        if not force_legacy and effective_mode in {"v2"}:
+            scheduler_mode = "lane_v2"
+
+        concurrency_enabled = bool(
+            scheduler_mode == "lane_v2"
+            and bool(cfg.get("lane_concurrency_enabled"))
+            and not bool(cfg.get("force_disable_concurrency"))
+        )
+
+        provider_canon_enabled = bool(cfg.get("provider_canon_enabled"))
+        provider_canon_enforced = bool(provider_canon_enabled and cfg.get("provider_canon_enforce"))
+        policy_pack_enabled = bool(cfg.get("policy_packs_enabled"))
+        policy_pack_enforced = bool(policy_pack_enabled and cfg.get("policy_packs_enforce"))
+        learning_caps_enabled = bool(cfg.get("learning_caps_enabled"))
+        learning_caps_enforced = bool(learning_caps_enabled and cfg.get("learning_caps_enforce"))
+
+        provider_groups_count = int(cfg.get("provider_groups_count") or 0)
+        provider_domains_count = int(cfg.get("provider_domains_count") or 0)
+        fallback_active = bool(cfg.get("fallback_active"))
+        pmta_pressure_level = int(cfg.get("pmta_pressure_level") or 0)
+
+        probe_candidate_multi = provider_groups_count >= 2 if provider_canon_enforced else provider_domains_count >= 2
+        probe_enabled = bool(cfg.get("probe_mode_enabled") and probe_candidate_multi)
+        if fallback_active or pmta_pressure_level >= 3:
+            probe_enabled = False
+
+        wave_scope_single = provider_groups_count == 1 if provider_canon_enforced else provider_domains_count == 1
+        waves_enabled = bool(cfg.get("single_domain_waves_enabled") and wave_scope_single)
+
+        backoff_jitter_mode = str(cfg.get("backoff_jitter_mode") or "off").strip().lower() or "off"
+        if backoff_jitter_mode not in {"off", "deterministic", "random"}:
+            backoff_jitter_mode = "off"
+
+        fallback_controller_enabled = bool(cfg.get("fallback_controller_enabled"))
+        if concurrency_enabled or effective_mode in {"v2"}:
+            fallback_controller_enabled = True
+
+        resource_governor_enabled = bool(cfg.get("resource_governor_enabled"))
+        if concurrency_enabled and not bool(cfg.get("resource_governor_enabled_explicit")):
+            resource_governor_enabled = True
+
+        return EffectivePlan(
+            scheduler_mode=scheduler_mode,
+            concurrency_enabled=concurrency_enabled,
+            probe_enabled=probe_enabled,
+            waves_enabled=waves_enabled,
+            provider_canon_enabled=provider_canon_enabled,
+            provider_canon_enforced=provider_canon_enforced,
+            policy_pack_enabled=policy_pack_enabled,
+            policy_pack_enforced=policy_pack_enforced,
+            learning_caps_enabled=learning_caps_enabled,
+            learning_caps_enforced=learning_caps_enforced,
+            backoff_jitter_mode=backoff_jitter_mode,
+            fallback_controller_enabled=fallback_controller_enabled,
+            resource_governor_enabled=resource_governor_enabled,
+            accounting_recon_enabled=bool(cfg.get("lane_accounting_recon_enabled")),
+            ui_telemetry_enabled=bool(cfg.get("ui_telemetry_enabled")),
+        )
+
+
 class ShadowRecorder:
     def __init__(self, max_events: int):
         self.max_events = max(1, int(max_events or 50))
@@ -2832,6 +2921,97 @@ def _run_rollout_selftests() -> List[str]:
     after = _shadow_state_counts(state_buckets, retries)
     assert before == after, "shadow purity failed"
     logs.append("shadow_purity_ok")
+    return logs
+
+
+def run_acceptance_suite() -> List[str]:
+    """Fast deterministic acceptance checks (no SMTP/network)."""
+    logs: List[str] = []
+
+    rcpts = [f"u{i}@gmail.com" for i in range(6)] + [f"u{i}@googlemail.com" for i in range(3)] + [f"u{i}@yahoo.com" for i in range(5)]
+    senders = ["a@sender-a.com", "b@sender-b.com"]
+    a1, st1 = normalize_and_partition_recipients(rcpts, senders, "acc-seed")
+    a2, st2 = normalize_and_partition_recipients(rcpts, senders, "acc-seed")
+    assert a1 == a2 and st1 == st2, "partition determinism failed"
+    logs.append("partition_determinism_ok")
+
+    grp1 = canonical_provider("googlemail.com", alias_map={"googlemail.com": "google"})
+    grp2 = canonical_provider("googlemail.com", alias_map={"googlemail.com": "google"})
+    assert grp1 == grp2 == "google", "provider canonicalization determinism failed"
+    logs.append("provider_canon_determinism_ok")
+
+    bm_inflight = BudgetManager(BudgetConfig(enabled=True, provider_max_inflight_default=1, provider_min_gap_s_default=0.0, sender_max_inflight=2))
+    lane = (0, "gmail.com")
+    bm_inflight.on_start(lane, now_ts=10.0)
+    allowed_now, reason_now = bm_inflight.can_start(lane, now_ts=10.5, is_retry=False, is_probe=False)
+    assert (not allowed_now) and ("inflight" in reason_now), "budget inflight cap must block"
+
+    bm_gap = BudgetManager(BudgetConfig(enabled=True, provider_max_inflight_default=2, provider_min_gap_s_default=2.0, sender_max_inflight=2))
+    bm_gap.on_start(lane, now_ts=10.0)
+    bm_gap.on_finish(lane, now_ts=10.2)
+    allowed_gap, reason_gap = bm_gap.can_start(lane, now_ts=11.0, is_retry=False, is_probe=False)
+    assert (not allowed_gap) and ("min_gap" in reason_gap), "budget min-gap must block"
+    allowed_after, _ = bm_gap.can_start(lane, now_ts=12.3, is_retry=False, is_probe=False)
+    assert allowed_after, "budget min-gap should allow after delay"
+    logs.append("budget_manager_correctness_ok")
+
+    gov = GlobalResourceGovernor(max_total_workers=4)
+    ok1, _ = gov.can_reserve(3, now_ts=1.0, pmta_pressure_level=0)
+    assert ok1
+    gov.reserve(3, lane_key=(0, "gmail.com"), now_ts=1.0)
+    ok2, _ = gov.can_reserve(2, now_ts=1.1, pmta_pressure_level=0)
+    assert not ok2
+    gov.release(10, lane_key=(0, "gmail.com"), now_ts=1.2)
+    snap = gov.snapshot()
+    assert int(snap.get("inflight_workers") or 0) == 0, "governor inflight must not go negative"
+    logs.append("governor_correctness_ok")
+
+    picker = LanePickerV2(scheduler_rng=random.Random(2), use_soft_bias=False)
+    pick, _meta = picker.pick_next(
+        now_ts=100.0,
+        sender_cursor=0,
+        sender_buckets={0: {"gmail.com": ["x@gmail.com"]}},
+        provider_retry_chunks={"0|gmail.com": [{"next_retry_ts": 99.0, "chunk": ["a@gmail.com"]}]},
+    )
+    assert pick == (0, "gmail.com"), "retry-ready lane must be preferred"
+    logs.append("lane_picker_retry_priority_ok")
+
+    base_caps = {"chunk_size": 200, "thread_workers": 5, "delay_s": 0.2, "sleep_chunks": 0.0}
+    caps, _ = resolve_caps_for_attempt(
+        job=None,
+        now_ts=1.0,
+        lane_key=(0, "gmail.com"),
+        base_caps=base_caps,
+        runtime_overrides={},
+        pressure_caps={},
+        health_caps={},
+        lane_registry=None,
+        learning_engine={"chunk_size_cap": 100, "workers_cap": 2, "delay_floor": 0.8, "sleep_floor": 1.0},
+        probe_selected=False,
+        policy_pack_clamps={"chunk_size_cap": 80, "workers_cap": 1, "delay_floor": 1.0, "sleep_floor": 2.0},
+    )
+    assert int(caps["chunk_size"]) <= 200 and int(caps["thread_workers"]) <= 5
+    assert float(caps["delay_s"]) >= 0.2 and float(caps["sleep_chunks"]) >= 0.0
+    logs.append("caps_resolver_clamp_only_ok")
+
+    sb = {0: {"gmail.com": ["a@gmail.com"]}}
+    rq = {"0|gmail.com": [{"next_retry_ts": 0.0, "chunk": ["a@gmail.com"]}]}
+    before = _shadow_state_counts(sb, rq)
+    shadow_picker = LanePickerV2(scheduler_rng=random.Random(11), use_soft_bias=False)
+    _ = shadow_picker.pick_next(now_ts=10.0, sender_cursor=0, sender_buckets={0: {"gmail.com": list(sb[0]["gmail.com"])}}, provider_retry_chunks={"0|gmail.com": list(rq["0|gmail.com"])})
+    after = _shadow_state_counts(sb, rq)
+    assert before == after, "shadow mode must not mutate queues"
+    logs.append("shadow_mode_purity_ok")
+
+    fc = FallbackController(thresholds={"deferral_rate": 0.2, "hardfail_rate": 0.1, "timeout_rate": 0.1, "blocked_per_min": 5.0, "pmta_pressure_level": 3, "exceptions_per_min": 1.0}, window_s=60, debug=False, disable_reenable=True, min_active_s=120, recovery_s=60, actions_config={"step1_disable_concurrency": True, "step2_disable_probe": True, "step3_switch_to_legacy": True})
+    fc.observe(10.0, {"attempts_total": 10, "deferrals_4xx": 0, "hardfails_5xx": 0, "timeouts_conn": 0, "blocked_events": 0, "exceptions_count": 0}, pmta_pressure_level=0)
+    fc.observe(20.0, {"attempts_total": 60, "deferrals_4xx": 20, "hardfails_5xx": 0, "timeouts_conn": 0, "blocked_events": 0, "exceptions_count": 0}, pmta_pressure_level=0)
+    triggered, _reasons = fc.should_trigger(20.0)
+    assert triggered and fc.is_in_fallback(21.0), "fallback should trigger"
+    fc.observe(30.0, {"attempts_total": 80, "deferrals_4xx": 20, "hardfails_5xx": 0, "timeouts_conn": 0, "blocked_events": 0, "exceptions_count": 0}, pmta_pressure_level=0)
+    _t2, _r2 = fc.should_trigger(30.0)
+    assert fc.is_in_fallback(40.0), "fallback hysteresis should prevent immediate flapping"
+    logs.append("fallback_controller_hysteresis_ok")
     return logs
 
 
@@ -2922,6 +3102,7 @@ class SendJob:
     debug_provider_canon: dict = field(default_factory=dict)
     debug_backoff_jitter: List[dict] = field(default_factory=list)
     debug_rollout: dict = field(default_factory=dict)
+    debug_effective_plan: dict = field(default_factory=dict)
     debug_wave_status: dict = field(default_factory=dict)
     debug_policy_pack: dict = field(default_factory=dict)
     debug_learning_policy: dict = field(default_factory=dict)
@@ -3844,6 +4025,7 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "debug_provider_canon": job.debug_provider_canon or {},
         "debug_backoff_jitter": (job.debug_backoff_jitter or [])[-50:],
         "debug_rollout": job.debug_rollout or {},
+        "debug_effective_plan": job.debug_effective_plan or {},
         "debug_wave_status": job.debug_wave_status or {},
         "debug_policy_pack": job.debug_policy_pack or {},
         "debug_learning_policy": job.debug_learning_policy or {},
@@ -4819,6 +5001,7 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job.debug_provider_canon = (s.get("debug_provider_canon") if isinstance(s.get("debug_provider_canon"), dict) else {}) or {}
         job.debug_backoff_jitter = list(s.get("debug_backoff_jitter") or [])
         job.debug_rollout = (s.get("debug_rollout") if isinstance(s.get("debug_rollout"), dict) else {}) or {}
+        job.debug_effective_plan = (s.get("debug_effective_plan") if isinstance(s.get("debug_effective_plan"), dict) else {}) or {}
         job.debug_wave_status = (s.get("debug_wave_status") if isinstance(s.get("debug_wave_status"), dict) else {}) or {}
         job.debug_policy_pack = (s.get("debug_policy_pack") if isinstance(s.get("debug_policy_pack"), dict) else {}) or {}
         job.debug_learning_policy = (s.get("debug_learning_policy") if isinstance(s.get("debug_learning_policy"), dict) else {}) or {}
@@ -15158,10 +15341,61 @@ def smtp_send_job(
                         sender_idx_by_rcpt[rr] = int(_sidx)
         scheduler_rng = random.Random(int(hashlib.sha256(partition_seed.encode("utf-8", errors="ignore")).hexdigest()[:16], 16))
         provider_retry_chunks: Dict[str, List[dict]] = {}
+        provider_buckets = build_provider_buckets([
+            rcpt
+            for domains in sender_bucket_by_idx.values()
+            for bucket in (domains or {}).values()
+            for rcpt in (bucket or [])
+        ])[0]
+        provider_counts = {str(d or "").strip().lower(): int(len(v or [])) for d, v in (provider_buckets or {}).items() if str(d or "").strip()}
+        provider_canon.ingest_provider_counts(provider_counts, mx_by_domain={})
         rollout_effective_mode = str(rollout.get("effective_mode") or "legacy")
         lane_v2_rollout_enabled = bool(rollout_effective_mode == "v2")
         shadow_mode_active = bool(rollout_effective_mode == "shadow")
-        scheduler_mode_runtime = "lane_v2" if lane_v2_rollout_enabled else "legacy"
+        provider_groups_for_plan = {
+            provider_canon.group_for_domain(dom) for dom in (provider_counts or {}).keys() if str(dom or "").strip()
+        }
+        mode_plan = ModeOrchestrator().decide_effective_features(
+            job,
+            {
+                "force_legacy": force_legacy,
+                "force_disable_concurrency": force_disable_concurrency,
+                "lane_concurrency_enabled": lane_concurrency_enabled,
+                "probe_mode_enabled": probe_mode_enabled,
+                "single_domain_waves_enabled": single_domain_waves_enabled,
+                "provider_canon_enabled": provider_canon_enabled,
+                "provider_canon_enforce": provider_canon_enforce,
+                "policy_packs_enabled": policy_packs_enabled,
+                "policy_packs_enforce": policy_packs_enforce,
+                "learning_caps_enabled": learning_caps_enabled,
+                "learning_caps_enforce": learning_caps_enforce,
+                "backoff_jitter_mode": SHIVA_BACKOFF_JITTER,
+                "fallback_controller_enabled": fallback_controller_enabled,
+                "fallback_controller_enabled_explicit": get_env_bool("SHIVA_FALLBACK_CONTROLLER", False),
+                "resource_governor_enabled": resource_governor_enabled,
+                "resource_governor_enabled_explicit": get_env_bool("SHIVA_RESOURCE_GOVERNOR", False),
+                "lane_accounting_recon_enabled": lane_accounting_recon_enabled,
+                "ui_telemetry_enabled": bool(lane_metrics_export or lane_state_export or lane_v2_export),
+                "provider_domains_count": len(set(provider_counts.keys())),
+                "provider_groups_count": len(provider_groups_for_plan),
+                "pmta_pressure_level": int((job.pmta_pressure or {}).get("level") or 0),
+                "fallback_active": False,
+            },
+            rollout,
+        )
+        scheduler_mode_runtime = str(mode_plan.scheduler_mode)
+        lane_concurrency_runtime = bool(mode_plan.concurrency_enabled)
+        probe_mode_enabled = bool(mode_plan.probe_enabled)
+        single_domain_waves_enabled = bool(mode_plan.waves_enabled)
+        provider_canon.enabled = bool(mode_plan.provider_canon_enabled)
+        provider_canon.enforce = bool(mode_plan.provider_canon_enforced)
+        policy_packs_enabled = bool(mode_plan.policy_pack_enabled)
+        policy_packs_enforce = bool(mode_plan.policy_pack_enforced)
+        learning_caps_enforce = bool(mode_plan.learning_caps_enforced)
+        lane_accounting_recon_enabled = bool(mode_plan.accounting_recon_enabled)
+        resource_governor_enabled = bool(mode_plan.resource_governor_enabled)
+        fallback_controller_enabled = bool(mode_plan.fallback_controller_enabled)
+        backoff_jitter_mode_runtime = str(mode_plan.backoff_jitter_mode or "off")
         lane_picker_v2 = LanePickerV2(
             scheduler_rng=scheduler_rng,
             lane_registry=lane_registry,
@@ -15176,7 +15410,6 @@ def smtp_send_job(
             debug_log=lambda msg: job.log("INFO", msg),
         ) if (lane_v2_rollout_enabled or shadow_mode_active or scheduler_mode == "lane_v2") else None
         shadow_recorder = ShadowRecorder(shadow_max_events) if shadow_mode_active else None
-        lane_concurrency_runtime = bool(lane_concurrency_enabled and lane_v2_rollout_enabled and not force_disable_concurrency)
         lane_parallel_limit_runtime = min(int(lane_max_parallel), int(max_total_lanes)) if resource_governor_enabled else int(lane_max_parallel)
         resource_governor = GlobalResourceGovernor(
             max_total_workers=max_total_workers,
@@ -15190,14 +15423,6 @@ def smtp_send_job(
         if lane_concurrency_enabled and not lane_v2_rollout_enabled:
             with JOBS_LOCK:
                 job.log("INFO", "Lane concurrency disabled for this job (rollout not in v2 mode).")
-        provider_buckets = build_provider_buckets([
-            rcpt
-            for domains in sender_bucket_by_idx.values()
-            for bucket in (domains or {}).values()
-            for rcpt in (bucket or [])
-        ])[0]
-        provider_counts = {str(d or "").strip().lower(): int(len(v or [])) for d, v in (provider_buckets or {}).items() if str(d or "").strip()}
-        provider_canon.ingest_provider_counts(provider_counts, mx_by_domain={})
         policy_pack_caps_clamps: Dict[str, dict] = {}
         policy_pack_snapshot: dict = {}
         selected_pack: dict = {}
@@ -15350,7 +15575,7 @@ def smtp_send_job(
                 job.debug_wave_status = wave_controller.snapshot()
 
         fallback_exception_count = 0
-        fallback_controller_runtime = bool(fallback_controller_enabled or lane_v2_rollout_enabled)
+        fallback_controller_runtime = bool(fallback_controller_enabled)
         fallback_thresholds = {
             "deferral_rate": fallback_deferral_rate,
             "hardfail_rate": fallback_hardfail_rate,
@@ -15401,6 +15626,8 @@ def smtp_send_job(
                 "force_legacy": bool(force_legacy),
                 "force_disable_concurrency": bool(force_disable_concurrency),
             }
+            if mode_plan.ui_telemetry_enabled:
+                job.debug_effective_plan = asdict(mode_plan)
 
         def _switch_scheduler_legacy() -> None:
             nonlocal scheduler_mode_runtime
@@ -16350,10 +16577,10 @@ def smtp_send_job(
                     )
                     wait_s = wait_s_base
                     jitter_delta = 0.0
-                    if SHIVA_BACKOFF_JITTER != "off":
+                    if backoff_jitter_mode_runtime != "off":
                         wait_s, jitter_delta = apply_backoff_jitter(
                             wait_s_base=wait_s_base,
-                            mode=SHIVA_BACKOFF_JITTER,
+                            mode=backoff_jitter_mode_runtime,
                             pct=SHIVA_BACKOFF_JITTER_PCT,
                             max_jitter_s=SHIVA_BACKOFF_JITTER_MAX_S,
                             min_jitter_s=SHIVA_BACKOFF_JITTER_MIN_S,
@@ -16394,10 +16621,10 @@ def smtp_send_job(
                     )
                     if intervention:
                         msg += f" | intervention={intervention}"
-                    if SHIVA_BACKOFF_JITTER != "off" and SHIVA_BACKOFF_JITTER_DEBUG:
-                        msg += f" | jitter={jitter_delta:+.2f}s mode={SHIVA_BACKOFF_JITTER}"
+                    if backoff_jitter_mode_runtime != "off" and SHIVA_BACKOFF_JITTER_DEBUG:
+                        msg += f" | jitter={jitter_delta:+.2f}s mode={backoff_jitter_mode_runtime}"
                     job.log("WARN", msg)
-                    if SHIVA_BACKOFF_JITTER != "off" and SHIVA_BACKOFF_JITTER_EXPORT:
+                    if backoff_jitter_mode_runtime != "off" and SHIVA_BACKOFF_JITTER_EXPORT:
                         with JOBS_LOCK:
                             job.debug_backoff_jitter.append({
                                 "lane_key": target_key,
@@ -17038,6 +17265,8 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "Verbose debug logging for lane accounting reconciliation."},
     {"key": "SHIVA_RUN_SELFTESTS", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Run lightweight deterministic rollout self-tests at startup."},
+    {"key": "SHIVA_RUN_ACCEPTANCE_SUITE", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Run internal end-to-end acceptance suite (deterministic, no network IO) at startup."},
 
     # App (restart-only)
     {"key": "SHIVA_HOST", "type": "str", "default": "0.0.0.0", "group": "App", "restart_required": True,
@@ -17288,6 +17517,17 @@ if bool(get_env_bool("SHIVA_RUN_SELFTESTS", False)):
     except Exception as _selftest_exc:
         logging.getLogger("shiva").error("Rollout self-tests failed: %s", _selftest_exc)
 
+if bool(get_env_bool("SHIVA_RUN_ACCEPTANCE_SUITE", False)):
+    try:
+        _acceptance_logs = run_acceptance_suite()
+        _msg = "Acceptance suite PASS ({}): {}".format(len(_acceptance_logs), ",".join(_acceptance_logs))
+        print(_msg)
+        logging.getLogger("shiva").info(_msg)
+    except Exception as _acceptance_exc:
+        _msg = f"Acceptance suite FAIL: {_acceptance_exc}"
+        print(_msg)
+        logging.getLogger("shiva").error(_msg)
+
 
 # =========================
 # Routes
@@ -17409,6 +17649,7 @@ def build_scheduler_telemetry_snapshot(job: 'SendJob') -> dict:
     provider_canon = getattr(job, "debug_provider_canon", {}) or {}
     shadow_events = list(getattr(job, "debug_shadow_events", []) or [])
     rollout = getattr(job, "debug_rollout", {}) or {}
+    effective_plan = getattr(job, "debug_effective_plan", {}) or {}
     wave_status = getattr(job, "debug_wave_status", {}) or {}
     last_caps = getattr(job, "debug_last_caps_resolve", {}) or {}
     probe_status = getattr(job, "debug_probe_status", {}) or {}
@@ -17490,9 +17731,10 @@ def build_scheduler_telemetry_snapshot(job: 'SendJob') -> dict:
             "force_disable_concurrency": bool(rollout.get("force_disable_concurrency") or False),
         },
         "scheduler": {
-            "mode": "lane_v2" if bool(rollout.get("lane_v2_enabled") or rollout.get("effective_mode") in {"on", "canary", "shadow"}) else "legacy",
-            "concurrency_enabled": bool(rollout.get("lane_concurrency_enabled") or False),
+            "mode": str(effective_plan.get("scheduler_mode") or ("lane_v2" if bool(rollout.get("lane_v2_enabled") or rollout.get("effective_mode") in {"on", "canary", "shadow"}) else "legacy")),
+            "concurrency_enabled": bool(effective_plan.get("concurrency_enabled") or rollout.get("lane_concurrency_enabled") or False),
             "max_parallel_lanes": int(rollout.get("max_parallel_lanes") or 1),
+            "effective_plan": dict(effective_plan or {}),
         },
         "probe": {
             "active": bool(probe_status.get("probe_active") or probe_status.get("active") or False),
