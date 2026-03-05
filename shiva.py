@@ -17026,6 +17026,29 @@ def smtp_send_job(
             job.maybe_persist(force=True)
 
 
+def smtp_send_job_thread_entry(*args, **kwargs) -> None:
+    """Thread-safe entrypoint for smtp_send_job.
+
+    Guarantees that unexpected crashes (outside smtp_send_job's internal try/except)
+    still mark the job as failed instead of leaving it stuck in "running" state.
+    """
+    job_id = str((args[0] if args else kwargs.get("job_id")) or "")
+    try:
+        smtp_send_job(*args, **kwargs)
+    except Exception as exc:
+        logging.getLogger("shiva").exception("smtp_send_job_thread_entry fatal crash for job=%s", job_id)
+        if not job_id:
+            return
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if not job:
+                return
+            job.status = "error"
+            job.last_error = str(exc)
+            job.log("ERROR", f"Fatal thread crash: {exc}")
+            job.maybe_persist(force=True)
+
+
 
 # =========================
 # App Config Schema + helpers
@@ -19241,7 +19264,7 @@ def start():
     job.maybe_persist(force=True)
 
     t = threading.Thread(
-        target=smtp_send_job,
+        target=smtp_send_job_thread_entry,
         daemon=True,
         args=(
             job_id,
