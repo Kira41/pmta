@@ -1270,6 +1270,17 @@ class BudgetManager:
             float(now_ts or time.time()) + float(cooldown_s),
         )
 
+    def clone_for_shadow(self) -> 'BudgetManager':
+        cloned = BudgetManager(self.config, lane_registry=self.lane_registry, debug=self.debug)
+        cloned.inflight_by_provider = dict(self.inflight_by_provider)
+        cloned.inflight_by_sender = dict(self.inflight_by_sender)
+        cloned.provider_last_start_ts = dict(self.provider_last_start_ts)
+        cloned.provider_cooldown_until = dict(self.provider_cooldown_until)
+        cloned.lane_inflight = dict(self.lane_inflight)
+        cloned.provider_max_inflight_overrides = dict(self.provider_max_inflight_overrides)
+        cloned.external_gates = dict(self.external_gates)
+        return cloned
+
     def snapshot(self) -> dict:
         return {
             "enabled": bool(self.config.enabled),
@@ -2003,6 +2014,140 @@ class FallbackController:
             "min_active_s": int(self.min_active_s),
             "recovery_s": int(self.recovery_s),
         }
+
+
+class RolloutDecider:
+    """Job-scoped rollout selector for legacy/shadow/canary/on."""
+
+    def __init__(self, mode: str, canary_percent: int, allowlists: dict, denylists: dict, seed_mode: str, debug: bool = False):
+        self.mode = str(mode or "off").strip().lower() or "off"
+        if self.mode not in {"off", "shadow", "canary", "on"}:
+            self.mode = "off"
+        self.canary_percent = max(0, min(100, int(canary_percent or 0)))
+        self.allowlist_campaigns = {str(x or "").strip() for x in (allowlists or {}).get("campaigns", set()) if str(x or "").strip()}
+        self.allowlist_senders = {str(x or "").strip().lower() for x in (allowlists or {}).get("senders", set()) if str(x or "").strip()}
+        self.denylist_campaigns = {str(x or "").strip() for x in (denylists or {}).get("campaigns", set()) if str(x or "").strip()}
+        self.seed_mode = str(seed_mode or "job_id").strip().lower() or "job_id"
+        if self.seed_mode not in {"job_id", "campaign_id"}:
+            self.seed_mode = "job_id"
+        self.debug = bool(debug)
+
+    def _deterministic_bucket(self, seed: str) -> int:
+        raw = str(seed or "").encode("utf-8", errors="ignore")
+        return int(hashlib.sha256(raw).hexdigest()[:8], 16) % 100
+
+    def _sender_allowed(self, sender_emails: Optional[List[str]]) -> bool:
+        if not self.allowlist_senders:
+            return False
+        for sender in sender_emails or []:
+            sender_v = str(sender or "").strip().lower()
+            sender_domain = _extract_domain_from_email(sender_v) or ""
+            if sender_v in self.allowlist_senders or sender_domain in self.allowlist_senders:
+                return True
+        return False
+
+    def decide(self, job: Any, sender_emails: Optional[List[str]] = None, force_legacy: bool = False) -> dict:
+        reasons: List[str] = []
+        job_id = str(getattr(job, "id", "") or "")
+        campaign_id = str(getattr(job, "campaign_id", "") or "")
+
+        if force_legacy:
+            reasons.append("force_legacy")
+            effective = "legacy"
+        elif self.mode == "off":
+            reasons.append("rollout_off")
+            effective = "legacy"
+        elif self.mode == "shadow":
+            reasons.append("shadow_compute_only")
+            effective = "shadow"
+        elif self.mode == "on":
+            reasons.append("rollout_on")
+            effective = "v2"
+        else:
+            if campaign_id and campaign_id in self.denylist_campaigns:
+                reasons.append("campaign_denylist")
+                effective = "legacy"
+            elif campaign_id and campaign_id in self.allowlist_campaigns:
+                reasons.append("campaign_allowlist")
+                effective = "v2"
+            elif self._sender_allowed(sender_emails):
+                reasons.append("sender_allowlist")
+                effective = "v2"
+            else:
+                seed_value = job_id if self.seed_mode == "job_id" else campaign_id
+                bucket = self._deterministic_bucket(seed_value)
+                if bucket < self.canary_percent:
+                    reasons.append(f"canary_percent:{bucket}<{self.canary_percent}")
+                    effective = "v2"
+                else:
+                    reasons.append(f"canary_percent:{bucket}>={self.canary_percent}")
+                    effective = "legacy"
+        return {
+            "rollout_mode": self.mode,
+            "effective_mode": effective,
+            "reasons": reasons,
+            "is_canary": bool(self.mode == "canary" and effective == "v2"),
+            "is_shadow": bool(effective == "shadow"),
+            "is_on": bool(effective == "v2"),
+        }
+
+
+class ShadowRecorder:
+    def __init__(self, max_events: int):
+        self.max_events = max(1, int(max_events or 50))
+        self._events: deque = deque(maxlen=self.max_events)
+
+    def record(self, event_type: str, payload: dict) -> None:
+        self._events.append({
+            "ts": float(time.time()),
+            "type": str(event_type or "event"),
+            "payload": dict(payload or {}),
+        })
+
+    def snapshot(self) -> List[dict]:
+        return [dict(x) for x in list(self._events)]
+
+
+def _shadow_state_counts(sender_buckets: Dict[int, Dict[str, List[str]]], provider_retry_chunks: Dict[str, List[dict]]) -> dict:
+    bucket_total = 0
+    for domains in (sender_buckets or {}).values():
+        for items in (domains or {}).values():
+            bucket_total += len(items or [])
+    retry_total = 0
+    for retry_items in (provider_retry_chunks or {}).values():
+        retry_total += len(retry_items or [])
+    return {"sender_bucket_total": int(bucket_total), "retry_queue_total": int(retry_total)}
+
+
+def _run_rollout_selftests() -> List[str]:
+    logs: List[str] = []
+    rcpts = [f"user{i}@gmail.com" for i in range(12)] + [f"user{i}@yahoo.com" for i in range(9)]
+    senders = ["s1@sender-a.com", "s2@sender-b.com"]
+    out1, stats1 = normalize_and_partition_recipients(rcpts, senders, "seed-selftest")
+    out2, stats2 = normalize_and_partition_recipients(rcpts, senders, "seed-selftest")
+    assert out1 == out2 and stats1 == stats2, "determinism test failed"
+    logs.append("determinism_ok")
+
+    decider = RolloutDecider("off", 5, {"campaigns": set(), "senders": set()}, {"campaigns": set()}, "job_id")
+    j = type("JobStub", (), {"id": "job-1", "campaign_id": "camp-1"})()
+    decision = decider.decide(j, sender_emails=senders, force_legacy=False)
+    assert str(decision.get("effective_mode") or "") == "legacy", "off-mode must stay legacy"
+    logs.append("legacy_off_mode_ok")
+
+    state_buckets = {0: {"gmail.com": ["a@gmail.com", "b@gmail.com"]}}
+    retries = {"0|gmail.com": [{"next_retry_ts": 0.0, "chunk": ["a@gmail.com"]}]}
+    before = _shadow_state_counts(state_buckets, retries)
+    picker = LanePickerV2(scheduler_rng=random.Random(7), use_soft_bias=False)
+    _ = picker.pick_next(
+        now_ts=time.time(),
+        sender_cursor=0,
+        sender_buckets={0: {"gmail.com": list(state_buckets[0]["gmail.com"])}},
+        provider_retry_chunks={"0|gmail.com": list(retries["0|gmail.com"])},
+    )
+    after = _shadow_state_counts(state_buckets, retries)
+    assert before == after, "shadow purity failed"
+    logs.append("shadow_purity_ok")
+    return logs
 
 
 def map_provider_domains_to_sender_indexes(provider_domains: List[str], sender_emails: List[str]) -> Dict[str, int]:
@@ -12975,6 +13120,17 @@ def smtp_send_job(
     scheduler_mode = (get_env("SHIVA_SCHEDULER_MODE", "legacy") or "legacy").strip().lower() or "legacy"
     if scheduler_mode not in {"legacy", "lane_v2"}:
         scheduler_mode = "legacy"
+    rollout_mode = (get_env("SHIVA_ROLLOUT_MODE", "off") or "off").strip().lower() or "off"
+    canary_percent = max(0, min(100, int(get_env_int("SHIVA_CANARY_PERCENT", 5))))
+    canary_seed_mode = (get_env("SHIVA_CANARY_SEED_MODE", "job_id") or "job_id").strip().lower() or "job_id"
+    canary_allowlist_campaigns_raw = str(get_env("SHIVA_CANARY_ALLOWLIST_CAMPAIGNS", "") or "")
+    canary_denylist_campaigns_raw = str(get_env("SHIVA_CANARY_DENYLIST_CAMPAIGNS", "") or "")
+    canary_allowlist_senders_raw = str(get_env("SHIVA_CANARY_ALLOWLIST_SENDERS", "") or "")
+    canary_debug = bool(get_env_bool("SHIVA_CANARY_DEBUG", False))
+    shadow_export_enabled = bool(get_env_bool("SHIVA_SHADOW_EXPORT", False))
+    shadow_max_events = max(1, int(get_env_int("SHIVA_SHADOW_MAX_EVENTS", 50)))
+    force_legacy = bool(get_env_bool("SHIVA_FORCE_LEGACY", False))
+    force_disable_concurrency = bool(get_env_bool("SHIVA_FORCE_DISABLE_CONCURRENCY", False))
     lane_debug_enabled = bool(get_env_bool("SHIVA_LANE_DEBUG", False))
     lane_baseline_enabled = bool(get_env_bool("SHIVA_LANE_BASELINE_REPORT", False))
     lane_metrics_enabled = bool(get_env_bool("SHIVA_LANE_METRICS", False))
@@ -13343,6 +13499,13 @@ def smtp_send_job(
         if not budget_mgr:
             return True, "disabled"
         allowed, reason = budget_mgr.can_start(lane_key, now_ts, is_retry, is_probe, planned_chunk_size_hint=planned_chunk_size_hint)
+        if not allowed and shadow_mode_active and shadow_recorder:
+            shadow_recorder.record("budget_denial", {
+                "lane": f"{lane_key[0]}|{lane_key[1]}",
+                "reason": str(reason or "denied"),
+                "is_retry": bool(is_retry),
+                "is_probe": bool(is_probe),
+            })
         if (not allowed) and (lane_debug_enabled or budget_debug or single_domain_waves_debug):
             with JOBS_LOCK:
                 job.log("INFO", f"BudgetManager: denied lane {lane_key[0]}|{lane_key[1]} reason={reason}")
@@ -13809,6 +13972,19 @@ def smtp_send_job(
 
         # Two-level partitioning (sender -> recipient_domain -> recipients).
         partition_seed = str(job.campaign_id or job.id or job_id)
+        _split_csv = lambda raw: [x.strip() for x in str(raw or "").split(",") if x.strip()]
+        rollout_decider = RolloutDecider(
+            mode=rollout_mode,
+            canary_percent=canary_percent,
+            allowlists={
+                "campaigns": set(_split_csv(canary_allowlist_campaigns_raw)),
+                "senders": set(_split_csv(canary_allowlist_senders_raw)),
+            },
+            denylists={"campaigns": set(_split_csv(canary_denylist_campaigns_raw))},
+            seed_mode=canary_seed_mode,
+            debug=canary_debug,
+        )
+        rollout = rollout_decider.decide(job, sender_emails=sender_emails, force_legacy=force_legacy)
         sender_domain_buckets, partition_stats = normalize_and_partition_recipients(
             recipients=recipients,
             sender_emails=sender_emails,
@@ -13823,6 +13999,10 @@ def smtp_send_job(
         sender_cursor = 0
         scheduler_rng = random.Random(int(hashlib.sha256(partition_seed.encode("utf-8", errors="ignore")).hexdigest()[:16], 16))
         provider_retry_chunks: Dict[str, List[dict]] = {}
+        rollout_effective_mode = str(rollout.get("effective_mode") or "legacy")
+        lane_v2_rollout_enabled = bool(rollout_effective_mode == "v2")
+        shadow_mode_active = bool(rollout_effective_mode == "shadow")
+        scheduler_mode_runtime = "lane_v2" if lane_v2_rollout_enabled else "legacy"
         lane_picker_v2 = LanePickerV2(
             scheduler_rng=scheduler_rng,
             lane_registry=lane_registry,
@@ -13835,11 +14015,12 @@ def smtp_send_job(
             max_scan=lane_v2_max_scan,
             lane_weight_multiplier=_lane_weight_multiplier,
             debug_log=lambda msg: job.log("INFO", msg),
-        ) if scheduler_mode == "lane_v2" else None
-        if lane_concurrency_enabled and scheduler_mode != "lane_v2":
-            lane_concurrency_enabled = False
+        ) if (lane_v2_rollout_enabled or shadow_mode_active or scheduler_mode == "lane_v2") else None
+        shadow_recorder = ShadowRecorder(shadow_max_events) if shadow_mode_active else None
+        lane_concurrency_runtime = bool(lane_concurrency_enabled and lane_v2_rollout_enabled and not force_disable_concurrency)
+        if lane_concurrency_enabled and not lane_v2_rollout_enabled:
             with JOBS_LOCK:
-                job.log("WARN", "SHIVA_LANE_CONCURRENCY requires SHIVA_SCHEDULER_MODE=lane_v2; keeping sequential mode.")
+                job.log("INFO", "Lane concurrency disabled for this job (rollout not in v2 mode).")
         provider_buckets = build_provider_buckets([
             rcpt
             for domains in sender_bucket_by_idx.values()
@@ -13929,9 +14110,8 @@ def smtp_send_job(
             with JOBS_LOCK:
                 job.debug_wave_status = wave_controller.snapshot()
 
-        scheduler_mode_runtime = str(scheduler_mode)
-        lane_concurrency_runtime = bool(lane_concurrency_enabled)
         fallback_exception_count = 0
+        fallback_controller_runtime = bool(fallback_controller_enabled or lane_v2_rollout_enabled)
         fallback_controller = FallbackController(
             thresholds={
                 "deferral_rate": fallback_deferral_rate,
@@ -13951,7 +14131,18 @@ def smtp_send_job(
                 "step2_disable_probe": fallback_step2_disable_probe,
                 "step3_switch_to_legacy": fallback_step3_switch_to_legacy,
             },
-        ) if fallback_controller_enabled else None
+        ) if fallback_controller_runtime else None
+
+        with JOBS_LOCK:
+            job.debug_rollout = {
+                "rollout_mode": str(rollout.get("rollout_mode") or rollout_mode),
+                "effective_mode": str(rollout_effective_mode),
+                "reasons": list(rollout.get("reasons") or []),
+                "is_canary": bool(rollout.get("is_canary")),
+                "is_shadow": bool(shadow_mode_active),
+                "force_legacy": bool(force_legacy),
+                "force_disable_concurrency": bool(force_disable_concurrency),
+            }
 
         def _switch_scheduler_legacy() -> None:
             nonlocal scheduler_mode_runtime
@@ -14002,7 +14193,7 @@ def smtp_send_job(
 
         with JOBS_LOCK:
             if scheduler_mode_runtime != "legacy":
-                job.log("INFO", f"Scheduler mode={scheduler_mode} (Lane Picker v2 enabled; sending pipeline remains legacy/sequential).")
+                job.log("INFO", f"Scheduler mode={scheduler_mode_runtime} (rollout effective_mode={rollout_effective_mode}; sending pipeline remains legacy/sequential).")
             job.log(
                 "INFO",
                 "Recipient partition stats: "
@@ -14203,6 +14394,7 @@ def smtp_send_job(
                 job.debug_baseline_report = dict(baseline_report)
                 job.log("INFO", f"Lane baseline report: {json.dumps(baseline_report, ensure_ascii=False, sort_keys=True)}")
 
+        used_legacy_selector = False
         if lane_debug_enabled:
             try:
                 lane_debug_self_check(baseline_report)
@@ -14348,18 +14540,24 @@ def smtp_send_job(
                 )
                 should_fallback, fallback_reasons = fallback_controller.should_trigger(now_ts)
                 if should_fallback:
-                    fallback_controller.apply_actions(
-                        {
-                            "disable_concurrency": _disable_concurrency_runtime,
-                            "disable_probe": _disable_probe_runtime,
-                            "switch_scheduler_legacy": _switch_scheduler_legacy,
-                        }
-                    )
-                    with JOBS_LOCK:
-                        job.log("WARN", f"Fallback triggered: {', '.join(fallback_reasons)}")
+                    if shadow_mode_active and shadow_recorder:
+                        shadow_recorder.record("fallback_would_trigger", {"reasons": list(fallback_reasons or [])})
+                    else:
+                        fallback_controller.apply_actions(
+                            {
+                                "disable_concurrency": _disable_concurrency_runtime,
+                                "disable_probe": _disable_probe_runtime,
+                                "switch_scheduler_legacy": _switch_scheduler_legacy,
+                            }
+                        )
+                        with JOBS_LOCK:
+                            job.log("WARN", f"Fallback triggered: {', '.join(fallback_reasons)}")
                 if fallback_export:
                     with JOBS_LOCK:
                         job.debug_fallback = fallback_controller.snapshot()
+            if shadow_mode_active and shadow_export_enabled and shadow_recorder:
+                with JOBS_LOCK:
+                    job.debug_shadow_events = shadow_recorder.snapshot()
 
             probe_selected_this_iteration = False
             sender_domain_pick = _pick_retry_ready_sender_domain(now_ts)
@@ -14375,6 +14573,31 @@ def smtp_send_job(
                 if sender_domain_pick:
                     probe_selected_this_iteration = True
             lane_pick_meta: dict = {"pick_type": "none"}
+            if shadow_mode_active and shadow_recorder and lane_picker_v2:
+                shadow_budget_mgr = budget_mgr.clone_for_shadow() if budget_mgr else None
+                shadow_picker = LanePickerV2(
+                    scheduler_rng=random.Random(int(hashlib.sha256(f"{partition_seed}|shadow|{chunk_idx}|{sender_cursor}".encode("utf-8", errors="ignore")).hexdigest()[:16], 16)),
+                    lane_registry=lane_registry,
+                    budget_mgr=shadow_budget_mgr,
+                    debug=False,
+                    export_debug=False,
+                    respect_lane_states=lane_v2_respect_lane_states,
+                    use_budgets=lane_v2_use_budgets,
+                    use_soft_bias=lane_v2_use_soft_bias,
+                    max_scan=lane_v2_max_scan,
+                    lane_weight_multiplier=_lane_weight_multiplier,
+                )
+                shadow_pick, shadow_meta = shadow_picker.pick_next(
+                    now_ts=now_ts,
+                    sender_cursor=sender_cursor,
+                    sender_buckets={k: {d: list(v) for d, v in (vv or {}).items()} for k, vv in sender_bucket_by_idx.items()},
+                    provider_retry_chunks={k: list(v or []) for k, v in provider_retry_chunks.items()},
+                    probe_active=bool(probe_selected_this_iteration),
+                )
+                shadow_recorder.record("lane_v2_pick", {
+                    "pick": (f"{shadow_pick[0]}|{shadow_pick[1]}" if shadow_pick else "none"),
+                    "meta": dict(shadow_meta or {}),
+                })
             if not sender_domain_pick:
                 if scheduler_mode_runtime == "lane_v2" and lane_picker_v2:
                     sender_domain_pick, lane_pick_meta = lane_picker_v2.pick_next(
@@ -14388,6 +14611,7 @@ def smtp_send_job(
                         with JOBS_LOCK:
                             job.debug_last_lane_pick = dict(lane_pick_meta or {})
                 else:
+                    used_legacy_selector = True
                     sender_domain_pick = _next_sender_domain(now_ts)
             if not sender_domain_pick:
                 wait_retry = _next_retry_wait(now_ts)
@@ -15014,6 +15238,10 @@ def smtp_send_job(
         with JOBS_LOCK:
             job.status = "done"
             job.current_chunk = -1
+            if isinstance(job.debug_rollout, dict):
+                job.debug_rollout["used_legacy_selector"] = bool(used_legacy_selector or shadow_mode_active or not lane_v2_rollout_enabled)
+            if shadow_mode_active and shadow_export_enabled and shadow_recorder:
+                job.debug_shadow_events = shadow_recorder.snapshot()
             job.log("INFO", "Job finished.")
             job.maybe_persist(force=True)
 
@@ -15336,6 +15564,30 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "Lower clamp for adaptive burst_tokens."},
     {"key": "SHIVA_WAVE_MAX_BURST", "type": "float", "default": "1200", "group": "Scheduler", "restart_required": False,
      "desc": "Upper clamp for adaptive burst_tokens."},
+    {"key": "SHIVA_ROLLOUT_MODE", "type": "str", "default": "off", "group": "Scheduler", "restart_required": False,
+     "desc": "Rollout mode: off | shadow | canary | on."},
+    {"key": "SHIVA_CANARY_PERCENT", "type": "int", "default": "5", "group": "Scheduler", "restart_required": False,
+     "desc": "Canary percentage of jobs eligible for lane_v2 when rollout mode is canary."},
+    {"key": "SHIVA_CANARY_SEED_MODE", "type": "str", "default": "job_id", "group": "Scheduler", "restart_required": False,
+     "desc": "Deterministic canary seed mode: job_id | campaign_id."},
+    {"key": "SHIVA_CANARY_ALLOWLIST_CAMPAIGNS", "type": "str", "default": "", "group": "Scheduler", "restart_required": False,
+     "desc": "Comma-separated campaign IDs forced into canary lane_v2."},
+    {"key": "SHIVA_CANARY_DENYLIST_CAMPAIGNS", "type": "str", "default": "", "group": "Scheduler", "restart_required": False,
+     "desc": "Comma-separated campaign IDs forced to legacy during canary."},
+    {"key": "SHIVA_CANARY_ALLOWLIST_SENDERS", "type": "str", "default": "", "group": "Scheduler", "restart_required": False,
+     "desc": "Comma-separated sender emails/domains forced into canary lane_v2."},
+    {"key": "SHIVA_CANARY_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Enable extra rollout/canary debug metadata in job payloads."},
+    {"key": "SHIVA_SHADOW_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Export bounded shadow-mode events to job debug payload."},
+    {"key": "SHIVA_SHADOW_MAX_EVENTS", "type": "int", "default": "50", "group": "Scheduler", "restart_required": False,
+     "desc": "Maximum retained shadow events per job."},
+    {"key": "SHIVA_FORCE_LEGACY", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Emergency kill-switch: force legacy scheduler for all jobs."},
+    {"key": "SHIVA_FORCE_DISABLE_CONCURRENCY", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Emergency kill-switch: disable lane concurrency at runtime."},
+    {"key": "SHIVA_RUN_SELFTESTS", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Run lightweight deterministic rollout self-tests at startup."},
 
     # App (restart-only)
     {"key": "SHIVA_HOST", "type": "str", "default": "0.0.0.0", "group": "App", "restart_required": True,
@@ -15568,6 +15820,13 @@ try:
     reload_runtime_config()
 except Exception:
     pass
+
+if bool(get_env_bool("SHIVA_RUN_SELFTESTS", False)):
+    try:
+        _selftest_logs = _run_rollout_selftests()
+        logging.getLogger("shiva").info("Rollout self-tests passed: %s", ",".join(_selftest_logs))
+    except Exception as _selftest_exc:
+        logging.getLogger("shiva").error("Rollout self-tests failed: %s", _selftest_exc)
 
 
 # =========================
