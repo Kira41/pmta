@@ -59,3 +59,29 @@ def test_resolve_caps_applies_policy_pack_clamps(monkeypatch):
     assert caps["thread_workers"] == 2
     assert caps["delay_s"] >= 0.9
     assert any(step.get("step") == "policy_pack" for step in meta.get("steps") or [])
+
+
+def test_resolve_caps_tolerates_list_like_numeric_values(monkeypatch):
+    monkeypatch.setenv("SHIVA_LEARNING_CAPS_ENFORCE", "0")
+    monkeypatch.setenv("SHIVA_LANE_STATE_CAPS_ENFORCE", "0")
+
+    caps, meta = shiva.resolve_caps_for_attempt(
+        job=None,
+        now_ts=1.0,
+        lane_key=(0, "gmail.com"),
+        base_caps={"chunk_size": 500, "thread_workers": 10, "delay_s": 0.1, "sleep_chunks": 0.0},
+        runtime_overrides={"chunk_size": ["400"], "thread_workers": ["8"], "delay_s": ["0.2"], "sleep_chunks": ["1"]},
+        pressure_caps={"level": ["2"], "chunk_size_max": ["200"], "workers_max": ["3"], "delay_min": ["0.5"], "sleep_min": ["2"]},
+        health_caps={"level": ["1"], "applied": {"chunk_size": ["150"], "workers": ["2"], "delay_s": ["0.7"], "sleep_chunks": ["3"]}},
+        lane_registry=None,
+        learning_engine={},
+        probe_selected=False,
+        policy_pack_clamps={},
+    )
+
+    assert caps["chunk_size"] == 150
+    assert caps["thread_workers"] == 2
+    assert caps["delay_s"] >= 0.7
+    assert caps["sleep_chunks"] >= 3.0
+    assert any("pmta_level=2" in str(step.get("reason")) for step in (meta.get("steps") or []))
+    assert any("health_level=1" in str(step.get("reason")) for step in (meta.get("steps") or []))
