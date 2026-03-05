@@ -7073,14 +7073,52 @@ PAGE_JOBS = r"""
       backdrop-filter: blur(10px);
     }
 
+    .filterToggleBtn{
+      position: fixed;
+      top: 86px;
+      right: 18px;
+      z-index: 45;
+      border-radius: 999px;
+      padding: 11px 14px;
+      box-shadow: var(--shadow);
+    }
+
+    .filterDrawerBackdrop{
+      position: fixed;
+      inset: 0;
+      background: rgba(3,7,20,.58);
+      backdrop-filter: blur(2px);
+      z-index: 46;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .22s ease;
+    }
+    .filterDrawer{
+      position: fixed;
+      top: 0;
+      right: 0;
+      width: min(380px, 94vw);
+      height: 100vh;
+      overflow-y: auto;
+      z-index: 47;
+      transform: translateX(102%);
+      transition: transform .24s ease;
+      padding: 74px 14px 16px;
+      background: linear-gradient(180deg, rgba(10,16,34,.96), rgba(8,13,28,.98));
+      border-left: 1px solid var(--border);
+      box-shadow: -14px 0 42px rgba(0,0,0,.36);
+    }
+    body.filterMenuOpen .filterDrawerBackdrop{opacity:1; pointer-events:auto;}
+    body.filterMenuOpen .filterDrawer{transform: translateX(0);}
+
     .filterBar{
       background: linear-gradient(180deg, var(--card), var(--card2));
       border:1px solid var(--border);
       border-radius: 14px;
       padding: 10px 12px;
-      margin-bottom: 12px;
+      margin-bottom: 6px;
       display:grid;
-      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      grid-template-columns: 1fr;
       gap:8px;
       align-items:end;
     }
@@ -7104,7 +7142,7 @@ PAGE_JOBS = r"""
       padding:8px 9px;
     }
     .filterCell option{ background:#0b1020; color:#fff; }
-    .filterMeta{ grid-column:1 / -1; font-size:12px; color:var(--muted); }
+    .filterMeta{ grid-column:1 / -1; font-size:12px; color:var(--muted); margin-top:2px; }
 
     .jobTop{display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start; justify-content:space-between;}
     .titleRow{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
@@ -7434,55 +7472,60 @@ PAGE_JOBS = r"""
       </div>
     </div>
 
-    <div class="filterBar" id="jobsFilterBar">
-      <div class="filterCell">
-        <label for="fltStatus" class="labelTip">Status <span class="tip" data-tip="Filter jobs by current execution state (running/done/paused/backoff).">ⓘ</span></label>
-        <select id="fltStatus">
-          <option value="all">All</option>
-          <option value="running">running</option>
-          <option value="done">done</option>
-          <option value="paused">paused</option>
-          <option value="backoff">backoff</option>
-        </select>
+    <button class="btn secondary filterToggleBtn" type="button" id="btnToggleFilters">🧰 Filters</button>
+    <div class="filterDrawerBackdrop" id="jobsFilterBackdrop"></div>
+    <aside class="filterDrawer" id="jobsFilterDrawer" aria-hidden="true">
+      <div class="filterBar" id="jobsFilterBar">
+        <div class="filterCell">
+          <label for="fltStatus" class="labelTip">Status <span class="tip" data-tip="Filter jobs by current execution state (running/done/paused/backoff/stop).">ⓘ</span></label>
+          <select id="fltStatus">
+            <option value="all">All</option>
+            <option value="running">running</option>
+            <option value="done">done</option>
+            <option value="paused">paused</option>
+            <option value="backoff">backoff</option>
+            <option value="stop">stop</option>
+          </select>
+        </div>
+        <div class="filterCell">
+          <label for="fltMode" class="labelTip">Mode <span class="tip" data-tip="Show jobs by bridge polling mode: counts or legacy.">ⓘ</span></label>
+          <select id="fltMode">
+            <option value="all">All</option>
+            <option value="counts">counts</option>
+            <option value="legacy">legacy</option>
+          </select>
+        </div>
+        <div class="filterCell">
+          <label for="fltRisk" class="labelTip">Risk <span class="tip" data-tip="Highlight jobs with health/risk signals such as stale updates or degraded internals.">ⓘ</span></label>
+          <select id="fltRisk">
+            <option value="all">All</option>
+            <option value="internal_degraded">internal degraded</option>
+            <option value="deliverability_high">deliverability high</option>
+            <option value="stale">stale</option>
+          </select>
+        </div>
+        <div class="filterCell">
+          <label for="fltProvider" class="labelTip">Provider <span class="tip" data-tip="Filter by recipient provider bucket (gmail/yahoo/outlook/icloud/other).">ⓘ</span></label>
+          <select id="fltProvider">
+            <option value="all">All</option>
+            <option value="gmail">gmail</option>
+            <option value="yahoo">yahoo</option>
+            <option value="outlook">outlook</option>
+            <option value="icloud">icloud</option>
+            <option value="other">other</option>
+          </select>
+        </div>
+        <div class="filterCell">
+          <label for="fltSort" class="labelTip">Sort <span class="tip" data-tip="Control card order: newest first, highest risk first, or stalest first.">ⓘ</span></label>
+          <select id="fltSort">
+            <option value="newest">newest first</option>
+            <option value="highest_risk">highest risk first</option>
+            <option value="stalest">stalest first</option>
+          </select>
+        </div>
+        <div class="filterMeta" id="filterMeta">Showing all jobs.</div>
       </div>
-      <div class="filterCell">
-        <label for="fltMode" class="labelTip">Mode <span class="tip" data-tip="Show jobs by bridge polling mode: counts or legacy.">ⓘ</span></label>
-        <select id="fltMode">
-          <option value="all">All</option>
-          <option value="counts">counts</option>
-          <option value="legacy">legacy</option>
-        </select>
-      </div>
-      <div class="filterCell">
-        <label for="fltRisk" class="labelTip">Risk <span class="tip" data-tip="Highlight jobs with health/risk signals such as stale updates or degraded internals.">ⓘ</span></label>
-        <select id="fltRisk">
-          <option value="all">All</option>
-          <option value="internal_degraded">internal degraded</option>
-          <option value="deliverability_high">deliverability high</option>
-          <option value="stale">stale</option>
-        </select>
-      </div>
-      <div class="filterCell">
-        <label for="fltProvider" class="labelTip">Provider <span class="tip" data-tip="Filter by recipient provider bucket (gmail/yahoo/outlook/icloud/other).">ⓘ</span></label>
-        <select id="fltProvider">
-          <option value="all">All</option>
-          <option value="gmail">gmail</option>
-          <option value="yahoo">yahoo</option>
-          <option value="outlook">outlook</option>
-          <option value="icloud">icloud</option>
-          <option value="other">other</option>
-        </select>
-      </div>
-      <div class="filterCell">
-        <label for="fltSort" class="labelTip">Sort <span class="tip" data-tip="Control card order: newest first, highest risk first, or stalest first.">ⓘ</span></label>
-        <select id="fltSort">
-          <option value="newest">newest first</option>
-          <option value="highest_risk">highest risk first</option>
-          <option value="stalest">stalest first</option>
-        </select>
-      </div>
-      <div class="filterMeta" id="filterMeta">Showing all jobs.</div>
-    </div>
+    </aside>
 
     {% for j in jobs %}
       <div class="job" data-jobid="{{j.id}}" data-created="{{j.created_at}}">
@@ -7791,6 +7834,7 @@ PAGE_JOBS = r"""
   function normalizeJobStatus(j){
     const raw = (j && j.status ? j.status : '').toString().trim().toLowerCase();
     if(raw === 'running' || raw === 'done' || raw === 'paused' || raw === 'backoff') return raw;
+    if(raw === 'stop' || raw === 'stopped') return 'stop';
     return 'other';
   }
 
@@ -9226,7 +9270,7 @@ This will remove it from Jobs history.`);
       const risk = get('risk', 'all');
       const provider = get('provider', 'all');
       const sort = get('sort', 'newest');
-      state.filters.status = ['all','running','done','paused','backoff'].includes(status) ? status : 'all';
+      state.filters.status = ['all','running','done','paused','backoff','stop'].includes(status) ? status : 'all';
       state.filters.mode = ['all','counts','legacy'].includes(mode) ? mode : 'all';
       state.filters.risk = ['all','internal_degraded','deliverability_high','stale'].includes(risk) ? risk : 'all';
       state.filters.provider = ['all','gmail','yahoo','outlook','icloud','other'].includes(provider) ? provider : 'all';
@@ -9319,8 +9363,33 @@ This will remove it from Jobs history.`);
     }
   }
 
+  function setFilterDrawerOpen(open){
+    const isOpen = !!open;
+    document.body.classList.toggle('filterMenuOpen', isOpen);
+    const drawer = document.getElementById('jobsFilterDrawer');
+    if(drawer) drawer.setAttribute('aria-hidden', isOpen ? 'false' : 'true');
+  }
+
+  function bindFilterDrawer(){
+    const btn = document.getElementById('btnToggleFilters');
+    const backdrop = document.getElementById('jobsFilterBackdrop');
+    if(btn){
+      btn.addEventListener('click', () => {
+        const isOpen = document.body.classList.contains('filterMenuOpen');
+        setFilterDrawerOpen(!isOpen);
+      });
+    }
+    if(backdrop){
+      backdrop.addEventListener('click', () => setFilterDrawerOpen(false));
+    }
+    document.addEventListener('keydown', (ev) => {
+      if(ev.key === 'Escape') setFilterDrawerOpen(false);
+    });
+  }
+
   restoreFiltersFromQuery();
   syncFilterInputs();
+  bindFilterDrawer();
 
   let cards = Array.from(document.querySelectorAll('.job[data-jobid]'));
   cards.forEach(bindControls);
