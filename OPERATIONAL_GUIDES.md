@@ -438,3 +438,100 @@ curl -s "${BRIDGE_BASE_URL}/api/v1/job/count?job_id=${PMTA_JOB_ID}" | jq
 2. **Shiva يسحب لكن لا يربط الأحداث بجوب** (`job_not_found` مرتفع ⇒ `accepted=0`).
 
 ابدأ دائمًا بـ `/api/accounting/bridge/status` لأنه يعطيك الحكم الفوري: هل المشكلة `events_received=0` (سحب) أم `job_not_found>0` (ربط).
+
+---
+
+## Lane Scheduler v2 Operations
+
+### 1) Recommended deployment path
+
+1. `shadow` لمدة 24 ساعة (legacy execution + shadow events only).
+2. `canary` بنسبة 5%.
+3. زيادة تدريجية: 20% ثم 50%.
+4. `on` بعد استقرار المؤشرات.
+
+### 2) Recommended flag sets
+
+#### Shadow (safe observe-only)
+```bash
+SHIVA_ROLLOUT_MODE=shadow
+SHIVA_SHADOW_EXPORT=1
+SHIVA_UI_TELEMETRY=1
+SHIVA_POLICY_PACKS=1
+SHIVA_POLICY_PACKS_ENFORCE=0
+SHIVA_LEARNING_CAPS=1
+SHIVA_LEARNING_CAPS_ENFORCE=0
+```
+
+#### Canary (minimal recommended config)
+```bash
+SHIVA_ROLLOUT_MODE=canary
+SHIVA_CANARY_PERCENT=5
+SHIVA_LANE_CONCURRENCY=1
+SHIVA_FALLBACK_CONTROLLER=1
+SHIVA_RESOURCE_GOVERNOR=1
+SHIVA_BACKOFF_JITTER=deterministic
+SHIVA_UI_TELEMETRY=1
+SHIVA_SHADOW_EXPORT=1
+```
+
+#### On (full rollout)
+```bash
+SHIVA_ROLLOUT_MODE=on
+SHIVA_LANE_CONCURRENCY=1
+SHIVA_FALLBACK_CONTROLLER=1
+SHIVA_RESOURCE_GOVERNOR=1
+SHIVA_BACKOFF_JITTER=deterministic
+SHIVA_POLICY_PACKS=1
+SHIVA_POLICY_PACKS_ENFORCE=1   # optional
+SHIVA_LEARNING_CAPS=1
+SHIVA_LEARNING_CAPS_ENFORCE=1  # optional
+SHIVA_UI_TELEMETRY=1
+```
+
+### 3) Troubleshooting checklist
+
+- إذا ارتفعت `deferrals`:
+  - راقب telemetry panel.
+  - راجع provider budgets و `provider_min_gap`.
+  - تأكد من تفعيل wave mode للحالات single-domain فقط.
+  - قلل `SHIVA_MAX_PARALLEL_LANES` أو عطّل concurrency مؤقتًا.
+
+- إذا ارتفعت `timeouts`:
+  - راجع governor caps (`max_total_workers`, `max_total_lanes`).
+  - راقب lane states (خصوصًا `INFRA_FAIL` / `QUARANTINED`).
+  - خفض إجمالي العمال (workers) تدريجيًا.
+
+### 4) Emergency rollback
+
+1. إجبار legacy فورًا:
+   ```bash
+   SHIVA_FORCE_LEGACY=1
+   ```
+   (بديل: `SHIVA_ROLLOUT_MODE=off`)
+
+2. إيقاف concurrency:
+   ```bash
+   SHIVA_FORCE_DISABLE_CONCURRENCY=1
+   ```
+
+3. أعد تشغيل الخدمة لتطبيق الإعدادات بسرعة.
+
+### 5) What to monitor in telemetry panel
+
+- توزيع lane states: `HEALTHY` مقابل `THROTTLED/QUARANTINED/INFRA_FAIL`.
+- معدل deferrals لكل provider/group.
+- fallback trigger events + reasons.
+- inflight lanes + total workers (وخاصة تحت governor).
+- PMTA pressure level over time.
+
+### 6) Internal acceptance suite (no network)
+
+لتشغيل suite سريع قبل rollout:
+
+```bash
+SHIVA_RUN_ACCEPTANCE_SUITE=1 python -c "import shiva"
+```
+
+- الاختبارات deterministic وتعمل على synthetic state فقط.
+- لا يوجد إرسال SMTP ولا network endpoints.
