@@ -16,6 +16,7 @@ import time
 import uuid
 import threading
 import queue
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email import policy as email_policy
@@ -515,6 +516,161 @@ def lane_debug_self_check(report: dict) -> None:
     logger.info("lane_debug_self_check: partition_seed=%s", partition_seed)
 
 
+class LaneMetrics:
+    """In-memory rolling lane health metrics keyed by (sender_idx, provider_domain)."""
+
+    def __init__(self, window: int, use_ema: bool):
+        self.window = max(1, int(window or 1))
+        self.use_ema = bool(use_ema)
+        self._lanes: Dict[str, dict] = {}
+
+    def _lane_id(self, lane_key: Tuple[int, str]) -> str:
+        sender_idx, provider_domain = lane_key
+        return f"{int(sender_idx)}|{str(provider_domain or '').strip().lower()}"
+
+    def ensure_lane(self, lane_key: Tuple[int, str], *, sender_email: str = "", sender_domain: str = "") -> dict:
+        lid = self._lane_id(lane_key)
+        lane = self._lanes.get(lid)
+        if lane is None:
+            lane = {
+                "sender_idx": int(lane_key[0] or 0),
+                "provider_domain": str(lane_key[1] or "").strip().lower(),
+                "sender_email": str(sender_email or "").strip(),
+                "sender_domain": str(sender_domain or "").strip().lower(),
+                "window": deque(maxlen=self.window),
+                "sums": {
+                    "attempts_total": 0,
+                    "sent_attempts": 0,
+                    "accepted_2xx": 0,
+                    "deferrals_4xx": 0,
+                    "hardfails_5xx": 0,
+                    "timeouts_conn": 0,
+                    "blocked_events": 0,
+                    "backoff_events": 0,
+                },
+                "chunks_selected": 0,
+                "selected_messages": 0,
+                "last_error_samples": deque(maxlen=5),
+                "last_backoff": {"wait_s": 0.0, "failure_type": ""},
+            }
+            self._lanes[lid] = lane
+        else:
+            if sender_email:
+                lane["sender_email"] = str(sender_email).strip()
+            if sender_domain:
+                lane["sender_domain"] = str(sender_domain).strip().lower()
+        return lane
+
+    def _push_window(self, lane: dict, sample: dict) -> None:
+        w = lane["window"]
+        sums = lane["sums"]
+        if len(w) >= self.window:
+            old = w[0]
+            for k in sums.keys():
+                sums[k] = int(sums.get(k) or 0) - int(old.get(k) or 0)
+        w.append(sample)
+        for k in sums.keys():
+            sums[k] = int(sums.get(k) or 0) + int(sample.get(k) or 0)
+
+    def _add_error_signature(self, lane: dict, signature: str) -> None:
+        sig = str(signature or "").strip()
+        if sig:
+            lane["last_error_samples"].append(sig[:160])
+
+    def on_chunk_selected(self, lane_key: Tuple[int, str], chunk_size: int, *, sender_email: str = "", sender_domain: str = "") -> None:
+        lane = self.ensure_lane(lane_key, sender_email=sender_email, sender_domain=sender_domain)
+        lane["chunks_selected"] = int(lane.get("chunks_selected") or 0) + 1
+        lane["selected_messages"] = int(lane.get("selected_messages") or 0) + max(0, int(chunk_size or 0))
+
+    def on_blocked(self, lane_key: Tuple[int, str], reason: str, *, sender_email: str = "", sender_domain: str = "") -> None:
+        lane = self.ensure_lane(lane_key, sender_email=sender_email, sender_domain=sender_domain)
+        self._push_window(
+            lane,
+            {
+                "attempts_total": 0,
+                "sent_attempts": 0,
+                "accepted_2xx": 0,
+                "deferrals_4xx": 0,
+                "hardfails_5xx": 0,
+                "timeouts_conn": 0,
+                "blocked_events": 1,
+                "backoff_events": 0,
+            },
+        )
+        self._add_error_signature(lane, f"blocked:{str(reason or 'policy').strip()[:140]}")
+
+    def on_chunk_result(self, lane_key: Tuple[int, str], counts_dict: dict, *, sender_email: str = "", sender_domain: str = "") -> None:
+        lane = self.ensure_lane(lane_key, sender_email=sender_email, sender_domain=sender_domain)
+        sample = {
+            "attempts_total": max(0, int((counts_dict or {}).get("attempts_total") or 0)),
+            "sent_attempts": max(0, int((counts_dict or {}).get("sent_attempts") or 0)),
+            "accepted_2xx": max(0, int((counts_dict or {}).get("accepted_2xx") or 0)),
+            "deferrals_4xx": max(0, int((counts_dict or {}).get("deferrals_4xx") or 0)),
+            "hardfails_5xx": max(0, int((counts_dict or {}).get("hardfails_5xx") or 0)),
+            "timeouts_conn": max(0, int((counts_dict or {}).get("timeouts_conn") or 0)),
+            "blocked_events": max(0, int((counts_dict or {}).get("blocked_events") or 0)),
+            "backoff_events": 0,
+        }
+        self._push_window(lane, sample)
+        for sig in list((counts_dict or {}).get("error_signatures") or [])[:5]:
+            self._add_error_signature(lane, str(sig))
+
+    def on_backoff_scheduled(self, lane_key: Tuple[int, str], wait_s: float, failure_type: str, *, sender_email: str = "", sender_domain: str = "") -> None:
+        lane = self.ensure_lane(lane_key, sender_email=sender_email, sender_domain=sender_domain)
+        self._push_window(
+            lane,
+            {
+                "attempts_total": 0,
+                "sent_attempts": 0,
+                "accepted_2xx": 0,
+                "deferrals_4xx": 0,
+                "hardfails_5xx": 0,
+                "timeouts_conn": 0,
+                "blocked_events": 0,
+                "backoff_events": 1,
+            },
+        )
+        lane["last_backoff"] = {"wait_s": float(wait_s or 0.0), "failure_type": str(failure_type or "")}
+        self._add_error_signature(lane, f"backoff:{str(failure_type or 'unknown')}")
+
+    def snapshot(self) -> dict:
+        out: Dict[str, Any] = {
+            "window": int(self.window),
+            "use_ema": bool(self.use_ema),
+            "lanes": {},
+        }
+        for lane_id, lane in self._lanes.items():
+            sums = lane.get("sums") or {}
+            attempts = max(1, int(sums.get("attempts_total") or 0))
+            out["lanes"][lane_id] = {
+                "sender_idx": int(lane.get("sender_idx") or 0),
+                "sender_email": str(lane.get("sender_email") or ""),
+                "sender_domain": str(lane.get("sender_domain") or ""),
+                "provider_domain": str(lane.get("provider_domain") or ""),
+                "window_samples": int(len(lane.get("window") or [])),
+                "chunks_selected": int(lane.get("chunks_selected") or 0),
+                "selected_messages": int(lane.get("selected_messages") or 0),
+                "attempts_total": int(sums.get("attempts_total") or 0),
+                "sent_attempts": int(sums.get("sent_attempts") or 0),
+                "accepted_2xx": int(sums.get("accepted_2xx") or 0),
+                "deferrals_4xx": int(sums.get("deferrals_4xx") or 0),
+                "hardfails_5xx": int(sums.get("hardfails_5xx") or 0),
+                "timeouts_conn": int(sums.get("timeouts_conn") or 0),
+                "blocked_events": int(sums.get("blocked_events") or 0),
+                "backoff_events": int(sums.get("backoff_events") or 0),
+                "deferral_rate": float(int(sums.get("deferrals_4xx") or 0) / attempts),
+                "hardfail_rate": float(int(sums.get("hardfails_5xx") or 0) / attempts),
+                "timeout_rate": float(int(sums.get("timeouts_conn") or 0) / attempts),
+                "last_backoff": dict(lane.get("last_backoff") or {}),
+                "last_error_samples": list(lane.get("last_error_samples") or []),
+            }
+        return out
+
+    def reset_for_job(self, job_id: str) -> None:
+        _ = str(job_id or "")
+        self._lanes = {}
+
+
 def map_provider_domains_to_sender_indexes(provider_domains: List[str], sender_emails: List[str]) -> Dict[str, int]:
     """Distribute provider domains evenly across sender emails.
 
@@ -592,6 +748,7 @@ class SendJob:
 
     # Scheduler baseline snapshot (optional; debug-only, additive)
     debug_baseline_report: dict = field(default_factory=dict)
+    debug_lane_metrics_snapshot: dict = field(default_factory=dict)
 
     # PMTA diagnostics snapshot (optional; helps classify failures quickly)
     pmta_diag: dict = field(default_factory=dict)
@@ -1497,6 +1654,7 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "pmta_pressure": job.pmta_pressure or {},
         "pmta_pressure_ts": job.pmta_pressure_ts or "",
         "debug_baseline_report": job.debug_baseline_report or {},
+        "lane_metrics": job.debug_lane_metrics_snapshot or {},
         "pmta_diag": job.pmta_diag or {},
         "pmta_diag_ts": job.pmta_diag_ts or "",
         "created_at": job.created_at,
@@ -2235,6 +2393,7 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job.pmta_pressure = (s.get("pmta_pressure") if isinstance(s.get("pmta_pressure"), dict) else {}) or {}
         job.pmta_pressure_ts = str(s.get("pmta_pressure_ts") or "")
         job.debug_baseline_report = (s.get("debug_baseline_report") if isinstance(s.get("debug_baseline_report"), dict) else {}) or {}
+        job.debug_lane_metrics_snapshot = (s.get("lane_metrics") if isinstance(s.get("lane_metrics"), dict) else {}) or {}
         job.pmta_diag = (s.get("pmta_diag") if isinstance(s.get("pmta_diag"), dict) else {}) or {}
         job.pmta_diag_ts = str(s.get("pmta_diag_ts") or "")
         job.updated_at = str(s.get("updated_at") or "")
@@ -11460,6 +11619,71 @@ def smtp_send_job(
         scheduler_mode = "legacy"
     lane_debug_enabled = bool(get_env_bool("SHIVA_LANE_DEBUG", False))
     lane_baseline_enabled = bool(get_env_bool("SHIVA_LANE_BASELINE_REPORT", False))
+    lane_metrics_enabled = bool(get_env_bool("SHIVA_LANE_METRICS", False))
+    lane_metrics_window = max(1, int(get_env_int("SHIVA_LANE_METRICS_WINDOW", 200)))
+    lane_metrics_use_ema = bool(get_env_bool("SHIVA_LANE_METRICS_EMA", True))
+    lane_metrics_export = bool(get_env_bool("SHIVA_LANE_METRICS_EXPORT", False))
+    lane_metrics = LaneMetrics(window=lane_metrics_window, use_ema=lane_metrics_use_ema) if lane_metrics_enabled else None
+
+    if lane_metrics_export:
+        with JOBS_LOCK:
+            job.debug_lane_metrics_snapshot = {}
+
+    def _lane_key(sender_idx: int, provider_domain: str) -> Tuple[int, str]:
+        return (int(sender_idx or 0), str(provider_domain or "").strip().lower())
+
+    def _lane_signature_from_detail(detail: str) -> Tuple[str, str]:
+        txt = str(detail or "").strip()
+        low = txt.lower()
+        m = re.search(r"\b([245]\d\d)\b", txt)
+        code = m.group(1) if m else ""
+        if "timeout" in low or "timed out" in low:
+            return "timeout", f"timeout:{txt[:120]}"
+        if code.startswith("4") or any(x in low for x in ("defer", "temporary", "transient", "4.7", " 421", " 450", " 451", " 452")):
+            return "4xx", (f"4xx:{code} " if code else "4xx:") + txt[:110]
+        if code.startswith("5") or any(x in low for x in ("permanent", "reject", "denied", "blocked", "user unknown", "invalid recipient")):
+            return "5xx", (f"5xx:{code} " if code else "5xx:") + txt[:110]
+        return "5xx", f"err:{txt[:120]}"
+
+    def _lane_chunk_result_from_recent(recent_slice: List[dict], chunk_len: int) -> dict:
+        accepted = 0
+        timeouts = 0
+        deferrals = 0
+        hardfails = 0
+        signatures: List[str] = []
+        for rr in (recent_slice or []):
+            if bool(rr.get("ok")):
+                accepted += 1
+                continue
+            klass, sig = _lane_signature_from_detail(str(rr.get("detail") or ""))
+            if klass == "timeout":
+                timeouts += 1
+            elif klass == "4xx":
+                deferrals += 1
+            else:
+                hardfails += 1
+            if sig:
+                signatures.append(sig)
+        attempts_total = accepted + timeouts + deferrals + hardfails
+        if attempts_total <= 0:
+            attempts_total = max(0, int(chunk_len or 0))
+        sent_attempts = max(0, int(chunk_len or attempts_total))
+        return {
+            "attempts_total": int(attempts_total),
+            "sent_attempts": int(sent_attempts),
+            "accepted_2xx": int(accepted),
+            "deferrals_4xx": int(deferrals),
+            "hardfails_5xx": int(hardfails),
+            "timeouts_conn": int(timeouts),
+            "error_signatures": signatures[:5],
+        }
+
+    def _lane_metrics_export_snapshot() -> None:
+        if not (lane_metrics and lane_metrics_export):
+            return
+        snap = lane_metrics.snapshot()
+        with JOBS_LOCK:
+            job.debug_lane_metrics_snapshot = snap
 
     smtp_host_ips = _resolve_ipv4(smtp_host) if smtp_host else []
 
@@ -12179,6 +12403,19 @@ def smtp_send_job(
                 sender_attempt_in_domain = 0
                 chunk_idx_local = chunk_idx
 
+            if lane_metrics:
+                sender_email_for_lane = ""
+                sender_domain_for_lane = ""
+                if 0 <= int(sender_idx_fixed or 0) < len(from_emails2):
+                    sender_email_for_lane = str(from_emails2[int(sender_idx_fixed)] or "")
+                    sender_domain_for_lane = _extract_domain_from_email(sender_email_for_lane) or ""
+                lane_metrics.on_chunk_selected(
+                    _lane_key(sender_idx_fixed, target_domain),
+                    len(chunk),
+                    sender_email=sender_email_for_lane,
+                    sender_domain=sender_domain_for_lane,
+                )
+
             chunk_url = _cyclic_pick(urls2, chunk_idx_local)
             chunk_src = _cyclic_pick(src2, chunk_idx_local)
 
@@ -12399,6 +12636,13 @@ def smtp_send_job(
                     pmta_text = f"pmta={pmta_reason}"
                     blocked_reasons.append(pmta_text)
                     blocked_signals.append(("pmta", pmta_reason or "policy block"))
+                    if lane_metrics:
+                        lane_metrics.on_blocked(
+                            _lane_key(sender_idx_fixed, target_domain),
+                            pmta_reason or "pmta policy block",
+                            sender_email=fe,
+                            sender_domain=active_sender_domain,
+                        )
 
                 blocked = spam_blocked or blacklist_blocked or pmta_blocked
                 failure_type, intervention = _classify_backoff_failure(
@@ -12516,6 +12760,15 @@ def smtp_send_job(
                     if intervention:
                         msg += f" | intervention={intervention}"
                     job.log("WARN", msg)
+                    if lane_metrics:
+                        lane_metrics.on_backoff_scheduled(
+                            _lane_key(sender_idx_fixed, target_domain),
+                            wait_s,
+                            failure_type,
+                            sender_email=fe,
+                            sender_domain=active_sender_domain,
+                        )
+                        _lane_metrics_export_snapshot()
 
                     retry_queue = provider_retry_chunks.setdefault(target_key, [])
                     retry_queue.append({
@@ -12551,6 +12804,10 @@ def smtp_send_job(
                     _stop_job("stop requested")
                     return
 
+                before_recent_len = 0
+                with JOBS_LOCK:
+                    before_recent_len = len(job.recent_results or [])
+
                 _send_chunk(
                     chunk_idx=chunk_idx_local,
                     chunk_rcpts=chunk,
@@ -12565,6 +12822,17 @@ def smtp_send_job(
                     chunk_url=chunk_url,
                     chunk_src=chunk_src,
                 )
+
+                if lane_metrics:
+                    with JOBS_LOCK:
+                        recent_slice = list((job.recent_results or [])[before_recent_len:])
+                    lane_metrics.on_chunk_result(
+                        _lane_key(sender_idx_fixed, target_domain),
+                        _lane_chunk_result_from_recent(recent_slice, len(chunk)),
+                        sender_email=fe,
+                        sender_domain=active_sender_domain,
+                    )
+                    _lane_metrics_export_snapshot()
                 db_log_email_attempt(
                     job_id=job_id,
                     campaign_id=job.campaign_id,
@@ -12772,6 +13040,14 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "Enable lane debug self-check invariants (logging + fatal on hard mismatch)."},
     {"key": "SHIVA_LANE_BASELINE_REPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Emit one baseline scheduler report at job start (read-only snapshot)."},
+    {"key": "SHIVA_LANE_METRICS", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Enable in-memory lane metrics per (sender_idx, provider_domain) during send loop."},
+    {"key": "SHIVA_LANE_METRICS_WINDOW", "type": "int", "default": "200", "group": "Scheduler", "restart_required": False,
+     "desc": "Lane metrics rolling window size (samples per lane)."},
+    {"key": "SHIVA_LANE_METRICS_EMA", "type": "bool", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "Compatibility flag for lane metrics smoothing mode (rolling window implementation is used in this phase)."},
+    {"key": "SHIVA_LANE_METRICS_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Export lane metrics snapshot into job debug payload as additive field lane_metrics."},
 
     # App (restart-only)
     {"key": "SHIVA_HOST", "type": "str", "default": "0.0.0.0", "group": "App", "restart_required": True,
