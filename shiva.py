@@ -14449,6 +14449,17 @@ def smtp_send_job(
             f"Starting job. total={len(recipients)} host={smtp_host}:{smtp_port} security={smtp_security} chunk_size={chunk_size} workers={thread_workers} sleep_chunks={sleep_chunks}s",
         )
 
+    # Prime PMTA live panel with an initial snapshot regardless of adaptive/backoff toggles.
+    # This keeps the UI informative (connected/unreachable/disabled reason) even when
+    # PMTA_QUEUE_BACKOFF and PMTA_PRESSURE_CONTROL are both disabled.
+    try:
+        initial_live = pmta_live_panel(smtp_host=smtp_host)
+        with JOBS_LOCK:
+            job.pmta_live = initial_live
+            job.pmta_live_ts = now_iso()
+    except Exception:
+        pass
+
     # Guardrails
     if not sender_emails:
         with JOBS_LOCK:
@@ -16603,17 +16614,18 @@ def smtp_send_job(
                 sb = chunk_subjects[rot % len(chunk_subjects)]
                 b_used = chunk_body_variants[rot % len(chunk_body_variants)] if chunk_body_variants else body
 
-                # Update PMTA live metrics for UI (rate-limited)
-                if PMTA_QUEUE_BACKOFF:
-                    try:
-                        if (time.time() - float(last_pmta_live or 0.0)) >= float(PMTA_LIVE_POLL_S or 3.0):
-                            live = pmta_live_panel(smtp_host=smtp_host)
-                            last_pmta_live = time.time()
-                            with JOBS_LOCK:
-                                job.pmta_live = live
-                                job.pmta_live_ts = now_iso()
-                    except Exception:
-                        pass
+                # Update PMTA live metrics for UI (rate-limited).
+                # Keep this active even when PMTA_QUEUE_BACKOFF is OFF so the PMTA panel
+                # still reflects the real monitor status during sending.
+                try:
+                    if (time.time() - float(last_pmta_live or 0.0)) >= float(PMTA_LIVE_POLL_S or 3.0):
+                        live = pmta_live_panel(smtp_host=smtp_host)
+                        last_pmta_live = time.time()
+                        with JOBS_LOCK:
+                            job.pmta_live = live
+                            job.pmta_live_ts = now_iso()
+                except Exception:
+                    pass
 
                 sc, det = _spam_check(fe, sb, b_used, body_format2)
                 bl_listed, bl_detail = _blacklist_check(fe)
