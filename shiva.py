@@ -7248,6 +7248,15 @@ PAGE_JOBS = r"""
     .pmtaSub{ margin-top:8px; font-size: 11px; color: rgba(255,255,255,.60); line-height: 1.35; word-break: break-word; overflow-wrap:anywhere; }
     .pmtaHint{ margin-top:6px; font-size: 11px; color: rgba(255,255,255,.52); line-height: 1.35; }
 
+    .chunkList{display:grid; gap:7px; margin-top:10px;}
+    .chunkItem{display:flex; align-items:flex-start; gap:8px; padding:7px 9px; border:1px solid rgba(255,255,255,.12); background:rgba(255,255,255,.03); border-radius:10px;}
+    .chunkIcon{font-size:13px; line-height:1.2; margin-top:1px;}
+    .chunkLabel{font-size:11px; color:rgba(255,255,255,.62); text-transform:uppercase; letter-spacing:.35px;}
+    .chunkValue{font-size:12px; color:rgba(255,255,255,.92); font-weight:800; line-height:1.35; overflow-wrap:anywhere;}
+    .chunkValue.warn{color:var(--warn);}
+    .chunkValue.bad{color:var(--bad);}
+    .chunkValue.good{color:var(--good);}
+
     .pmtaBanner{
       border:1px solid rgba(255,255,255,.14);
       border-radius: 14px;
@@ -7495,6 +7504,14 @@ PAGE_JOBS = r"""
             <div class="rateCell"><div class="k">Complaint %</div><div class="v" data-k="rateComplaint">—</div></div>
             <div class="rateCell"><div class="k">Deferred %</div><div class="v" data-k="rateDeferred">—</div></div>
           </div>
+
+          <div class="panel" style="margin-top:10px;">
+            <h4>PMTA Live Panel</h4>
+            <div class="pmtaLive" data-k="pmtaLine">—</div>
+            <div class="mini" style="margin-top:6px" data-k="pmtaNote">Note: <b>sent</b> = accepted by PMTA (client-side). Delivery may still be queued/deferred.</div>
+            <div class="mini" style="margin-top:6px" data-k="pmtaDiag">Diag: —</div>
+          </div>
+
           <details class="qualityMini">
             <summary>Quality</summary>
             <div class="qualityLine">Final-fail: <span data-k="failed">—</span> · Skipped: <span data-k="skipped">—</span> · Invalid: <span data-k="invalid">—</span> · Total: <span data-k="total">—</span></div>
@@ -7535,17 +7552,9 @@ PAGE_JOBS = r"""
           </div>
 
           <div class="panel moreBlock">
-            <h4>PMTA Live Panel</h4>
-            <div class="pmtaCompact" data-k="pmtaCompact">PMTA: —</div>
-            <details class="pmtaToggle">
-              <summary>Show PMTA panel</summary>
-              <div class="pmtaLive" data-k="pmtaLine">—</div>
-              <div class="mini" style="margin-top:6px" data-k="pmtaNote">Note: <b>sent</b> = accepted by PMTA (client-side). Delivery may still be queued/deferred.</div>
-              <div class="mini" style="margin-top:6px" data-k="pmtaDiag">Diag: —</div>
-              <div class="mini" style="margin-top:8px"><b>Outcomes (PMTA accounting)</b></div>
-              <div class="outcomesWrap" data-k="outcomes">—</div>
-              <div class="outTrend" data-k="outcomeTrend">—</div>
-            </details>
+            <h4>Outcomes (PMTA accounting)</h4>
+            <div class="outcomesWrap" data-k="outcomes">—</div>
+            <div class="outTrend" data-k="outcomeTrend">—</div>
           </div>
 
           <div class="moreGrid moreBlock">
@@ -8644,7 +8653,7 @@ This will remove it from Jobs history.`);
     const ci = j.current_chunk_info || {};
     const cDom = j.current_chunk_domains || {};
 
-    let chunkLine = '—';
+    let chunkLine = '<div class="mini">—</div>';
     if(ci && (ci.chunk !== undefined) && (ci.chunk !== null) && Number(ci.size||0) > 0){
       const cnum = Number(ci.chunk||0) + 1;
       const at = Number(ci.attempt||0);
@@ -8685,17 +8694,35 @@ This will remove it from Jobs history.`);
         }
       }catch(e){ /* ignore */ }
 
-      chunkLine = `#${cnum} size=${Number(ci.size||0)} · workers=${Number(ci.workers||0)} · delay=${Number(ci.delay_s||0)}s · attempt=${at} · sender=${sender} · spam=${spam} · bl=${blShort} · subject=${subjShort}`+
-        (pmtaReasonShort ? (` · pmta=${pmtaReasonShort}`) : '')+
-        (pmtaSlowShort ? (` · pmta_slow(${pmtaSlowShort})`) : '')+
-        (adaptiveShort ? (` · ${adaptiveShort}`) : '');
+      const spamN = Number(ci.spam_score);
+      const spamTone = Number.isFinite(spamN) ? (spamN >= 4 ? 'bad' : (spamN >= 2 ? 'warn' : 'good')) : '';
+      const hasBl = !!(blShort && blShort.trim());
+      const blTone = hasBl ? 'warn' : 'good';
+
+      const cdEntriesInline = Object.entries(cDom).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0)).slice(0,6);
+      const activeDomainsTxt = cdEntriesInline.length
+        ? cdEntriesInline.map(([d,c]) => `${esc(d)}(${Number(c||0)})`).join(' · ')
+        : '—';
+
+      chunkLine = [
+        `<div class="mini">Chunk #${cnum} · size=${Number(ci.size||0)} · workers=${Number(ci.workers||0)} · delay=${Number(ci.delay_s||0)}s · attempt=${at}</div>`,
+        `<div class="chunkList">`,
+          `<div class="chunkItem"><span class="chunkIcon">📧</span><div><div class="chunkLabel">Sender</div><div class="chunkValue">${esc(sender || '—')}</div></div></div>`,
+          `<div class="chunkItem"><span class="chunkIcon">🧪</span><div><div class="chunkLabel">Spam / BL</div><div class="chunkValue ${spamTone}">Spam: ${esc(spam)}</div><div class="chunkValue ${blTone}">BL: ${esc(blShort || '—')}</div></div></div>`,
+          `<div class="chunkItem"><span class="chunkIcon">📝</span><div><div class="chunkLabel">Subject</div><div class="chunkValue">${esc(subjShort || '—')}</div></div></div>`,
+          `<div class="chunkItem"><span class="chunkIcon">🌐</span><div><div class="chunkLabel">Active domains</div><div class="chunkValue">${activeDomainsTxt}</div></div></div>`,
+        `</div>`,
+      ].join('') +
+      (pmtaReasonShort ? (`<div class="mini" style="margin-top:8px">PMTA reason: ${esc(pmtaReasonShort)}</div>`) : '')+
+      (pmtaSlowShort ? (`<div class="mini">PMTA slow: ${esc(pmtaSlowShort)}</div>`) : '')+
+      (adaptiveShort ? (`<div class="mini">Adaptive: ${esc(adaptiveShort)}</div>`) : '');
     }
-    qk(card,'chunkLine').textContent = chunkLine;
+    qk(card,'chunkLine').innerHTML = chunkLine;
 
     // active domains for current chunk
     const cdEntries = Object.entries(cDom).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0)).slice(0,6);
     qk(card,'chunkDomains').innerHTML = cdEntries.length
-      ? ('Active domains: ' + cdEntries.map(([d,c]) => `${esc(d)}(${Number(c||0)})`).join(' · '))
+      ? ('Top active domains: ' + cdEntries.map(([d,c]) => `${esc(d)}(${Number(c||0)})`).join(' · '))
       : 'Active domains: —';
 
     // Backoff info (latest)
