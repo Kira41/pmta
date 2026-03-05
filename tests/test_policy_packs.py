@@ -85,3 +85,45 @@ def test_resolve_caps_tolerates_list_like_numeric_values(monkeypatch):
     assert caps["sleep_chunks"] >= 3.0
     assert any("pmta_level=2" in str(step.get("reason")) for step in (meta.get("steps") or []))
     assert any("health_level=1" in str(step.get("reason")) for step in (meta.get("steps") or []))
+
+
+def test_policy_pack_applier_tolerates_list_values_in_pack():
+    cfg = shiva.BudgetConfig(
+        enabled=True,
+        provider_max_inflight_default=3,
+        provider_max_inflight_map={"google": 3},
+        provider_min_gap_s_default=0.0,
+        provider_min_gap_s_map={"google": 2.0},
+        provider_cooldown_s_default=0.0,
+        provider_cooldown_s_map={"google": 30.0},
+    )
+    pack = {
+        "provider_defaults": {
+            "google": {
+                "max_inflight": ["1"],
+                "min_gap_s": 20,
+                "cooldown_s": 120,
+                "delay_floor": 1.0,
+                "chunk_cap": ["150"],
+                "workers_cap": ["3"],
+            }
+        },
+        "resource_governor": {"max_total_workers": ["6"]},
+    }
+
+    class _Gov:
+        max_total_workers = 10
+
+    applier = shiva.PolicyPackApplier(pack, enforce=True)
+    ctx = {
+        "provider_keys": ["google"],
+        "budget_config": cfg,
+        "policy_pack_caps_clamps": {},
+        "resource_governor": _Gov(),
+    }
+    applied = applier.apply_job_local_overrides(ctx)
+
+    assert cfg.provider_max_inflight_map["google"] == 1
+    assert ctx["policy_pack_caps_clamps"]["google"]["chunk_size_cap"] == 150
+    assert ctx["policy_pack_caps_clamps"]["google"]["workers_cap"] == 3
+    assert applied["resource_governor"]["max_total_workers"] == 6
