@@ -54,3 +54,24 @@ def test_caps_resolver_lane_caps_respect_scheduler_mode(monkeypatch):
 
     assert caps["chunk_size"] == 500
     assert caps["thread_workers"] == 10
+
+
+def test_caps_resolver_tolerates_list_like_numeric_values(monkeypatch):
+    monkeypatch.setenv("SHIVA_LEARNING_CAPS_ENFORCE", "0")
+    monkeypatch.setenv("SHIVA_LANE_STATE_CAPS_ENFORCE", "0")
+
+    caps, _ = shiva.resolve_caps_for_attempt(
+        job=None,
+        now_ts=1.0,
+        lane_key=(0, "gmail.com"),
+        base_caps={"chunk_size": ["400"], "thread_workers": ["6"], "delay_s": ["0.2"], "sleep_chunks": ["0.3"]},
+        runtime_overrides={"chunk_size": ["300"], "thread_workers": ["4"], "delay_s": ["0.4"], "sleep_chunks": ["0.5"]},
+        pressure_caps={"chunk_size_max": ["200"], "workers_max": ["3"], "delay_min": ["0.8"], "sleep_min": ["1.2"]},
+        health_caps={"applied": {"chunk_size": ["150"], "workers": ["2"], "delay_s": ["1.0"], "sleep_chunks": ["2.0"]}},
+        lane_registry=None,
+    )
+
+    assert caps["chunk_size"] == 150
+    assert caps["thread_workers"] == 2
+    assert caps["delay_s"] == 1.0
+    assert caps["sleep_chunks"] == 2.0

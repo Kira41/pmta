@@ -2164,6 +2164,9 @@ class ProbeController:
 
 
 def clamp_caps_to_bounds(caps: dict, bounds_override: Optional[dict] = None) -> dict:
+    def _num(v: Any, *, as_type: str, default: Any) -> Any:
+        return _coerce_scalar_number(v, as_type=as_type, default=default)
+
     out = dict(caps or {})
     min_chunk = max(1, int(_env_int("SHIVA_CAPS_MIN_CHUNK", 50)))
     max_chunk = max(min_chunk, int(_env_int("SHIVA_CAPS_MAX_CHUNK", 2000)))
@@ -2175,16 +2178,19 @@ def clamp_caps_to_bounds(caps: dict, bounds_override: Optional[dict] = None) -> 
     max_sleep = max(min_sleep, float(_env_float("SHIVA_CAPS_MAX_SLEEP_CHUNKS", 60)))
     if isinstance(bounds_override, dict):
         if bounds_override.get("max_chunk") is not None:
-            max_chunk = min(max_chunk, max(1, int(bounds_override.get("max_chunk") or max_chunk)))
+            max_chunk = min(max_chunk, max(1, _num(bounds_override.get("max_chunk"), as_type="int", default=max_chunk)))
         if bounds_override.get("max_workers") is not None:
-            max_workers = min(max_workers, max(1, int(bounds_override.get("max_workers") or max_workers)))
+            max_workers = min(max_workers, max(1, _num(bounds_override.get("max_workers"), as_type="int", default=max_workers)))
         if bounds_override.get("max_delay_s") is not None:
-            max_delay = min(max_delay, max(0.0, float(bounds_override.get("max_delay_s") or max_delay)))
+            max_delay = min(max_delay, max(0.0, _num(bounds_override.get("max_delay_s"), as_type="float", default=max_delay)))
 
-    out["chunk_size"] = max(min_chunk, min(max_chunk, int(out.get("chunk_size") or min_chunk)))
-    out["thread_workers"] = max(min_workers, min(max_workers, int(out.get("thread_workers") or out.get("workers") or min_workers)))
-    out["delay_s"] = max(min_delay, min(max_delay, float(out.get("delay_s") or 0.0)))
-    out["sleep_chunks"] = max(min_sleep, min(max_sleep, float(out.get("sleep_chunks") or 0.0)))
+    out["chunk_size"] = max(min_chunk, min(max_chunk, _num(out.get("chunk_size"), as_type="int", default=min_chunk)))
+    out["thread_workers"] = max(
+        min_workers,
+        min(max_workers, _num(out.get("thread_workers") if out.get("thread_workers") is not None else out.get("workers"), as_type="int", default=min_workers)),
+    )
+    out["delay_s"] = max(min_delay, min(max_delay, _num(out.get("delay_s"), as_type="float", default=0.0)))
+    out["sleep_chunks"] = max(min_sleep, min(max_sleep, _num(out.get("sleep_chunks"), as_type="float", default=0.0)))
     return out
 
 
@@ -16419,10 +16425,10 @@ def smtp_send_job(
                     ),
                     caps_bounds_override=guard_caps_bounds_override,
                 )
-                cs = int(effective_caps.get("chunk_size") or cs)
-                workers2 = int(effective_caps.get("thread_workers") or workers2)
-                delay2 = float(effective_caps.get("delay_s") if effective_caps.get("delay_s") is not None else delay2)
-                sleep2 = float(effective_caps.get("sleep_chunks") if effective_caps.get("sleep_chunks") is not None else sleep2)
+                cs = _safe_int(effective_caps.get("chunk_size"), cs)
+                workers2 = _safe_int(effective_caps.get("thread_workers"), workers2)
+                delay2 = _coerce_scalar_number(effective_caps.get("delay_s"), as_type="float", default=delay2)
+                sleep2 = _coerce_scalar_number(effective_caps.get("sleep_chunks"), as_type="float", default=sleep2)
                 if caps_resolver_export:
                     with JOBS_LOCK:
                         job.debug_last_caps_resolve = dict(caps_meta or {})
@@ -16440,10 +16446,10 @@ def smtp_send_job(
                             "sleep_chunks": sleep2,
                         }
                     )
-                    cs = int(clamped_caps.get("chunk_size") or cs)
-                    workers2 = int(clamped_caps.get("workers") or workers2)
-                    delay2 = float(clamped_caps.get("delay_s") if clamped_caps.get("delay_s") is not None else delay2)
-                    sleep2 = float(clamped_caps.get("sleep_chunks") if clamped_caps.get("sleep_chunks") is not None else sleep2)
+                    cs = _safe_int(clamped_caps.get("chunk_size"), cs)
+                    workers2 = _safe_int(clamped_caps.get("workers"), workers2)
+                    delay2 = _coerce_scalar_number(clamped_caps.get("delay_s"), as_type="float", default=delay2)
+                    sleep2 = _coerce_scalar_number(clamped_caps.get("sleep_chunks"), as_type="float", default=sleep2)
                 if learning_caps_enforce and learning_caps:
                     if isinstance(learning_caps.get("chunk_size_cap"), int):
                         cs = max(1, min(int(cs or 1), int(learning_caps.get("chunk_size_cap") or cs)))
