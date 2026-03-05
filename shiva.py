@@ -325,6 +325,136 @@ def build_provider_buckets(recipients: List[str]) -> Tuple[Dict[str, List[str]],
     return buckets, order
 
 
+DEFAULT_PROVIDER_MX_PATTERNS = {
+    "googlemail.com": "google",
+    "gmail-smtp-in.l.google.com": "google",
+    "google.com": "google",
+    "protection.outlook.com": "microsoft",
+    "outlook.com": "microsoft",
+    "yahoodns.net": "yahoo",
+    "icloud.com": "apple",
+}
+
+def _normalize_provider_token(val: Any) -> str:
+    return str(val or "").strip().lower()
+
+
+def _domain_suffix_match(domain: str, suffix: str) -> bool:
+    d = _normalize_provider_token(domain)
+    s = _normalize_provider_token(suffix).lstrip(".")
+    return bool(d and s and (d == s or d.endswith("." + s)))
+
+
+def canonical_provider(recipient_domain: str, mx_hosts: Optional[List[str]] = None, *, alias_map: Optional[Dict[str, str]] = None, suffix_map: Optional[Dict[str, str]] = None, use_mx_fingerprint: bool = False, mx_patterns: Optional[Dict[str, str]] = None, unknown_group: str = "other") -> str:
+    domain = _normalize_provider_token(recipient_domain)
+    unknown = _normalize_provider_token(unknown_group) or "other"
+    aliases = { _normalize_provider_token(k): _normalize_provider_token(v) for k, v in (alias_map or {}).items() if _normalize_provider_token(k) and _normalize_provider_token(v) }
+    suffixes = { _normalize_provider_token(k).lstrip('.'): _normalize_provider_token(v) for k, v in (suffix_map or {}).items() if _normalize_provider_token(k) and _normalize_provider_token(v) }
+    if domain and domain in aliases:
+        return aliases[domain]
+    for suffix in sorted(suffixes.keys(), key=lambda x: (-len(x), x)):
+        if _domain_suffix_match(domain, suffix):
+            return suffixes[suffix]
+    if use_mx_fingerprint and mx_hosts:
+        patterns_src = mx_patterns if isinstance(mx_patterns, dict) else DEFAULT_PROVIDER_MX_PATTERNS
+        patterns = { _normalize_provider_token(k): _normalize_provider_token(v) for k, v in (patterns_src or {}).items() if _normalize_provider_token(k) and _normalize_provider_token(v) }
+        norm_hosts = [str(h or "").strip().lower() for h in (mx_hosts or []) if str(h or "").strip()]
+        for host in norm_hosts:
+            for needle in sorted(patterns.keys(), key=lambda x: (-len(x), x)):
+                if needle in host:
+                    return patterns[needle]
+    return unknown
+
+
+class ProviderCanon:
+    DEFAULT_SUFFIX_MAP = {
+        "gmail.com": "google",
+        "googlemail.com": "google",
+        "outlook.com": "microsoft",
+        "hotmail.com": "microsoft",
+        "live.com": "microsoft",
+    }
+    DEFAULT_MX_PATTERNS = dict(DEFAULT_PROVIDER_MX_PATTERNS)
+
+    def __init__(self, *, enabled: bool, enforce: bool, export: bool, debug: bool, alias_map: Optional[Dict[str, str]], suffix_map: Optional[Dict[str, str]], use_mx_fingerprint: bool, unknown_group: str):
+        self.enabled = bool(enabled)
+        self.enforce = bool(enforce and enabled)
+        self.export = bool(export)
+        self.debug = bool(debug)
+        self.alias_map = dict(alias_map or {})
+        self.suffix_map = dict(suffix_map or self.DEFAULT_SUFFIX_MAP)
+        self.use_mx_fingerprint = bool(use_mx_fingerprint)
+        self.mx_patterns = dict(self.DEFAULT_MX_PATTERNS)
+        self.unknown_group = _normalize_provider_token(unknown_group) or "other"
+        self.domain_to_group: Dict[str, str] = {}
+        self.group_counts: Dict[str, int] = {}
+        self.unknown_domains: Set[str] = set()
+
+    @classmethod
+    def _parse_json_map(cls, raw: str) -> Dict[str, str]:
+        txt = str(raw or "").strip()
+        if not txt:
+            return {}
+        try:
+            parsed = json.loads(txt)
+        except Exception:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        out: Dict[str, str] = {}
+        for k, v in parsed.items():
+            kk = _normalize_provider_token(k)
+            vv = _normalize_provider_token(v)
+            if kk and vv:
+                out[kk] = vv
+        return out
+
+    @classmethod
+    def from_env(cls, *, enabled: bool, enforce: bool, export: bool, debug: bool, alias_json: str, suffix_json: str, use_mx_fingerprint: bool, unknown_group: str) -> 'ProviderCanon':
+        alias_map = cls._parse_json_map(alias_json)
+        suffix_map = dict(cls.DEFAULT_SUFFIX_MAP)
+        suffix_map.update(cls._parse_json_map(suffix_json))
+        return cls(enabled=enabled, enforce=enforce, export=export, debug=debug, alias_map=alias_map, suffix_map=suffix_map, use_mx_fingerprint=use_mx_fingerprint, unknown_group=unknown_group)
+
+    def group_for_domain(self, recipient_domain: str, mx_hosts: Optional[List[str]] = None) -> str:
+        domain = _normalize_provider_token(recipient_domain)
+        if not domain:
+            return self.unknown_group
+        if domain in self.domain_to_group:
+            return self.domain_to_group[domain]
+        grp = canonical_provider(domain, mx_hosts, alias_map=self.alias_map, suffix_map=self.suffix_map, use_mx_fingerprint=self.use_mx_fingerprint, mx_patterns=self.mx_patterns, unknown_group=self.unknown_group)
+        self.domain_to_group[domain] = grp
+        if grp == self.unknown_group:
+            self.unknown_domains.add(domain)
+        return grp
+
+    def ingest_provider_counts(self, provider_counts: Dict[str, int], mx_by_domain: Optional[Dict[str, List[str]]] = None) -> None:
+        for d, cnt in (provider_counts or {}).items():
+            dom = _normalize_provider_token(d)
+            if not dom:
+                continue
+            grp = self.group_for_domain(dom, (mx_by_domain or {}).get(dom))
+            self.group_counts[grp] = int(self.group_counts.get(grp) or 0) + max(0, int(cnt or 0))
+
+    def lane_provider_key(self, lane_key: Tuple[int, str]) -> Tuple[int, str]:
+        sender_idx = int((lane_key or (0, ""))[0] or 0)
+        raw_domain = str((lane_key or (0, ""))[1] or "").strip().lower()
+        if not self.enforce:
+            return (sender_idx, raw_domain)
+        return (sender_idx, self.group_for_domain(raw_domain))
+
+    def snapshot(self, top_n_domains: int = 50) -> dict:
+        sorted_domains = sorted(self.domain_to_group.items(), key=lambda kv: kv[0])[:max(1, int(top_n_domains or 50))]
+        return {
+            "enabled": bool(self.enabled),
+            "enforce": bool(self.enforce),
+            "provider_groups": {k: int(v) for k, v in sorted(self.group_counts.items())},
+            "domain_to_group": {k: v for k, v in sorted_domains},
+            "unknown_domains_sample": sorted(list(self.unknown_domains))[:20],
+            "mx_fingerprint_used": bool(self.use_mx_fingerprint),
+        }
+
+
 def normalize_and_partition_recipients(
     recipients: List[str],
     sender_emails: List[str],
@@ -1127,7 +1257,7 @@ class LearningCapsEngine:
 class BudgetManager:
     """Job-scoped budget gate for lane start decisions (sequential today, concurrency-ready)."""
 
-    def __init__(self, config: BudgetConfig, lane_registry: Optional[LaneRegistry] = None, debug: bool = False):
+    def __init__(self, config: BudgetConfig, lane_registry: Optional[LaneRegistry] = None, debug: bool = False, provider_key_resolver: Optional[Callable[[Tuple[int, str]], Tuple[int, str]]] = None):
         self.config = config or BudgetConfig()
         self.lane_registry = lane_registry
         self.debug = bool(debug)
@@ -1139,9 +1269,21 @@ class BudgetManager:
         self.last_denied_reasons: List[dict] = []
         self.provider_max_inflight_overrides: Dict[str, int] = {}
         self.external_gates: Dict[str, Callable[[Tuple[int, str], float, bool, bool, Optional[int]], Tuple[bool, str]]] = {}
+        self.provider_key_resolver = provider_key_resolver
+
+    def _resolved_lane_key(self, lane_key: Tuple[int, str]) -> Tuple[int, str]:
+        base = (int((lane_key or (0, ""))[0] or 0), str((lane_key or (0, ""))[1] or "").strip().lower())
+        if not callable(self.provider_key_resolver):
+            return base
+        try:
+            resolved = self.provider_key_resolver(base)
+            return (int((resolved or base)[0] or 0), str((resolved or base)[1] or "").strip().lower())
+        except Exception:
+            return base
 
     def _lane_id(self, lane_key: Tuple[int, str]) -> str:
-        return f"{int((lane_key or (0, ''))[0])}|{str((lane_key or (0, ''))[1] or '').strip().lower()}"
+        rk = self._resolved_lane_key(lane_key)
+        return f"{int(rk[0])}|{str(rk[1] or '').strip().lower()}"
 
     def _provider_name(self, provider_domain: str) -> str:
         return str(provider_domain or "").strip().lower()
@@ -1194,8 +1336,9 @@ class BudgetManager:
     def can_start(self, lane_key: Tuple[int, str], now_ts: float, is_retry: bool, is_probe: bool, planned_chunk_size_hint: Optional[int] = None) -> Tuple[bool, str]:
         if not self.config.enabled:
             return True, "disabled"
-        sender_idx = int((lane_key or (0, ""))[0] or 0)
-        provider_domain = self._provider_name((lane_key or (0, ""))[1])
+        resolved_lane_key = self._resolved_lane_key(lane_key)
+        sender_idx = int((resolved_lane_key or (0, ""))[0] or 0)
+        provider_domain = self._provider_name((resolved_lane_key or (0, ""))[1])
 
         if self.lane_registry:
             lane_info = self.lane_registry.get_lane_info((sender_idx, provider_domain))
@@ -1237,8 +1380,9 @@ class BudgetManager:
     def on_start(self, lane_key: Tuple[int, str], now_ts: float) -> None:
         if not self.config.enabled:
             return
-        sender_idx = int((lane_key or (0, ""))[0] or 0)
-        provider_domain = self._provider_name((lane_key or (0, ""))[1])
+        resolved_lane_key = self._resolved_lane_key(lane_key)
+        sender_idx = int((resolved_lane_key or (0, ""))[0] or 0)
+        provider_domain = self._provider_name((resolved_lane_key or (0, ""))[1])
         self.inflight_by_provider[provider_domain] = int(self.inflight_by_provider.get(provider_domain) or 0) + 1
         self.inflight_by_sender[sender_idx] = int(self.inflight_by_sender.get(sender_idx) or 0) + 1
         self.provider_last_start_ts[provider_domain] = float(now_ts or time.time())
@@ -1247,8 +1391,9 @@ class BudgetManager:
     def on_finish(self, lane_key: Tuple[int, str], now_ts: float) -> None:
         if not self.config.enabled:
             return
-        sender_idx = int((lane_key or (0, ""))[0] or 0)
-        provider_domain = self._provider_name((lane_key or (0, ""))[1])
+        resolved_lane_key = self._resolved_lane_key(lane_key)
+        sender_idx = int((resolved_lane_key or (0, ""))[0] or 0)
+        provider_domain = self._provider_name((resolved_lane_key or (0, ""))[1])
         self.inflight_by_provider[provider_domain] = max(0, int(self.inflight_by_provider.get(provider_domain) or 0) - 1)
         self.inflight_by_sender[sender_idx] = max(0, int(self.inflight_by_sender.get(sender_idx) or 0) - 1)
         self.lane_inflight[self._lane_id((sender_idx, provider_domain))] = False
@@ -1256,7 +1401,8 @@ class BudgetManager:
     def on_lane_state_signal(self, lane_key: Tuple[int, str], state: str, now_ts: float, failure_type: Optional[str] = None) -> None:
         if not self.config.enabled:
             return
-        provider_domain = self._provider_name((lane_key or (0, ""))[1])
+        resolved_lane_key = self._resolved_lane_key(lane_key)
+        provider_domain = self._provider_name((resolved_lane_key or (0, ""))[1])
         state_v = str(state or "").strip().upper()
         severe_failure = str(failure_type or "").strip().lower()
         severe = state_v in {"QUARANTINED", "INFRA_FAIL"} or severe_failure in {"infra", "timeout", "network", "connection"}
@@ -1271,7 +1417,7 @@ class BudgetManager:
         )
 
     def clone_for_shadow(self) -> 'BudgetManager':
-        cloned = BudgetManager(self.config, lane_registry=self.lane_registry, debug=self.debug)
+        cloned = BudgetManager(self.config, lane_registry=self.lane_registry, debug=self.debug, provider_key_resolver=self.provider_key_resolver)
         cloned.inflight_by_provider = dict(self.inflight_by_provider)
         cloned.inflight_by_sender = dict(self.inflight_by_sender)
         cloned.provider_last_start_ts = dict(self.provider_last_start_ts)
@@ -2233,6 +2379,7 @@ class SendJob:
     debug_budget_status: dict = field(default_factory=dict)
     debug_lane_executor: dict = field(default_factory=dict)
     debug_fallback: dict = field(default_factory=dict)
+    debug_provider_canon: dict = field(default_factory=dict)
     debug_backoff_jitter: List[dict] = field(default_factory=list)
 
     # PMTA diagnostics snapshot (optional; helps classify failures quickly)
@@ -3145,6 +3292,7 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "debug_budget_status": job.debug_budget_status or {},
         "debug_lane_executor": job.debug_lane_executor or {},
         "debug_fallback": job.debug_fallback or {},
+        "debug_provider_canon": job.debug_provider_canon or {},
         "debug_backoff_jitter": (job.debug_backoff_jitter or [])[-50:],
         "pmta_diag": job.pmta_diag or {},
         "pmta_diag_ts": job.pmta_diag_ts or "",
@@ -3899,6 +4047,7 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job.debug_budget_status = (s.get("debug_budget_status") if isinstance(s.get("debug_budget_status"), dict) else {}) or {}
         job.debug_lane_executor = (s.get("debug_lane_executor") if isinstance(s.get("debug_lane_executor"), dict) else {}) or {}
         job.debug_fallback = (s.get("debug_fallback") if isinstance(s.get("debug_fallback"), dict) else {}) or {}
+        job.debug_provider_canon = (s.get("debug_provider_canon") if isinstance(s.get("debug_provider_canon"), dict) else {}) or {}
         job.debug_backoff_jitter = list(s.get("debug_backoff_jitter") or [])
         job.pmta_diag = (s.get("pmta_diag") if isinstance(s.get("pmta_diag"), dict) else {}) or {}
         job.pmta_diag_ts = str(s.get("pmta_diag_ts") or "")
@@ -13230,6 +13379,14 @@ def smtp_send_job(
     learning_min_samples = max(1, int(get_env_int("SHIVA_LEARNING_MIN_SAMPLES", 200)))
     learning_recency_days = max(1, int(get_env_int("SHIVA_LEARNING_RECENCY_DAYS", 14)))
     learning_export = bool(get_env_bool("SHIVA_LEARNING_EXPORT", False))
+    provider_canon_enabled = bool(get_env_bool("SHIVA_PROVIDER_CANON", False))
+    provider_canon_enforce = bool(get_env_bool("SHIVA_PROVIDER_CANON_ENFORCE", False))
+    provider_canon_export = bool(get_env_bool("SHIVA_PROVIDER_CANON_EXPORT", False))
+    provider_alias_json = str(get_env("SHIVA_PROVIDER_ALIAS_JSON", "") or "").strip()
+    provider_suffix_json = str(get_env("SHIVA_PROVIDER_SUFFIX_JSON", "") or "").strip()
+    provider_mx_fingerprint = bool(get_env_bool("SHIVA_PROVIDER_MX_FINGERPRINT", False))
+    provider_unknown_group = str(get_env("SHIVA_PROVIDER_UNKNOWN_GROUP", "other") or "other").strip() or "other"
+    provider_canon_debug = bool(get_env_bool("SHIVA_PROVIDER_CANON_DEBUG", False))
     learning_max_lanes_provider_json = str(get_env("SHIVA_LEARNING_MAX_LANES_PROVIDER_JSON", "") or "").strip()
     learning_delay_floor_json = str(get_env("SHIVA_LEARNING_DELAY_FLOOR_JSON", "") or "").strip()
     learning_chunk_cap_json = str(get_env("SHIVA_LEARNING_CHUNK_CAP_JSON", "") or "").strip()
@@ -13359,12 +13516,32 @@ def smtp_send_job(
     if fallback_export:
         with JOBS_LOCK:
             job.debug_fallback = {}
+    if provider_canon_export:
+        with JOBS_LOCK:
+            job.debug_provider_canon = {}
     if SHIVA_BACKOFF_JITTER_EXPORT:
         with JOBS_LOCK:
             job.debug_backoff_jitter = []
     if learning_export:
         with JOBS_LOCK:
             job.debug_learning_policy = {}
+
+    provider_canon = ProviderCanon.from_env(
+        enabled=provider_canon_enabled,
+        enforce=provider_canon_enforce,
+        export=provider_canon_export,
+        debug=provider_canon_debug,
+        alias_json=provider_alias_json,
+        suffix_json=provider_suffix_json,
+        use_mx_fingerprint=provider_mx_fingerprint,
+        unknown_group=provider_unknown_group,
+    )
+    if provider_canon_enabled and provider_alias_json and not provider_canon.alias_map:
+        with JOBS_LOCK:
+            job.log("WARN", "SHIVA_PROVIDER_ALIAS_JSON ignored: expected JSON object with domain->group pairs")
+    if provider_canon_enabled and provider_suffix_json and not ProviderCanon._parse_json_map(provider_suffix_json):
+        with JOBS_LOCK:
+            job.log("WARN", "SHIVA_PROVIDER_SUFFIX_JSON ignored: expected JSON object with suffix->group pairs")
 
     budget_config = BudgetConfig(
         enabled=budget_manager_enabled,
@@ -13380,7 +13557,7 @@ def smtp_send_job(
         apply_to_probe=budget_apply_to_probe,
         export=budget_export,
     )
-    budget_mgr = BudgetManager(budget_config, lane_registry=lane_registry, debug=budget_debug) if budget_manager_enabled else None
+    budget_mgr = BudgetManager(budget_config, lane_registry=lane_registry, debug=budget_debug, provider_key_resolver=provider_canon.lane_provider_key if provider_canon.enforce else None) if budget_manager_enabled else None
 
     learning_provider_workers_override = _parse_budget_json_map(learning_max_lanes_provider_json, value_type="int", min_v=1, max_v=10)
     learning_provider_delay_override = _parse_budget_json_map(learning_delay_floor_json, value_type="float", min_v=0.2, max_v=3.0)
@@ -13565,9 +13742,11 @@ def smtp_send_job(
                 "is_retry": bool(is_retry),
                 "is_probe": bool(is_probe),
             })
-        if (not allowed) and (lane_debug_enabled or budget_debug or single_domain_waves_debug):
+        if (not allowed) and (lane_debug_enabled or budget_debug or single_domain_waves_debug or provider_canon_debug):
+            lane_group = provider_canon.group_for_domain(str((lane_key or (0, ""))[1] or "")) if provider_canon.enabled else ""
+            extra = f" group={lane_group}" if provider_canon.enabled else ""
             with JOBS_LOCK:
-                job.log("INFO", f"BudgetManager: denied lane {lane_key[0]}|{lane_key[1]} reason={reason}")
+                job.log("INFO", f"BudgetManager: denied lane {lane_key[0]}|{lane_key[1]}{extra} reason={reason}")
         return allowed, reason
 
     def _provider_metrics_snapshot(provider_domain: str) -> dict:
@@ -13586,7 +13765,9 @@ def smtp_send_job(
         snap = lane_metrics.snapshot()
         lanes = (snap.get("lanes") if isinstance(snap, dict) else {}) or {}
         for lane in lanes.values():
-            if str((lane or {}).get("provider_domain") or "").strip().lower() != provider:
+            lane_provider_raw = str((lane or {}).get("provider_domain") or "").strip().lower()
+            lane_provider_cmp = provider_canon.group_for_domain(lane_provider_raw) if provider_canon.enforce else lane_provider_raw
+            if lane_provider_cmp != provider:
                 continue
             totals["attempts_total"] += int((lane or {}).get("attempts_total") or 0)
             totals["deferrals_4xx"] += int((lane or {}).get("deferrals_4xx") or 0)
@@ -14086,6 +14267,16 @@ def smtp_send_job(
             for bucket in (domains or {}).values()
             for rcpt in (bucket or [])
         ])[0]
+        provider_counts = {str(d or "").strip().lower(): int(len(v or [])) for d, v in (provider_buckets or {}).items() if str(d or "").strip()}
+        provider_canon.ingest_provider_counts(provider_counts, mx_by_domain={})
+
+        def _lane_budget_key(lane_key: Tuple[int, str]) -> Tuple[int, str]:
+            return provider_canon.lane_provider_key(lane_key)
+
+        if provider_canon.enabled and provider_canon.export:
+            with JOBS_LOCK:
+                job.debug_provider_canon = provider_canon.snapshot()
+
         probe_controller = ProbeController(
             enabled=probe_mode_enabled,
             duration_s=probe_duration_s,
@@ -14099,7 +14290,7 @@ def smtp_send_job(
             min_providers=probe_min_providers,
         )
         probe_provider_domains = [
-            d
+            (provider_canon.group_for_domain(d) if provider_canon.enforce else str(d or "").strip().lower())
             for d, cnt in (provider_buckets or {}).items()
             if str(d or "").strip() and int(cnt or 0) > 0
         ]
@@ -14157,7 +14348,7 @@ def smtp_send_job(
             budget_mgr.register_external_gate(
                 "single_domain_wave",
                 lambda lane_key, now_ts, _is_retry, _is_probe, planned_chunk_size_hint: wave_controller.can_start_lane(
-                    lane_key,
+                    _lane_budget_key(lane_key),
                     now_ts,
                     int(planned_chunk_size_hint or wave_min_tokens_to_start_chunk),
                 ),
@@ -15223,7 +15414,7 @@ def smtp_send_job(
                 wave_cost = max(1, len(chunk)) * wave_token_cost_per_msg
                 if wave_controller.enabled:
                     with lock_wave:
-                        wave_controller.reserve_tokens(lane_key_current, time.time(), wave_cost)
+                        wave_controller.reserve_tokens(_lane_budget_key(lane_key_current), time.time(), wave_cost)
                 if budget_mgr:
                     budget_mgr.on_start(lane_key_current, time.time())
                 try:
@@ -15266,7 +15457,7 @@ def smtp_send_job(
                     )
                     if wave_controller.enabled:
                         with lock_wave:
-                            wave_controller.on_feedback(time.time(), _provider_metrics_snapshot(target_domain))
+                            wave_controller.on_feedback(time.time(), _provider_metrics_snapshot(provider_canon.group_for_domain(target_domain) if provider_canon.enforce else target_domain))
                     _lane_metrics_export_snapshot()
                 db_log_email_attempt(
                     job_id=job_id,
@@ -15620,6 +15811,22 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "Optional JSON map overriding provider delay floor suggestions from learning policy."},
     {"key": "SHIVA_LEARNING_CHUNK_CAP_JSON", "type": "str", "default": "", "group": "Scheduler", "restart_required": False,
      "desc": "Optional JSON map overriding provider chunk cap suggestions from learning policy."},
+    {"key": "SHIVA_PROVIDER_CANON", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Compute canonical provider groups for recipient domains (debug/classification only unless enforce is enabled)."},
+    {"key": "SHIVA_PROVIDER_CANON_ENFORCE", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "If enabled, budgets and single-provider wave detection use canonical provider-group keys."},
+    {"key": "SHIVA_PROVIDER_CANON_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Export provider canonicalization snapshot into job debug payload as debug_provider_canon."},
+    {"key": "SHIVA_PROVIDER_ALIAS_JSON", "type": "str", "default": "", "group": "Scheduler", "restart_required": False,
+     "desc": "JSON object for exact domain->provider_group aliases used before suffix/mx rules."},
+    {"key": "SHIVA_PROVIDER_SUFFIX_JSON", "type": "str", "default": "", "group": "Scheduler", "restart_required": False,
+     "desc": "JSON object for suffix->provider_group mappings (domain boundary match)."},
+    {"key": "SHIVA_PROVIDER_MX_FINGERPRINT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "If enabled, canonicalization can use already-known MX host fingerprints (no extra lookups)."},
+    {"key": "SHIVA_PROVIDER_UNKNOWN_GROUP", "type": "str", "default": "other", "group": "Scheduler", "restart_required": False,
+     "desc": "Fallback provider-group key for unmatched domains."},
+    {"key": "SHIVA_PROVIDER_CANON_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Emit concise provider canonicalization debug logs (raw domain + canonical group)."},
     {"key": "SHIVA_SINGLE_DOMAIN_WAVES", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Enable single-provider-domain wave pacing mode (provider-wide token bucket + deterministic stagger)."},
     {"key": "SHIVA_SINGLE_DOMAIN_WAVES_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
