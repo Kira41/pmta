@@ -1900,6 +1900,134 @@ class ProbeController:
         }
 
 
+def clamp_caps_to_bounds(caps: dict) -> dict:
+    out = dict(caps or {})
+    min_chunk = max(1, int(_env_int("SHIVA_CAPS_MIN_CHUNK", 50)))
+    max_chunk = max(min_chunk, int(_env_int("SHIVA_CAPS_MAX_CHUNK", 2000)))
+    min_workers = max(1, int(_env_int("SHIVA_CAPS_MIN_WORKERS", 1)))
+    max_workers = max(min_workers, int(_env_int("SHIVA_CAPS_MAX_WORKERS", 50)))
+    min_delay = max(0.0, float(_env_float("SHIVA_CAPS_MIN_DELAY_S", 0.0)))
+    max_delay = max(min_delay, float(_env_float("SHIVA_CAPS_MAX_DELAY_S", 5.0)))
+    min_sleep = max(0.0, float(_env_float("SHIVA_CAPS_MIN_SLEEP_CHUNKS", 0)))
+    max_sleep = max(min_sleep, float(_env_float("SHIVA_CAPS_MAX_SLEEP_CHUNKS", 60)))
+
+    out["chunk_size"] = max(min_chunk, min(max_chunk, int(out.get("chunk_size") or min_chunk)))
+    out["thread_workers"] = max(min_workers, min(max_workers, int(out.get("thread_workers") or out.get("workers") or min_workers)))
+    out["delay_s"] = max(min_delay, min(max_delay, float(out.get("delay_s") or 0.0)))
+    out["sleep_chunks"] = max(min_sleep, min(max_sleep, float(out.get("sleep_chunks") or 0.0)))
+    return out
+
+
+def resolve_caps_for_attempt(
+    job,
+    now_ts,
+    lane_key: Tuple[int, str],
+    base_caps,
+    runtime_overrides,
+    pressure_caps,
+    health_caps,
+    lane_registry: Optional[LaneRegistry],
+    learning_engine=None,
+    probe_selected: bool = False,
+) -> Tuple[dict, dict]:
+    lane = (int((lane_key or (0, ""))[0] or 0), str((lane_key or (0, ""))[1] or "").strip().lower())
+    rt = dict(runtime_overrides or {})
+    caps = clamp_caps_to_bounds(base_caps or {})
+    meta: Dict[str, Any] = {
+        "lane_key": f"{lane[0]}|{lane[1]}",
+        "timestamp": float(now_ts or time.time()),
+        "source_order": ["base", "overrides", "pressure", "health", "learning", "lane_state", "probe"],
+        "steps": [],
+        "lane_state": None,
+        "learning": {},
+        "probe_selected": bool(probe_selected),
+    }
+
+    def _record(step: str, before: dict, after: dict, reason: str) -> None:
+        meta["steps"].append({"step": step, "before": dict(before), "after": dict(after), "reason": str(reason or "")})
+
+    before = dict(caps)
+    direct = dict(caps)
+    if rt:
+        if rt.get("chunk_size") is not None:
+            direct["chunk_size"] = int(rt.get("chunk_size") or direct["chunk_size"])
+        if rt.get("thread_workers") is not None:
+            direct["thread_workers"] = int(rt.get("thread_workers") or direct["thread_workers"])
+        if rt.get("delay_s") is not None:
+            direct["delay_s"] = float(rt.get("delay_s") or direct["delay_s"])
+        if rt.get("sleep_chunks") is not None:
+            direct["sleep_chunks"] = float(rt.get("sleep_chunks") if rt.get("sleep_chunks") is not None else direct["sleep_chunks"])
+    caps = clamp_caps_to_bounds(direct)
+    _record("overrides", before, caps, "campaign_form runtime overrides")
+
+    def _apply_clamps(src: dict, *, chunk_key: str, workers_key: str, delay_key: str, sleep_key: str) -> None:
+        nonlocal caps
+        if not isinstance(src, dict):
+            return
+        c2 = dict(caps)
+        if src.get(chunk_key) is not None:
+            c2["chunk_size"] = min(int(c2["chunk_size"]), int(src.get(chunk_key) or c2["chunk_size"]))
+        if src.get(workers_key) is not None:
+            c2["thread_workers"] = min(int(c2["thread_workers"]), int(src.get(workers_key) or c2["thread_workers"]))
+        if src.get(delay_key) is not None:
+            c2["delay_s"] = max(float(c2["delay_s"]), float(src.get(delay_key) or c2["delay_s"]))
+        if src.get(sleep_key) is not None:
+            c2["sleep_chunks"] = max(float(c2["sleep_chunks"]), float(src.get(sleep_key) or c2["sleep_chunks"]))
+        caps = clamp_caps_to_bounds(c2)
+
+    before = dict(caps)
+    _apply_clamps(dict(pressure_caps or {}), chunk_key="chunk_size_max", workers_key="workers_max", delay_key="delay_min", sleep_key="sleep_min")
+    _record("pressure", before, caps, f"pmta_level={int((pressure_caps or {}).get('level') or 0)}")
+
+    before = dict(caps)
+    health_applied = (health_caps or {}).get("applied") if isinstance(health_caps, dict) else {}
+    _apply_clamps(dict(health_applied or {}), chunk_key="chunk_size", workers_key="workers", delay_key="delay_s", sleep_key="sleep_chunks")
+    _record("health", before, caps, f"health_level={int((health_caps or {}).get('level') or 0)}")
+
+    learning_caps: Dict[str, Any] = {}
+    if isinstance(learning_engine, dict):
+        learning_caps = dict(learning_engine)
+    if bool(get_env_bool("SHIVA_LEARNING_CAPS_ENFORCE", False)) and learning_caps:
+        before = dict(caps)
+        _apply_clamps(learning_caps, chunk_key="chunk_size_cap", workers_key="workers_cap", delay_key="delay_floor", sleep_key="sleep_floor")
+        meta["learning"] = {
+            "enforced": True,
+            "tier": learning_caps.get("tier"),
+            "confidence": learning_caps.get("confidence"),
+            "caps": dict(learning_caps),
+        }
+        _record("learning", before, caps, "learning clamp-only")
+
+    lane_state_enforce = bool(get_env_bool("SHIVA_LANE_STATE_CAPS_ENFORCE", False))
+    lane_only_v2 = bool(get_env_bool("SHIVA_LANE_STATE_CAPS_ONLY_IN_LANE_V2", True))
+    scheduler_mode_runtime = str(rt.get("__scheduler_mode_runtime") or "legacy").strip().lower() or "legacy"
+    if lane_state_enforce and (not lane_only_v2 or scheduler_mode_runtime == "lane_v2") and lane_registry:
+        lane_info = lane_registry.get_lane_info(lane)
+        lane_rec = dict(lane_info.get("recommended_caps") or {}) if isinstance(lane_info, dict) else {}
+        if lane_rec:
+            before = dict(caps)
+            _apply_clamps(lane_rec, chunk_key="chunk_size_cap", workers_key="workers_cap", delay_key="delay_floor", sleep_key="sleep_floor")
+            meta["lane_state"] = {
+                "state": str((lane_info or {}).get("state") or "HEALTHY"),
+                "recommended_caps": lane_rec,
+            }
+            _record("lane_state", before, caps, f"lane_state={meta['lane_state']['state']}")
+
+    if probe_selected:
+        probe_caps = {
+            "chunk_size_cap": int(_env_int("SHIVA_PROBE_CHUNK_SIZE", 80)),
+            "workers_cap": int(_env_int("SHIVA_PROBE_WORKERS", 2)),
+            "delay_floor": float(_env_float("SHIVA_PROBE_DELAY_FLOOR_S", 0.8)),
+            "sleep_floor": float(_env_float("SHIVA_PROBE_SLEEP_FLOOR_S", 2.0)),
+        }
+        before = dict(caps)
+        _apply_clamps(probe_caps, chunk_key="chunk_size_cap", workers_key="workers_cap", delay_key="delay_floor", sleep_key="sleep_floor")
+        _record("probe", before, caps, "probe-selected lane clamp")
+
+    meta["final"] = dict(caps)
+    return caps, meta
+
+
 class LaneExecutor:
     """Concurrent lane-task runner (job-scoped)."""
 
@@ -13355,9 +13483,9 @@ def smtp_send_job(
     probe_mode_enabled = bool(get_env_bool("SHIVA_PROBE_MODE", False))
     probe_duration_s = max(1, int(get_env_int("SHIVA_PROBE_DURATION_S", 300)))
     probe_rounds = max(1, int(get_env_int("SHIVA_PROBE_ROUNDS", 2)))
-    probe_chunk_size = max(1, int(get_env_int("SHIVA_PROBE_CHUNK_SIZE", 80)))
-    probe_workers = max(1, int(get_env_int("SHIVA_PROBE_WORKERS", 2)))
-    probe_delay_floor_s = max(0.0, float(get_env_float("SHIVA_PROBE_DELAY_FLOOR_S", 0.8)))
+    probe_chunk_size = max(1, int(_env_int("SHIVA_PROBE_CHUNK_SIZE", 80)))
+    probe_workers = max(1, int(_env_int("SHIVA_PROBE_WORKERS", 2)))
+    probe_delay_floor_s = max(0.0, float(_env_float("SHIVA_PROBE_DELAY_FLOOR_S", 0.8)))
     probe_sleep_floor_s = max(0.0, float(get_env_float("SHIVA_PROBE_SLEEP_FLOOR_S", 2)))
     probe_min_providers = max(1, int(get_env_int("SHIVA_PROBE_MIN_PROVIDERS", 3)))
     probe_export = bool(get_env_bool("SHIVA_PROBE_EXPORT", False))
@@ -13375,6 +13503,9 @@ def smtp_send_job(
     budget_export = bool(get_env_bool("SHIVA_BUDGET_EXPORT", False))
     learning_caps_enabled = bool(get_env_bool("SHIVA_LEARNING_CAPS", False))
     learning_caps_enforce = bool(get_env_bool("SHIVA_LEARNING_CAPS_ENFORCE", False))
+    caps_resolver_enabled = bool(get_env_bool("SHIVA_CAPS_RESOLVER", False))
+    caps_resolver_export = bool(get_env_bool("SHIVA_CAPS_RESOLVER_EXPORT", False))
+    caps_resolver_debug = bool(get_env_bool("SHIVA_CAPS_RESOLVER_DEBUG", False))
     learning_refresh_s = max(30, int(get_env_int("SHIVA_LEARNING_REFRESH_S", 120)))
     learning_min_samples = max(1, int(get_env_int("SHIVA_LEARNING_MIN_SAMPLES", 200)))
     learning_recency_days = max(1, int(get_env_int("SHIVA_LEARNING_RECENCY_DAYS", 14)))
@@ -14882,29 +15013,65 @@ def smtp_send_job(
                 sender_cursor = (int(sender_idx_fixed) + 1) % len(sender_emails)
             elif probe_selected_this_iteration and len(sender_emails) > 0:
                 sender_cursor = (int(sender_idx_fixed) + 1) % len(sender_emails)
-            if probe_selected_this_iteration:
-                clamped_caps = probe_controller.apply_probe_caps(
-                    {
-                        "chunk_size": cs,
-                        "workers": workers2,
-                        "delay_s": delay2,
-                        "sleep_chunks": sleep2,
-                    }
-                )
-                cs = int(clamped_caps.get("chunk_size") or cs)
-                workers2 = int(clamped_caps.get("workers") or workers2)
-                delay2 = float(clamped_caps.get("delay_s") if clamped_caps.get("delay_s") is not None else delay2)
-                sleep2 = float(clamped_caps.get("sleep_chunks") if clamped_caps.get("sleep_chunks") is not None else sleep2)
             lane_key_selected = (int(sender_idx_fixed), str(target_domain or "").strip().lower())
             sender_email_selected = from_emails2[sender_idx_fixed % len(from_emails2)] if from_emails2 else ""
             learning_caps = _learning_caps_for_lane(lane_key_selected, sender_email_selected)
-            if learning_caps_enforce and learning_caps:
-                if isinstance(learning_caps.get("chunk_size_cap"), int):
-                    cs = max(1, min(int(cs or 1), int(learning_caps.get("chunk_size_cap") or cs)))
-                if isinstance(learning_caps.get("workers_cap"), int):
-                    workers2 = max(1, min(int(workers2 or 1), int(learning_caps.get("workers_cap") or workers2)))
-                if isinstance(learning_caps.get("delay_floor"), (int, float)):
-                    delay2 = max(float(delay2 or 0.0), float(learning_caps.get("delay_floor") or 0.0))
+            if caps_resolver_enabled:
+                effective_caps, caps_meta = resolve_caps_for_attempt(
+                    job=job,
+                    now_ts=now_ts,
+                    lane_key=lane_key_selected,
+                    base_caps={
+                        "chunk_size": int(chunk_size),
+                        "thread_workers": int(thread_workers),
+                        "delay_s": float(delay_s),
+                        "sleep_chunks": float(sleep_chunks),
+                    },
+                    runtime_overrides={
+                        "chunk_size": cs,
+                        "thread_workers": workers2,
+                        "delay_s": delay2,
+                        "sleep_chunks": sleep2,
+                        "__scheduler_mode_runtime": scheduler_mode_runtime,
+                    },
+                    pressure_caps=pmta_pressure_applied,
+                    health_caps=health_policy_applied,
+                    lane_registry=lane_registry,
+                    learning_engine=learning_caps,
+                    probe_selected=bool(probe_selected_this_iteration),
+                )
+                cs = int(effective_caps.get("chunk_size") or cs)
+                workers2 = int(effective_caps.get("thread_workers") or workers2)
+                delay2 = float(effective_caps.get("delay_s") if effective_caps.get("delay_s") is not None else delay2)
+                sleep2 = float(effective_caps.get("sleep_chunks") if effective_caps.get("sleep_chunks") is not None else sleep2)
+                if caps_resolver_export:
+                    with JOBS_LOCK:
+                        job.debug_last_caps_resolve = dict(caps_meta or {})
+                if caps_resolver_debug:
+                    applied_steps = [str(st.get("step")) for st in (caps_meta.get("steps") or []) if st.get("before") != st.get("after")]
+                    with JOBS_LOCK:
+                        job.log("INFO", f"CapsResolver lane={lane_key_selected[0]}|{lane_key_selected[1]} caps={{'chunk_size':{cs},'workers':{workers2},'delay_s':{delay2:.3f},'sleep_chunks':{sleep2:.3f}}} steps={','.join(applied_steps) or 'none'}")
+            else:
+                if probe_selected_this_iteration:
+                    clamped_caps = probe_controller.apply_probe_caps(
+                        {
+                            "chunk_size": cs,
+                            "workers": workers2,
+                            "delay_s": delay2,
+                            "sleep_chunks": sleep2,
+                        }
+                    )
+                    cs = int(clamped_caps.get("chunk_size") or cs)
+                    workers2 = int(clamped_caps.get("workers") or workers2)
+                    delay2 = float(clamped_caps.get("delay_s") if clamped_caps.get("delay_s") is not None else delay2)
+                    sleep2 = float(clamped_caps.get("sleep_chunks") if clamped_caps.get("sleep_chunks") is not None else sleep2)
+                if learning_caps_enforce and learning_caps:
+                    if isinstance(learning_caps.get("chunk_size_cap"), int):
+                        cs = max(1, min(int(cs or 1), int(learning_caps.get("chunk_size_cap") or cs)))
+                    if isinstance(learning_caps.get("workers_cap"), int):
+                        workers2 = max(1, min(int(workers2 or 1), int(learning_caps.get("workers_cap") or workers2)))
+                    if isinstance(learning_caps.get("delay_floor"), (int, float)):
+                        delay2 = max(float(delay2 or 0.0), float(learning_caps.get("delay_floor") or 0.0))
             target_key = _sd_key(sender_idx_fixed, target_domain)
 
             retry_q = provider_retry_chunks.get(target_key) or []
@@ -15797,6 +15964,32 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "Compute learning-driven provider/lane safety caps from existing SQLite learning tables (debug/additive unless enforced)."},
     {"key": "SHIVA_LEARNING_CAPS_ENFORCE", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Enforce learning caps as clamp-only safety limits (reduce aggressiveness only)."},
+    {"key": "SHIVA_CAPS_RESOLVER", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Enable unified caps resolver wiring for per-lane attempt cap merges. If disabled, legacy cap-merge logic remains unchanged."},
+    {"key": "SHIVA_CAPS_RESOLVER_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Export last resolved caps metadata into job debug payload as debug_last_caps_resolve."},
+    {"key": "SHIVA_CAPS_RESOLVER_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Emit concise per-chunk CapsResolver debug logs (lane + final caps + applied clamps)."},
+    {"key": "SHIVA_LANE_STATE_CAPS_ENFORCE", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "If enabled, enforce LaneRegistry recommended caps as clamp-only limits per lane attempt."},
+    {"key": "SHIVA_LANE_STATE_CAPS_ONLY_IN_LANE_V2", "type": "bool", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "When lane-state cap enforcement is enabled, apply only while effective scheduler mode is lane_v2."},
+    {"key": "SHIVA_CAPS_MIN_CHUNK", "type": "int", "default": "50", "group": "Scheduler", "restart_required": False,
+     "desc": "Global minimum chunk size bound for resolved caps."},
+    {"key": "SHIVA_CAPS_MAX_CHUNK", "type": "int", "default": "2000", "group": "Scheduler", "restart_required": False,
+     "desc": "Global maximum chunk size bound for resolved caps."},
+    {"key": "SHIVA_CAPS_MIN_WORKERS", "type": "int", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "Global minimum worker bound for resolved caps."},
+    {"key": "SHIVA_CAPS_MAX_WORKERS", "type": "int", "default": "50", "group": "Scheduler", "restart_required": False,
+     "desc": "Global maximum worker bound for resolved caps."},
+    {"key": "SHIVA_CAPS_MIN_DELAY_S", "type": "float", "default": "0.0", "group": "Scheduler", "restart_required": False,
+     "desc": "Global minimum per-message delay bound for resolved caps."},
+    {"key": "SHIVA_CAPS_MAX_DELAY_S", "type": "float", "default": "5.0", "group": "Scheduler", "restart_required": False,
+     "desc": "Global maximum per-message delay bound for resolved caps."},
+    {"key": "SHIVA_CAPS_MIN_SLEEP_CHUNKS", "type": "int", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Global minimum sleep-between-chunks bound for resolved caps."},
+    {"key": "SHIVA_CAPS_MAX_SLEEP_CHUNKS", "type": "int", "default": "60", "group": "Scheduler", "restart_required": False,
+     "desc": "Global maximum sleep-between-chunks bound for resolved caps."},
     {"key": "SHIVA_LEARNING_REFRESH_S", "type": "int", "default": "120", "group": "Scheduler", "restart_required": False,
      "desc": "Refresh interval (seconds) for learning policy DB reads."},
     {"key": "SHIVA_LEARNING_MIN_SAMPLES", "type": "int", "default": "200", "group": "Scheduler", "restart_required": False,
