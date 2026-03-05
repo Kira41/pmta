@@ -677,6 +677,10 @@ class LaneMetrics:
                     "timeouts_conn": 0,
                     "blocked_events": 0,
                     "backoff_events": 0,
+                    "acct_delivered": 0,
+                    "acct_bounced": 0,
+                    "acct_deferred": 0,
+                    "acct_complained": 0,
                 },
                 "chunks_selected": 0,
                 "selected_messages": 0,
@@ -767,6 +771,36 @@ class LaneMetrics:
         lane["last_backoff"] = {"wait_s": float(wait_s or 0.0), "failure_type": str(failure_type or "")}
         self._add_error_signature(lane, f"backoff:{str(failure_type or 'unknown')}")
 
+    def on_accounting_delta(
+        self,
+        lane_key: Tuple[int, str],
+        *,
+        delivered: int = 0,
+        bounced: int = 0,
+        deferred: int = 0,
+        complained: int = 0,
+        sender_email: str = "",
+        sender_domain: str = "",
+    ) -> None:
+        lane = self.ensure_lane(lane_key, sender_email=sender_email, sender_domain=sender_domain)
+        self._push_window(
+            lane,
+            {
+                "attempts_total": 0,
+                "sent_attempts": 0,
+                "accepted_2xx": 0,
+                "deferrals_4xx": 0,
+                "hardfails_5xx": 0,
+                "timeouts_conn": 0,
+                "blocked_events": 0,
+                "backoff_events": 0,
+                "acct_delivered": max(0, int(delivered or 0)),
+                "acct_bounced": max(0, int(bounced or 0)),
+                "acct_deferred": max(0, int(deferred or 0)),
+                "acct_complained": max(0, int(complained or 0)),
+            },
+        )
+
     def snapshot(self) -> dict:
         out: Dict[str, Any] = {
             "window": int(self.window),
@@ -793,9 +827,28 @@ class LaneMetrics:
                 "timeouts_conn": int(sums.get("timeouts_conn") or 0),
                 "blocked_events": int(sums.get("blocked_events") or 0),
                 "backoff_events": int(sums.get("backoff_events") or 0),
+                "acct_delivered": int(sums.get("acct_delivered") or 0),
+                "acct_bounced": int(sums.get("acct_bounced") or 0),
+                "acct_deferred": int(sums.get("acct_deferred") or 0),
+                "acct_complained": int(sums.get("acct_complained") or 0),
+                "acct_total": int(
+                    int(sums.get("acct_delivered") or 0)
+                    + int(sums.get("acct_bounced") or 0)
+                    + int(sums.get("acct_deferred") or 0)
+                    + int(sums.get("acct_complained") or 0)
+                ),
                 "deferral_rate": float(int(sums.get("deferrals_4xx") or 0) / attempts),
                 "hardfail_rate": float(int(sums.get("hardfails_5xx") or 0) / attempts),
                 "timeout_rate": float(int(sums.get("timeouts_conn") or 0) / attempts),
+                "acct_deferred_rate": float(
+                    int(sums.get("acct_deferred") or 0)
+                    / max(1, int(
+                        int(sums.get("acct_delivered") or 0)
+                        + int(sums.get("acct_bounced") or 0)
+                        + int(sums.get("acct_deferred") or 0)
+                        + int(sums.get("acct_complained") or 0)
+                    ))
+                ),
                 "last_backoff": dict(lane.get("last_backoff") or {}),
                 "last_error_samples": list(lane.get("last_error_samples") or []),
             }
@@ -929,6 +982,10 @@ class LaneRegistry:
         d = float(metrics.get("deferral_rate") or 0.0)
         h = float(metrics.get("hardfail_rate") or 0.0)
         t = float(metrics.get("timeout_rate") or 0.0)
+        acct_total = int(metrics.get("acct_total") or 0)
+        if acct_total > 0:
+            d = float(metrics.get("acct_deferred_rate") or d)
+            h = float((int(metrics.get("acct_bounced") or 0) + int(metrics.get("acct_complained") or 0)) / max(1, acct_total))
         backoff_type = str((lane.get("last_backoff") or {}).get("failure_type") or "").strip().lower()
         blocked_recent = len(lane.get("blocked_reasons") or []) > 0
         if t >= float(self.thresholds.get("timeout_rate_infra") or 0.05):
@@ -2667,6 +2724,7 @@ class SendJob:
     debug_last_lane_pick: dict = field(default_factory=dict)
     debug_last_caps_resolve: dict = field(default_factory=dict)
     debug_shadow_events: List[dict] = field(default_factory=list)
+    debug_lane_accounting: dict = field(default_factory=dict)
 
     # PMTA diagnostics snapshot (optional; helps classify failures quickly)
     pmta_diag: dict = field(default_factory=dict)
@@ -3587,6 +3645,7 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "debug_last_lane_pick": job.debug_last_lane_pick or {},
         "debug_last_caps_resolve": job.debug_last_caps_resolve or {},
         "debug_shadow_events": (job.debug_shadow_events or [])[-50:],
+        "debug_lane_accounting": job.debug_lane_accounting or {},
         "pmta_diag": job.pmta_diag or {},
         "pmta_diag_ts": job.pmta_diag_ts or "",
         "created_at": job.created_at,
@@ -3799,6 +3858,217 @@ def _email_domain(raw_email: Any) -> str:
     if not dom or "." not in dom:
         return ""
     return dom
+
+
+def normalize_accounting_event(line_or_json: Any, default_job_id: str = "") -> Optional[dict]:
+    payload = line_or_json if isinstance(line_or_json, dict) else {}
+
+    def _pick(*keys: str) -> str:
+        for k in keys:
+            v = payload.get(k)
+            if isinstance(v, (str, int, float)) and str(v).strip():
+                return str(v).strip()
+        return ""
+
+    raw_outcome = _pick("outcome", "status", "result", "event")
+    key = raw_outcome.strip().upper()
+    mapped = {
+        "D": "DELIVERED", "DELIVERED": "DELIVERED", "SUCCESS": "DELIVERED",
+        "B": "BOUNCED", "BOUNCED": "BOUNCED", "HARD_BOUNCE": "BOUNCED",
+        "R": "DEFERRED", "DEFERRED": "DEFERRED", "TEMPFAIL": "DEFERRED",
+        "C": "COMPLAINED", "COMPLAINED": "COMPLAINED", "COMPLAINT": "COMPLAINED",
+    }.get(key, "")
+    if not mapped:
+        return None
+
+    rcpt = _pick("rcpt", "recipient", "email", "recipient_email", "to")
+    rcpt = rcpt.lower()
+    rcpt_domain = _email_domain(rcpt)
+    sender_identity = _pick("sender", "sender_email", "mail_from", "from", "sender_domain") or "unknown_sender"
+    sender_identity = sender_identity.strip().lower()
+    if "@" in sender_identity:
+        sender_identity = sender_identity
+
+    return {
+        "job_id": (_pick("job_id", "campaign_id", "x_job_id", "x_campaign_id") or str(default_job_id or "").strip().lower()),
+        "sender_identity": sender_identity,
+        "rcpt_email": rcpt,
+        "rcpt_domain": rcpt_domain,
+        "outcome": mapped,
+        "ts": _pick("time_logged", "ts", "timestamp", "created_at") or now_iso(),
+        "raw_reason": _pick("dsn_diag", "response", "reason", "detail", "dsn_status"),
+    }
+
+
+class AccountingReconEngine:
+    def __init__(self, *, job_id: str, lane_metrics: Optional[LaneMetrics], lane_registry: Optional[LaneRegistry], provider_canon: Any = None,
+                 sender_idx_by_rcpt: Optional[Dict[str, int]] = None, lock: Optional[threading.RLock] = None,
+                 debug: bool = False, export: bool = False, dedupe_max_ids: int = 200000):
+        self.job_id = str(job_id or "").strip().lower()
+        self.lane_metrics = lane_metrics
+        self.lane_registry = lane_registry
+        self.provider_canon = provider_canon
+        self.sender_idx_by_rcpt = sender_idx_by_rcpt if isinstance(sender_idx_by_rcpt, dict) else {}
+        self.lock = lock
+        self.debug = bool(debug)
+        self.export = bool(export)
+        self._dedupe_max_ids = max(1000, int(dedupe_max_ids or 200000))
+        self._seen_ids: Set[str] = set()
+        self._seen_fifo: deque = deque(maxlen=self._dedupe_max_ids)
+        self._cursor_rowid = 0
+        self.lines_processed_total = 0
+        self.lines_processed_delta = 0
+        self.last_recon_ts = ""
+        self._lane_totals: Dict[str, dict] = {}
+        self._provider_totals: Dict[str, dict] = {}
+
+    def _event_id(self, ev: dict) -> str:
+        payload = "|".join([
+            str(ev.get("job_id") or ""),
+            str(ev.get("ts") or ""),
+            str(ev.get("rcpt_email") or ""),
+            str(ev.get("outcome") or ""),
+            str(ev.get("sender_identity") or ""),
+            str(ev.get("raw_reason") or ""),
+        ])
+        return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
+
+    def _remember(self, eid: str) -> bool:
+        if eid in self._seen_ids:
+            return False
+        if len(self._seen_fifo) >= self._dedupe_max_ids:
+            old = self._seen_fifo.popleft()
+            self._seen_ids.discard(old)
+        self._seen_fifo.append(eid)
+        self._seen_ids.add(eid)
+        return True
+
+    def _fetch_rows(self, limit: int = 4000) -> List[dict]:
+        rows: List[dict] = []
+        with DB_LOCK:
+            conn = _db_conn()
+            try:
+                rs = conn.execute(
+                    "SELECT rowid, job_id, rcpt, outcome, time_logged, dsn_diag, raw_json FROM accounting_events WHERE job_id=? AND rowid>? ORDER BY rowid ASC LIMIT ?",
+                    (self.job_id, int(self._cursor_rowid), int(limit)),
+                ).fetchall()
+            finally:
+                conn.close()
+        for r in rs:
+            raw_obj = {}
+            raw_json = str(r[6] or "")
+            if raw_json:
+                try:
+                    raw_obj = json.loads(raw_json)
+                except Exception:
+                    raw_obj = {}
+            raw_obj.update({
+                "job_id": str(r[1] or ""),
+                "rcpt": str(r[2] or ""),
+                "outcome": str(r[3] or ""),
+                "time_logged": str(r[4] or ""),
+                "dsn_diag": str(r[5] or ""),
+                "rowid": int(r[0] or 0),
+            })
+            rows.append(raw_obj)
+        return rows
+
+    def _resolve_lane(self, ev: dict) -> Tuple[Tuple[int, str], str]:
+        rcpt = str(ev.get("rcpt_email") or "").strip().lower()
+        sender_idx = int(self.sender_idx_by_rcpt.get(rcpt, 0) or 0)
+        provider_domain = str(ev.get("rcpt_domain") or "").strip().lower()
+        provider_key = provider_domain
+        if getattr(self.provider_canon, "enforce", False):
+            provider_key = str(self.provider_canon.group_for_domain(provider_domain) or provider_domain)
+        lane_key = (sender_idx, provider_key)
+        return lane_key, provider_key
+
+    def poll_and_update(self, job: Any, now_ts: float) -> dict:
+        delta = {"delivered": 0, "bounced": 0, "deferred": 0, "complained": 0, "lanes": 0}
+        lane_delta: Dict[str, dict] = {}
+        processed = 0
+        while True:
+            rows = self._fetch_rows()
+            if not rows:
+                break
+            for row in rows:
+                processed += 1
+                self._cursor_rowid = max(self._cursor_rowid, int(row.get("rowid") or 0))
+                ev = normalize_accounting_event(row, default_job_id=self.job_id)
+                if not ev or str(ev.get("job_id") or "").strip().lower() != self.job_id:
+                    continue
+                eid = self._event_id(ev)
+                if not self._remember(eid):
+                    continue
+                lane_key, provider_key = self._resolve_lane(ev)
+                lane_id = f"{lane_key[0]}|{lane_key[1]}"
+                if lane_id not in lane_delta:
+                    lane_delta[lane_id] = {"lane_key": lane_key, "delivered": 0, "bounced": 0, "deferred": 0, "complained": 0}
+                out = str(ev.get("outcome") or "")
+                if out == "DELIVERED":
+                    lane_delta[lane_id]["delivered"] += 1
+                    delta["delivered"] += 1
+                elif out == "BOUNCED":
+                    lane_delta[lane_id]["bounced"] += 1
+                    delta["bounced"] += 1
+                elif out == "DEFERRED":
+                    lane_delta[lane_id]["deferred"] += 1
+                    delta["deferred"] += 1
+                elif out == "COMPLAINED":
+                    lane_delta[lane_id]["complained"] += 1
+                    delta["complained"] += 1
+
+                p = self._provider_totals.setdefault(provider_key or "unknown_provider", {"delivered": 0, "bounced": 0, "deferred": 0, "complained": 0})
+                k = out.lower()
+                if k in p:
+                    p[k] += 1
+
+            if len(rows) < 4000:
+                break
+
+        delta["lanes"] = len(lane_delta)
+        for lane_id, c in lane_delta.items():
+            lk = c["lane_key"]
+            if self.lane_metrics:
+                self.lane_metrics.on_accounting_delta(lk, delivered=c["delivered"], bounced=c["bounced"], deferred=c["deferred"], complained=c["complained"])
+            lane_tot = self._lane_totals.setdefault(lane_id, {"sender_idx": int(lk[0]), "provider_key": str(lk[1]), "delivered": 0, "bounced": 0, "deferred": 0, "complained": 0})
+            for kk in ("delivered", "bounced", "deferred", "complained"):
+                lane_tot[kk] = int(lane_tot.get(kk) or 0) + int(c[kk] or 0)
+            if self.lane_registry and self.lane_metrics:
+                snap = (self.lane_metrics.snapshot().get("lanes") or {}).get(lane_id) or {}
+                self.lane_registry.update_from_metrics(now_ts, lk, snap)
+
+        self.lines_processed_total += processed
+        self.lines_processed_delta = processed
+        self.last_recon_ts = now_iso()
+        if self.export and hasattr(job, "debug_lane_accounting"):
+            job.debug_lane_accounting = self.snapshot()
+        return delta
+
+    def snapshot(self, max_lanes: int = 25) -> dict:
+        lanes = list(self._lane_totals.values())
+        lanes.sort(key=lambda x: (int(x.get("deferred") or 0), int(x.get("delivered") or 0)), reverse=True)
+        lane_rows = []
+        for item in lanes[:max(1, int(max_lanes))]:
+            total = int(item.get("delivered") or 0) + int(item.get("bounced") or 0) + int(item.get("deferred") or 0) + int(item.get("complained") or 0)
+            lane_rows.append({
+                **item,
+                "total": total,
+                "deferred_rate": float(int(item.get("deferred") or 0) / max(1, total)),
+                "bounce_rate": float(int(item.get("bounced") or 0) / max(1, total)),
+                "complaint_rate": float(int(item.get("complained") or 0) / max(1, total)),
+            })
+        provider_rows = []
+        for k, v in sorted(self._provider_totals.items(), key=lambda kv: sum(int(kv[1].get(x) or 0) for x in ("delivered", "bounced", "deferred", "complained")), reverse=True):
+            t = sum(int(v.get(x) or 0) for x in ("delivered", "bounced", "deferred", "complained"))
+            provider_rows.append({"provider": k, **v, "total": t, "deferred_rate": float(int(v.get("deferred") or 0) / max(1, t))})
+        return {
+            "last_recon_ts": self.last_recon_ts,
+            "lines_processed_total": int(self.lines_processed_total),
+            "lines_processed_delta": int(self.lines_processed_delta),
+            "providers": provider_rows[:20],
+            "lanes": lane_rows,
+        }
 
 
 def _learning_series_id(job_id: str, chunk_idx: int, provider_domain: str) -> str:
@@ -4349,6 +4619,7 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job.debug_last_lane_pick = (s.get("debug_last_lane_pick") if isinstance(s.get("debug_last_lane_pick"), dict) else {}) or {}
         job.debug_last_caps_resolve = (s.get("debug_last_caps_resolve") if isinstance(s.get("debug_last_caps_resolve"), dict) else {}) or {}
         job.debug_shadow_events = list(s.get("debug_shadow_events") or [])
+        job.debug_lane_accounting = (s.get("debug_lane_accounting") if isinstance(s.get("debug_lane_accounting"), dict) else {}) or {}
         job.pmta_diag = (s.get("pmta_diag") if isinstance(s.get("pmta_diag"), dict) else {}) or {}
         job.pmta_diag_ts = str(s.get("pmta_diag_ts") or "")
         job.updated_at = str(s.get("updated_at") or "")
@@ -13721,6 +13992,10 @@ def smtp_send_job(
     lane_metrics_export = bool(get_env_bool("SHIVA_LANE_METRICS_EXPORT", False))
     lane_registry_enabled = bool(get_env_bool("SHIVA_LANE_REGISTRY", False))
     lane_state_export = bool(get_env_bool("SHIVA_LANE_STATE_EXPORT", False))
+    lane_accounting_recon_enabled = bool(get_env_bool("SHIVA_LANE_ACCOUNTING_RECON", False))
+    lane_accounting_recon_interval_s = max(5, int(get_env_int("SHIVA_LANE_ACCOUNTING_RECON_INTERVAL_S", 30)))
+    lane_accounting_recon_export = bool(get_env_bool("SHIVA_LANE_ACCOUNTING_RECON_EXPORT", False))
+    lane_accounting_recon_debug = bool(get_env_bool("SHIVA_LANE_ACCOUNTING_RECON_DEBUG", False))
     soft_provider_budgets_enabled = bool(get_env_bool("SHIVA_SOFT_PROVIDER_BUDGETS", False))
     soft_provider_budget_debug = bool(get_env_bool("SHIVA_SOFT_BUDGET_DEBUG", False))
     provider_cooldown_s = max(1, int(get_env_int("SHIVA_PROVIDER_COOLDOWN_S", 90)))
@@ -13922,6 +14197,9 @@ def smtp_send_job(
     if learning_export:
         with JOBS_LOCK:
             job.debug_learning_policy = {}
+    if lane_accounting_recon_export:
+        with JOBS_LOCK:
+            job.debug_lane_accounting = {}
 
     provider_canon = ProviderCanon.from_env(
         enabled=provider_canon_enabled,
@@ -14190,6 +14468,27 @@ def smtp_send_job(
         if wave_controller.enabled and single_domain_waves_export:
             with JOBS_LOCK:
                 job.debug_wave_status = wave_controller.snapshot()
+
+    def _tick_accounting_recon(now_ts: float) -> None:
+        nonlocal last_accounting_recon_ts
+        if not accounting_recon_engine:
+            return
+        if (float(now_ts) - float(last_accounting_recon_ts)) < float(lane_accounting_recon_interval_s):
+            return
+        try:
+            delta = accounting_recon_engine.poll_and_update(job, now_ts)
+            if lane_accounting_recon_export:
+                with JOBS_LOCK:
+                    job.debug_lane_accounting = accounting_recon_engine.snapshot()
+            if lane_accounting_recon_debug and any(int(delta.get(k) or 0) > 0 for k in ("delivered", "bounced", "deferred", "complained")):
+                with JOBS_LOCK:
+                    job.log("INFO", f"Accounting recon delta: {delta}")
+        except Exception as e:
+            if lane_accounting_recon_debug:
+                with JOBS_LOCK:
+                    job.log("WARN", f"Accounting recon failed: {e}")
+        finally:
+            last_accounting_recon_ts = float(now_ts)
 
     smtp_host_ips = _resolve_ipv4(smtp_host) if smtp_host else []
 
@@ -14634,6 +14933,13 @@ def smtp_send_job(
             if s in sender_idx_map
         }
         sender_cursor = 0
+        sender_idx_by_rcpt: Dict[str, int] = {}
+        for _sidx, _domains in sender_bucket_by_idx.items():
+            for _rcpts in (_domains or {}).values():
+                for _rcpt in (_rcpts or []):
+                    rr = str(_rcpt or "").strip().lower()
+                    if rr:
+                        sender_idx_by_rcpt[rr] = int(_sidx)
         scheduler_rng = random.Random(int(hashlib.sha256(partition_seed.encode("utf-8", errors="ignore")).hexdigest()[:16], 16))
         provider_retry_chunks: Dict[str, List[dict]] = {}
         rollout_effective_mode = str(rollout.get("effective_mode") or "legacy")
@@ -14683,6 +14989,18 @@ def smtp_send_job(
         if provider_canon.enabled and provider_canon.export:
             with JOBS_LOCK:
                 job.debug_provider_canon = provider_canon.snapshot()
+
+        accounting_recon_engine = AccountingReconEngine(
+            job_id=job.id,
+            lane_metrics=lane_metrics,
+            lane_registry=lane_registry,
+            provider_canon=provider_canon,
+            sender_idx_by_rcpt=sender_idx_by_rcpt,
+            lock=JOBS_LOCK,
+            debug=lane_accounting_recon_debug,
+            export=lane_accounting_recon_export,
+        ) if lane_accounting_recon_enabled else None
+        last_accounting_recon_ts = 0.0
 
         probe_controller = ProbeController(
             enabled=probe_mode_enabled,
@@ -14835,12 +15153,22 @@ def smtp_send_job(
             }
             if lane_metrics:
                 ms = lane_metrics.snapshot()
-                for lane in (ms.get("lanes") if isinstance(ms, dict) else []) or []:
+                acct_attempts = 0
+                acct_def = 0
+                acct_hard = 0
+                for lane in (ms.get("lanes") if isinstance(ms, dict) else {}).values():
                     out["attempts_total"] += int(lane.get("attempts_total") or 0)
                     out["deferrals_4xx"] += int(lane.get("deferrals_4xx") or 0)
                     out["hardfails_5xx"] += int(lane.get("hardfails_5xx") or 0)
                     out["timeouts_conn"] += int(lane.get("timeouts_conn") or 0)
                     out["blocked_events"] += int(lane.get("blocked_events") or 0)
+                    acct_attempts += int(lane.get("acct_total") or 0)
+                    acct_def += int(lane.get("acct_deferred") or 0)
+                    acct_hard += int(lane.get("acct_bounced") or 0) + int(lane.get("acct_complained") or 0)
+                if acct_attempts > 0:
+                    out["attempts_total"] = int(acct_attempts)
+                    out["deferrals_4xx"] = int(acct_def)
+                    out["hardfails_5xx"] = int(acct_hard)
             if lane_registry:
                 rs = lane_registry.snapshot(time.time())
                 lanes = (rs.get("lanes") if isinstance(rs, dict) else []) or []
@@ -15064,6 +15392,7 @@ def smtp_send_job(
                 raise
 
         while _remaining_total() > 0:
+            _tick_accounting_recon(time.time())
             if not _wait_ready():
                 _stop_job("stop requested")
                 return
@@ -15958,6 +16287,7 @@ def smtp_send_job(
                     _stop_job("stop requested")
                     return
 
+        _tick_accounting_recon(time.time())
         if lane_concurrency_runtime and resource_governor and resource_governor_export:
             with JOBS_LOCK:
                 job.debug_resource_governor = resource_governor.snapshot()
@@ -16398,6 +16728,14 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "Max events included in scheduler_telemetry snapshot."},
     {"key": "SHIVA_UI_TELEMETRY_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Verbose UI telemetry debug logging for snapshot assembly."},
+    {"key": "SHIVA_LANE_ACCOUNTING_RECON", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Enable per-lane PMTA accounting reconciliation loop (ground-truth outcomes)."},
+    {"key": "SHIVA_LANE_ACCOUNTING_RECON_INTERVAL_S", "type": "int", "default": "30", "group": "Scheduler", "restart_required": False,
+     "desc": "Polling interval in seconds for lane accounting reconciliation during active jobs."},
+    {"key": "SHIVA_LANE_ACCOUNTING_RECON_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Export bounded per-lane accounting reconciliation snapshot into job debug payload/UI telemetry."},
+    {"key": "SHIVA_LANE_ACCOUNTING_RECON_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Verbose debug logging for lane accounting reconciliation."},
     {"key": "SHIVA_RUN_SELFTESTS", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Run lightweight deterministic rollout self-tests at startup."},
 
@@ -16774,6 +17112,7 @@ def build_scheduler_telemetry_snapshot(job: 'SendJob') -> dict:
     wave_status = getattr(job, "debug_wave_status", {}) or {}
     last_caps = getattr(job, "debug_last_caps_resolve", {}) or {}
     probe_status = getattr(job, "debug_probe_status", {}) or {}
+    accounting_recon = getattr(job, "debug_lane_accounting", {}) or {}
 
     lane_rows: List[dict] = []
     metrics_lanes = (lane_metrics.get("lanes") if isinstance(lane_metrics, dict) else {}) or {}
@@ -16883,6 +17222,14 @@ def build_scheduler_telemetry_snapshot(job: 'SendJob') -> dict:
             "enabled": bool(provider_canon.get("enabled") if isinstance(provider_canon, dict) else False),
             "groups": dict(provider_groups or {}),
         },
+        "accounting_recon": {
+            "enabled": bool(accounting_recon),
+            "last_recon_ts": str(accounting_recon.get("last_recon_ts") or ""),
+            "lines_processed_total": int(accounting_recon.get("lines_processed_total") or 0),
+            "lines_processed_delta": int(accounting_recon.get("lines_processed_delta") or 0),
+            "providers": list((accounting_recon.get("providers") if isinstance(accounting_recon, dict) else []) or [])[:20],
+            "lanes": list((accounting_recon.get("lanes") if isinstance(accounting_recon, dict) else []) or [])[:max_lanes],
+        },
         "lanes": lane_rows[:max_lanes],
         "executor": {
             "enabled": bool(lane_executor),
@@ -16972,6 +17319,7 @@ def job_api(job_id: str):
                 "accounting_last_ts": job.accounting_last_ts,
                 "accounting_error_counts": job.accounting_error_counts,
                 "accounting_last_errors": (job.accounting_last_errors or [])[-20:],
+                "debug_lane_accounting": job.debug_lane_accounting or {},
                 "internal_error_counts": job.internal_error_counts,
                 "internal_last_errors": (job.internal_last_errors or [])[-20:],
                 "spam_threshold": job.spam_threshold,
