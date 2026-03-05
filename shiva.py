@@ -743,6 +743,7 @@ class LaneRegistry:
                 "next_allowed_ts": 0.0,
                 "last_reason": "init",
                 "recommended_caps": {},
+                "recommended_caps_learning": {},
                 "deferral_rate": 0.0,
                 "hardfail_rate": 0.0,
                 "timeout_rate": 0.0,
@@ -868,6 +869,7 @@ class LaneRegistry:
             "next_allowed_ts": float(lane.get("next_allowed_ts") or 0.0),
             "last_reason": str(lane.get("last_reason") or ""),
             "recommended_caps": dict(lane.get("recommended_caps") or {}),
+            "recommended_caps_learning": dict(lane.get("recommended_caps_learning") or {}),
             "deferral_rate": float(lane.get("deferral_rate") or 0.0),
             "hardfail_rate": float(lane.get("hardfail_rate") or 0.0),
             "timeout_rate": float(lane.get("timeout_rate") or 0.0),
@@ -886,6 +888,10 @@ class LaneRegistry:
             "lanes": {lid: self.get_lane_info((int(v.get("sender_idx") or 0), str(v.get("provider_domain") or ""))) for lid, v in self._lanes.items()},
         }
 
+    def set_learning_caps(self, lane_key: Tuple[int, str], learning_caps: Optional[dict]) -> None:
+        lane = self.ensure_lane(lane_key, provider_domain=str(lane_key[1] or ""))
+        lane["recommended_caps_learning"] = dict(learning_caps or {})
+
 
 @dataclass
 class BudgetConfig:
@@ -901,6 +907,221 @@ class BudgetConfig:
     apply_to_retry: bool = False
     apply_to_probe: bool = True
     export: bool = False
+
+
+@dataclass
+class ProviderPolicy:
+    provider_max_inflight_suggested: Optional[int] = None
+    provider_min_gap_s_suggested: Optional[float] = None
+    provider_cooldown_s_suggested: Optional[float] = None
+    delay_floor_s_suggested: Optional[float] = None
+    chunk_cap_suggested: Optional[int] = None
+    workers_cap_suggested: Optional[int] = None
+    tier: str = "MIXED"
+    confidence: float = 0.0
+    attempts_total: int = 0
+    reasons: List[str] = field(default_factory=list)
+
+
+@dataclass
+class LanePolicy:
+    lane_state_bias: Optional[float] = None
+    delay_floor_s: Optional[float] = None
+    chunk_cap: Optional[int] = None
+    workers_cap: Optional[int] = None
+    confidence: float = 0.0
+    tier: str = "MIXED"
+    attempts_total: int = 0
+    reasons: List[str] = field(default_factory=list)
+
+
+@dataclass
+class LearningPolicy:
+    per_provider: Dict[str, ProviderPolicy] = field(default_factory=dict)
+    per_lane: Dict[str, LanePolicy] = field(default_factory=dict)
+    generated_ts: float = 0.0
+    data_quality: Dict[str, Any] = field(default_factory=dict)
+
+
+class LearningCapsEngine:
+    def __init__(
+        self,
+        db_getter: Optional[Callable[[], sqlite3.Connection]] = None,
+        refresh_s: int = 120,
+        min_samples: int = 200,
+        recency_days: int = 14,
+        debug: bool = False,
+    ):
+        self.db_getter = db_getter or _db_conn
+        self.refresh_s = max(10, int(refresh_s or 120))
+        self.min_samples = max(1, int(min_samples or 200))
+        self.recency_days = max(1, int(recency_days or 14))
+        self.debug = bool(debug)
+        self._last_refresh_ts = 0.0
+        self._policy = LearningPolicy(generated_ts=time.time())
+
+    def _clamp(self, val: Any, lo: float, hi: float, as_int: bool = False) -> Any:
+        try:
+            v = max(lo, min(hi, float(val)))
+            return int(round(v)) if as_int else float(v)
+        except Exception:
+            return int(round(lo)) if as_int else float(lo)
+
+    def _tier_for_rates(self, deferral_rate: float, hardfail_rate: float) -> Tuple[str, List[str]]:
+        reasons: List[str] = []
+        if hardfail_rate >= 0.04 or deferral_rate >= 0.40:
+            reasons.append(f"severe_rates d={deferral_rate:.3f} h={hardfail_rate:.3f}")
+            return "SLOW_OR_FAILING", reasons
+        if hardfail_rate >= 0.02 or deferral_rate >= 0.25:
+            reasons.append(f"degrading_rates d={deferral_rate:.3f} h={hardfail_rate:.3f}")
+            return "DEGRADING", reasons
+        if deferral_rate <= 0.08 and hardfail_rate <= 0.01:
+            reasons.append(f"healthy_rates d={deferral_rate:.3f} h={hardfail_rate:.3f}")
+            return "FAST_SUCCESS", reasons
+        reasons.append(f"mixed_rates d={deferral_rate:.3f} h={hardfail_rate:.3f}")
+        return "MIXED", reasons
+
+    def _derive_lane_policy(self, attempts: int, deferrals: int, hardfails: int) -> LanePolicy:
+        attempts_f = max(1, int(attempts or 0))
+        d_rate = float(deferrals) / float(attempts_f)
+        h_rate = float(hardfails) / float(attempts_f)
+        tier, reasons = self._tier_for_rates(d_rate, h_rate)
+        conf = min(1.0, float(attempts_f) / float(max(1, self.min_samples)))
+        if attempts_f < self.min_samples:
+            reasons.append("insufficient_samples")
+            return LanePolicy(confidence=conf, tier=tier, attempts_total=attempts_f, reasons=reasons)
+        if tier == "SLOW_OR_FAILING":
+            return LanePolicy(lane_state_bias=0.2, delay_floor_s=2.0, chunk_cap=80, workers_cap=1, confidence=conf, tier=tier, attempts_total=attempts_f, reasons=reasons)
+        if tier == "DEGRADING":
+            return LanePolicy(lane_state_bias=0.4, delay_floor_s=1.2, chunk_cap=150, workers_cap=2, confidence=conf, tier=tier, attempts_total=attempts_f, reasons=reasons)
+        if tier == "MIXED":
+            return LanePolicy(lane_state_bias=0.8, delay_floor_s=0.8, chunk_cap=300, workers_cap=3, confidence=conf, tier=tier, attempts_total=attempts_f, reasons=reasons)
+        return LanePolicy(lane_state_bias=1.0, delay_floor_s=0.5, chunk_cap=500, workers_cap=4, confidence=conf, tier=tier, attempts_total=attempts_f, reasons=reasons)
+
+    def _provider_from_lane_policies(self, lane_rows: List[dict]) -> ProviderPolicy:
+        attempts = sum(int(r.get("attempts") or 0) for r in lane_rows)
+        deferrals = sum(int(r.get("deferrals") or 0) for r in lane_rows)
+        hardfails = sum(int(r.get("hardfails") or 0) for r in lane_rows)
+        lane_policy = self._derive_lane_policy(attempts, deferrals, hardfails)
+        if attempts < self.min_samples:
+            return ProviderPolicy(tier=lane_policy.tier, confidence=lane_policy.confidence, attempts_total=attempts, reasons=list(lane_policy.reasons))
+        if lane_policy.tier == "SLOW_OR_FAILING":
+            return ProviderPolicy(1, 15.0, 300.0, 2.0, 100, 1, lane_policy.tier, lane_policy.confidence, attempts, lane_policy.reasons)
+        if lane_policy.tier == "DEGRADING":
+            return ProviderPolicy(2, 8.0, 180.0, 1.2, 180, 2, lane_policy.tier, lane_policy.confidence, attempts, lane_policy.reasons)
+        if lane_policy.tier == "MIXED":
+            return ProviderPolicy(3, 3.0, 90.0, 0.8, 300, 3, lane_policy.tier, lane_policy.confidence, attempts, lane_policy.reasons)
+        return ProviderPolicy(4, 1.0, 30.0, 0.4, 500, 4, lane_policy.tier, lane_policy.confidence, attempts, lane_policy.reasons)
+
+    def compute_policy(self, job: Any, senders: List[str], providers: List[str]) -> LearningPolicy:
+        providers_norm = sorted({str(p or "").strip().lower() for p in (providers or []) if str(p or "").strip()})
+        sender_domains = sorted({_extract_domain_from_email(s) for s in (senders or []) if _extract_domain_from_email(s)})
+        policy = LearningPolicy(generated_ts=time.time(), data_quality={"min_samples": self.min_samples, "recency_days": self.recency_days})
+        if not providers_norm or not sender_domains:
+            policy.data_quality["empty_scope"] = True
+            return policy
+        cutoff_iso = datetime.fromtimestamp(time.time() - (86400 * self.recency_days), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        rows: List[Tuple[str, str, int, int, int]] = []
+        with DB_LOCK:
+            conn = self.db_getter()
+            try:
+                provider_ph = ",".join(["?"] * len(providers_norm))
+                sender_ph = ",".join(["?"] * len(sender_domains))
+                q = (
+                    "SELECT sender_domain, provider_domain, "
+                    "SUM(CASE WHEN lower(outcome) LIKE '%defer%' OR lower(outcome) LIKE '%4xx%' THEN 1 ELSE 0 END) AS deferrals, "
+                    "SUM(CASE WHEN lower(outcome) LIKE '%fail%' OR lower(outcome) LIKE '%5xx%' THEN 1 ELSE 0 END) AS hardfails, "
+                    "COUNT(*) AS attempts "
+                    "FROM email_attempt_logs "
+                    f"WHERE provider_domain IN ({provider_ph}) AND sender_domain IN ({sender_ph}) AND attempt_ts >= ? "
+                    "GROUP BY sender_domain, provider_domain"
+                )
+                rows = conn.execute(q, providers_norm + sender_domains + [cutoff_iso]).fetchall()
+            except Exception:
+                rows = []
+            finally:
+                conn.close()
+        lane_rows_by_provider: Dict[str, List[dict]] = {}
+        for r in rows:
+            sender_dom = str(r[0] or "").strip().lower()
+            provider_dom = str(r[1] or "").strip().lower()
+            deferrals = int(r[2] or 0)
+            hardfails = int(r[3] or 0)
+            attempts = int(r[4] or 0)
+            lane_policy = self._derive_lane_policy(attempts, deferrals, hardfails)
+            if lane_policy.delay_floor_s is not None:
+                lane_policy.delay_floor_s = self._clamp(lane_policy.delay_floor_s, 0.2, 3.0)
+            if lane_policy.chunk_cap is not None:
+                lane_policy.chunk_cap = self._clamp(lane_policy.chunk_cap, 50, 1000, as_int=True)
+            if lane_policy.workers_cap is not None:
+                lane_policy.workers_cap = self._clamp(lane_policy.workers_cap, 1, 10, as_int=True)
+            policy.per_lane[f"{sender_dom}|{provider_dom}"] = lane_policy
+            lane_rows_by_provider.setdefault(provider_dom, []).append({"attempts": attempts, "deferrals": deferrals, "hardfails": hardfails})
+        for provider_dom in providers_norm:
+            p = self._provider_from_lane_policies(lane_rows_by_provider.get(provider_dom, []))
+            if p.provider_max_inflight_suggested is not None:
+                p.provider_max_inflight_suggested = self._clamp(p.provider_max_inflight_suggested, 1, 10, as_int=True)
+            if p.provider_min_gap_s_suggested is not None:
+                p.provider_min_gap_s_suggested = self._clamp(p.provider_min_gap_s_suggested, 0.0, 300.0)
+            if p.provider_cooldown_s_suggested is not None:
+                p.provider_cooldown_s_suggested = self._clamp(p.provider_cooldown_s_suggested, 0.0, 3600.0)
+            if p.delay_floor_s_suggested is not None:
+                p.delay_floor_s_suggested = self._clamp(p.delay_floor_s_suggested, 0.2, 3.0)
+            if p.chunk_cap_suggested is not None:
+                p.chunk_cap_suggested = self._clamp(p.chunk_cap_suggested, 50, 1000, as_int=True)
+            if p.workers_cap_suggested is not None:
+                p.workers_cap_suggested = self._clamp(p.workers_cap_suggested, 1, 10, as_int=True)
+            policy.per_provider[provider_dom] = p
+        return policy
+
+    def refresh_if_needed(self, now_ts: float, job: Any, senders: List[str], providers: List[str]) -> None:
+        now = float(now_ts or time.time())
+        if self._last_refresh_ts > 0 and (now - self._last_refresh_ts) < float(self.refresh_s):
+            return
+        self._policy = self.compute_policy(job, senders, providers)
+        self._last_refresh_ts = now
+
+    def get_provider_policy(self, provider_domain: str) -> Optional[ProviderPolicy]:
+        return self._policy.per_provider.get(str(provider_domain or "").strip().lower())
+
+    def get_lane_policy(self, lane_key: str) -> Optional[LanePolicy]:
+        return self._policy.per_lane.get(str(lane_key or "").strip().lower())
+
+    def snapshot(self) -> dict:
+        return {
+            "generated_ts": float(self._policy.generated_ts or 0.0),
+            "refresh_s": int(self.refresh_s),
+            "last_refresh_age_s": max(0.0, time.time() - float(self._last_refresh_ts or 0.0)) if self._last_refresh_ts else None,
+            "data_quality": dict(self._policy.data_quality or {}),
+            "providers": {
+                k: {
+                    "provider_max_inflight_suggested": v.provider_max_inflight_suggested,
+                    "provider_min_gap_s_suggested": v.provider_min_gap_s_suggested,
+                    "provider_cooldown_s_suggested": v.provider_cooldown_s_suggested,
+                    "delay_floor_s_suggested": v.delay_floor_s_suggested,
+                    "chunk_cap_suggested": v.chunk_cap_suggested,
+                    "workers_cap_suggested": v.workers_cap_suggested,
+                    "tier": v.tier,
+                    "confidence": v.confidence,
+                    "attempts_total": v.attempts_total,
+                    "reasons": list(v.reasons or []),
+                }
+                for k, v in sorted((self._policy.per_provider or {}).items())
+            },
+            "lanes": {
+                k: {
+                    "lane_state_bias": v.lane_state_bias,
+                    "delay_floor_s": v.delay_floor_s,
+                    "chunk_cap": v.chunk_cap,
+                    "workers_cap": v.workers_cap,
+                    "confidence": v.confidence,
+                    "tier": v.tier,
+                    "attempts_total": v.attempts_total,
+                    "reasons": list(v.reasons or []),
+                }
+                for k, v in sorted((self._policy.per_lane or {}).items())
+            },
+        }
 
 
 class BudgetManager:
@@ -3271,6 +3492,15 @@ def learning_recommendation(provider_domain: str, sender_domains: List[str], max
         "provider_trend": provider_trend,
         "provider_samples": int(provider_policy.get("sample_size") or 0),
         "provider_success_rate": float(provider_policy.get("success_rate", 0.0) or 0.0),
+        # additive export for richer policy consumers (backward compatible)
+        "policy": {
+            "tier": str(provider_trend or "unknown").upper(),
+            "confidence": min(1.0, float(provider_policy.get("sample_size") or 0) / 200.0),
+            "provider_backoff": {
+                "base_s": float(provider_policy.get("backoff_base_s", base_backoff_s) or base_backoff_s),
+                "max_s": float(provider_policy.get("backoff_max_s", max_backoff_s) or max_backoff_s),
+            },
+        },
     }
 
 
@@ -12782,6 +13012,15 @@ def smtp_send_job(
     budget_apply_to_retry = bool(get_env_bool("SHIVA_BUDGET_APPLY_TO_RETRY", False))
     budget_apply_to_probe = bool(get_env_bool("SHIVA_BUDGET_APPLY_TO_PROBE", True))
     budget_export = bool(get_env_bool("SHIVA_BUDGET_EXPORT", False))
+    learning_caps_enabled = bool(get_env_bool("SHIVA_LEARNING_CAPS", False))
+    learning_caps_enforce = bool(get_env_bool("SHIVA_LEARNING_CAPS_ENFORCE", False))
+    learning_refresh_s = max(30, int(get_env_int("SHIVA_LEARNING_REFRESH_S", 120)))
+    learning_min_samples = max(1, int(get_env_int("SHIVA_LEARNING_MIN_SAMPLES", 200)))
+    learning_recency_days = max(1, int(get_env_int("SHIVA_LEARNING_RECENCY_DAYS", 14)))
+    learning_export = bool(get_env_bool("SHIVA_LEARNING_EXPORT", False))
+    learning_max_lanes_provider_json = str(get_env("SHIVA_LEARNING_MAX_LANES_PROVIDER_JSON", "") or "").strip()
+    learning_delay_floor_json = str(get_env("SHIVA_LEARNING_DELAY_FLOOR_JSON", "") or "").strip()
+    learning_chunk_cap_json = str(get_env("SHIVA_LEARNING_CHUNK_CAP_JSON", "") or "").strip()
     lane_v2_debug = bool(get_env_bool("SHIVA_LANE_V2_DEBUG", False))
     lane_v2_export = bool(get_env_bool("SHIVA_LANE_V2_EXPORT", False))
     lane_v2_respect_lane_states = bool(get_env_bool("SHIVA_LANE_V2_RESPECT_LANE_STATES", True))
@@ -12908,6 +13147,9 @@ def smtp_send_job(
     if fallback_export:
         with JOBS_LOCK:
             job.debug_fallback = {}
+    if learning_export:
+        with JOBS_LOCK:
+            job.debug_learning_policy = {}
 
     budget_config = BudgetConfig(
         enabled=budget_manager_enabled,
@@ -12924,6 +13166,17 @@ def smtp_send_job(
         export=budget_export,
     )
     budget_mgr = BudgetManager(budget_config, lane_registry=lane_registry, debug=budget_debug) if budget_manager_enabled else None
+
+    learning_provider_workers_override = _parse_budget_json_map(learning_max_lanes_provider_json, value_type="int", min_v=1, max_v=10)
+    learning_provider_delay_override = _parse_budget_json_map(learning_delay_floor_json, value_type="float", min_v=0.2, max_v=3.0)
+    learning_provider_chunk_override = _parse_budget_json_map(learning_chunk_cap_json, value_type="int", min_v=50, max_v=1000)
+    learning_caps_engine = LearningCapsEngine(
+        db_getter=_db_conn,
+        refresh_s=learning_refresh_s,
+        min_samples=learning_min_samples,
+        recency_days=learning_recency_days,
+        debug=(lane_debug_enabled or budget_debug),
+    ) if learning_caps_enabled else None
 
     provider_cooldown_until: Dict[str, float] = {}
     lock_wave = threading.Lock()
@@ -13037,6 +13290,54 @@ def smtp_send_job(
                         job.log("INFO", f"SoftBudget: skipped lane {lane_key[0]}|{provider_domain} state={lane_state} next_allowed_ts={int(next_allowed_ts)}")
                 return True
         return False
+
+    def _refresh_learning_policy(now_ts: float) -> None:
+        if not learning_caps_engine:
+            return
+        providers_scope = sorted({str(k[1] or "").strip().lower() for k in (provider_retry_chunks or {}).keys() if isinstance(k, tuple) and str(k[1] or "").strip()})
+        providers_scope.extend([str(x or "").strip().lower() for x in (job.current_chunk_domains or {}).keys() if str(x or "").strip()])
+        providers_scope = sorted(set([p for p in providers_scope if p]))
+        if not providers_scope:
+            providers_scope = sorted({str(_extract_domain_from_recipient(r) or "").strip().lower() for r in (recipients or []) if _extract_domain_from_recipient(r)})
+        learning_caps_engine.refresh_if_needed(now_ts, job, sender_emails, providers_scope)
+        if learning_export:
+            with JOBS_LOCK:
+                job.debug_learning_policy = {
+                    **learning_caps_engine.snapshot(),
+                    "enforce": bool(learning_caps_enforce),
+                }
+
+    def _learning_caps_for_lane(lane_key: Tuple[int, str], sender_email: str) -> dict:
+        if not learning_caps_engine:
+            return {}
+        sender_domain = _extract_domain_from_email(sender_email)
+        provider_domain = str((lane_key or (0, ""))[1] or "").strip().lower()
+        if not sender_domain or not provider_domain:
+            return {}
+        lane_policy = learning_caps_engine.get_lane_policy(f"{sender_domain}|{provider_domain}")
+        provider_policy = learning_caps_engine.get_provider_policy(provider_domain)
+        out: Dict[str, Any] = {}
+        if lane_policy and lane_policy.chunk_cap is not None:
+            out["chunk_size_cap"] = int(lane_policy.chunk_cap)
+        if lane_policy and lane_policy.workers_cap is not None:
+            out["workers_cap"] = int(lane_policy.workers_cap)
+        if lane_policy and lane_policy.delay_floor_s is not None:
+            out["delay_floor"] = float(lane_policy.delay_floor_s)
+        if provider_policy and provider_policy.chunk_cap_suggested is not None:
+            out["chunk_size_cap"] = min(int(out.get("chunk_size_cap") or provider_policy.chunk_cap_suggested), int(provider_policy.chunk_cap_suggested))
+        if provider_policy and provider_policy.workers_cap_suggested is not None:
+            out["workers_cap"] = min(int(out.get("workers_cap") or provider_policy.workers_cap_suggested), int(provider_policy.workers_cap_suggested))
+        if provider_policy and provider_policy.delay_floor_s_suggested is not None:
+            out["delay_floor"] = max(float(out.get("delay_floor") or 0.0), float(provider_policy.delay_floor_s_suggested))
+        if provider_domain in learning_provider_chunk_override:
+            out["chunk_size_cap"] = int(learning_provider_chunk_override.get(provider_domain))
+        if provider_domain in learning_provider_workers_override:
+            out["workers_cap"] = int(learning_provider_workers_override.get(provider_domain))
+        if provider_domain in learning_provider_delay_override:
+            out["delay_floor"] = float(learning_provider_delay_override.get(provider_domain))
+        if lane_registry:
+            lane_registry.set_learning_caps(lane_key, out)
+        return out
 
     def _budget_can_start(lane_key: Tuple[int, str], now_ts: float, is_retry: bool, is_probe: bool, planned_chunk_size_hint: Optional[int] = None) -> Tuple[bool, str]:
         if not budget_mgr:
@@ -13593,6 +13894,15 @@ def smtp_send_job(
             },
         )
         wave_controller.start(job_start_ts=time.time(), num_senders=len(sender_emails), partition_seed=partition_seed)
+        if learning_caps_engine and wave_controller.enabled and single_provider_domain:
+            learning_caps_engine.refresh_if_needed(time.time(), job, sender_emails, [single_provider_domain])
+            if learning_caps_enforce:
+                provider_policy = learning_caps_engine.get_provider_policy(single_provider_domain)
+                if provider_policy and provider_policy.chunk_cap_suggested is not None:
+                    wave_controller.burst_tokens = min(float(wave_controller.burst_tokens), float(max(50, provider_policy.chunk_cap_suggested)))
+                    wave_controller.tokens_current = min(float(wave_controller.tokens_current), float(wave_controller.burst_tokens))
+                if provider_policy and provider_policy.workers_cap_suggested is not None:
+                    wave_controller.refill_per_sec = min(float(wave_controller.refill_per_sec), float(max(0.1, provider_policy.workers_cap_suggested)))
         if wave_controller.enabled and probe_controller.is_active(time.time()):
             probe_controller.stop()
         probe_controller.start(
@@ -14010,6 +14320,24 @@ def smtp_send_job(
                     pmta_pressure_applied = {}
 
             now_ts = time.time()
+            _refresh_learning_policy(now_ts)
+            if learning_caps_engine and budget_mgr:
+                policy_snapshot = learning_caps_engine.snapshot().get("providers") or {}
+                for provider_domain, provider_payload in policy_snapshot.items():
+                    suggested_inflight = provider_payload.get("provider_max_inflight_suggested")
+                    suggested_min_gap = provider_payload.get("provider_min_gap_s_suggested")
+                    suggested_cooldown = provider_payload.get("provider_cooldown_s_suggested")
+                    if learning_caps_enforce:
+                        if isinstance(suggested_inflight, int):
+                            baseline_inflight = budget_mgr.provider_max_inflight(provider_domain)
+                            budget_mgr.set_provider_max_inflight_override(provider_domain, min(baseline_inflight, int(suggested_inflight)))
+                        if isinstance(suggested_min_gap, (int, float)):
+                            prev_gap = float(budget_config.provider_min_gap_s_map.get(provider_domain, budget_config.provider_min_gap_s_default))
+                            budget_config.provider_min_gap_s_map[provider_domain] = max(prev_gap, float(suggested_min_gap))
+                        if isinstance(suggested_cooldown, (int, float)):
+                            prev_cd = float(budget_config.provider_cooldown_s_map.get(provider_domain, budget_config.provider_cooldown_s_default))
+                            budget_config.provider_cooldown_s_map[provider_domain] = max(prev_cd, float(suggested_cooldown))
+
             if fallback_controller:
                 pmta_level_now = int(pmta_pressure_applied.get("level") or 0) if isinstance(pmta_pressure_applied, dict) else 0
                 fallback_controller.observe(
@@ -14093,6 +14421,16 @@ def smtp_send_job(
                 workers2 = int(clamped_caps.get("workers") or workers2)
                 delay2 = float(clamped_caps.get("delay_s") if clamped_caps.get("delay_s") is not None else delay2)
                 sleep2 = float(clamped_caps.get("sleep_chunks") if clamped_caps.get("sleep_chunks") is not None else sleep2)
+            lane_key_selected = (int(sender_idx_fixed), str(target_domain or "").strip().lower())
+            sender_email_selected = from_emails2[sender_idx_fixed % len(from_emails2)] if from_emails2 else ""
+            learning_caps = _learning_caps_for_lane(lane_key_selected, sender_email_selected)
+            if learning_caps_enforce and learning_caps:
+                if isinstance(learning_caps.get("chunk_size_cap"), int):
+                    cs = max(1, min(int(cs or 1), int(learning_caps.get("chunk_size_cap") or cs)))
+                if isinstance(learning_caps.get("workers_cap"), int):
+                    workers2 = max(1, min(int(workers2 or 1), int(learning_caps.get("workers_cap") or workers2)))
+                if isinstance(learning_caps.get("delay_floor"), (int, float)):
+                    delay2 = max(float(delay2 or 0.0), float(learning_caps.get("delay_floor") or 0.0))
             target_key = _sd_key(sender_idx_fixed, target_domain)
 
             retry_q = provider_retry_chunks.get(target_key) or []
@@ -14936,6 +15274,24 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "If enabled, probe mode lane picks must pass BudgetManager gate."},
     {"key": "SHIVA_BUDGET_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Export BudgetManager debug snapshot into job debug payload as additive field debug_budget_status."},
+    {"key": "SHIVA_LEARNING_CAPS", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Compute learning-driven provider/lane safety caps from existing SQLite learning tables (debug/additive unless enforced)."},
+    {"key": "SHIVA_LEARNING_CAPS_ENFORCE", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Enforce learning caps as clamp-only safety limits (reduce aggressiveness only)."},
+    {"key": "SHIVA_LEARNING_REFRESH_S", "type": "int", "default": "120", "group": "Scheduler", "restart_required": False,
+     "desc": "Refresh interval (seconds) for learning policy DB reads."},
+    {"key": "SHIVA_LEARNING_MIN_SAMPLES", "type": "int", "default": "200", "group": "Scheduler", "restart_required": False,
+     "desc": "Minimum attempts required before trusting learning suggestions."},
+    {"key": "SHIVA_LEARNING_RECENCY_DAYS", "type": "int", "default": "14", "group": "Scheduler", "restart_required": False,
+     "desc": "Recency window (days) used for learning aggregation from attempt logs."},
+    {"key": "SHIVA_LEARNING_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Export learning policy snapshot into job.debug_learning_policy."},
+    {"key": "SHIVA_LEARNING_MAX_LANES_PROVIDER_JSON", "type": "str", "default": "", "group": "Scheduler", "restart_required": False,
+     "desc": "Optional JSON map overriding provider workers cap suggestions from learning policy."},
+    {"key": "SHIVA_LEARNING_DELAY_FLOOR_JSON", "type": "str", "default": "", "group": "Scheduler", "restart_required": False,
+     "desc": "Optional JSON map overriding provider delay floor suggestions from learning policy."},
+    {"key": "SHIVA_LEARNING_CHUNK_CAP_JSON", "type": "str", "default": "", "group": "Scheduler", "restart_required": False,
+     "desc": "Optional JSON map overriding provider chunk cap suggestions from learning policy."},
     {"key": "SHIVA_SINGLE_DOMAIN_WAVES", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Enable single-provider-domain wave pacing mode (provider-wide token bucket + deterministic stagger)."},
     {"key": "SHIVA_SINGLE_DOMAIN_WAVES_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
