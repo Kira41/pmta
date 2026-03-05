@@ -16145,8 +16145,8 @@ def smtp_send_job(
             health_caps=baseline_health,
             provider_retry_chunks=provider_retry_chunks,
         )
-        baseline_report["invalid_count"] = int(partition_stats.get("invalid_count") or 0)
-        baseline_report["deduped_count"] = int(partition_stats.get("deduplicated_count") or 0)
+        baseline_report["invalid_count"] = _safe_int(partition_stats.get("invalid_count"), 0)
+        baseline_report["deduped_count"] = _safe_int(partition_stats.get("deduplicated_count"), 0)
 
         if lane_baseline_enabled:
             with JOBS_LOCK:
