@@ -7248,6 +7248,29 @@ PAGE_JOBS = r"""
     .pmtaSub{ margin-top:8px; font-size: 11px; color: rgba(255,255,255,.60); line-height: 1.35; word-break: break-word; overflow-wrap:anywhere; }
     .pmtaHint{ margin-top:6px; font-size: 11px; color: rgba(255,255,255,.52); line-height: 1.35; }
 
+    .chunkMeta{
+      display:flex;
+      flex-wrap:wrap;
+      gap:6px;
+      margin-top:8px;
+      padding:8px;
+      border:1px solid rgba(122,167,255,.28);
+      border-radius:11px;
+      background:linear-gradient(135deg, rgba(122,167,255,.14), rgba(53,228,154,.08));
+    }
+    .chunkMetaPill{
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      padding:4px 9px;
+      border-radius:999px;
+      border:1px solid rgba(255,255,255,.2);
+      background:rgba(8,14,34,.48);
+      font-size:11px;
+      color:rgba(255,255,255,.92);
+      font-weight:800;
+      line-height:1.2;
+    }
     .chunkList{display:grid; gap:7px; margin-top:10px;}
     .chunkItem{display:flex; align-items:flex-start; gap:8px; padding:7px 9px; border:1px solid rgba(255,255,255,.12); background:rgba(255,255,255,.03); border-radius:10px;}
     .chunkIcon{font-size:13px; line-height:1.2; margin-top:1px;}
@@ -7256,6 +7279,9 @@ PAGE_JOBS = r"""
     .chunkValue.warn{color:var(--warn);}
     .chunkValue.bad{color:var(--bad);}
     .chunkValue.good{color:var(--good);}
+    .chunkNote{margin-top:8px; padding:8px 10px; border-radius:10px; border:1px solid rgba(255,255,255,.12); background:rgba(255,255,255,.03);}
+    .chunkNoteAdaptive{border-color:rgba(53,228,154,.32); background:rgba(53,228,154,.08);}
+    .chunkNoteDomains{margin-top:10px; border-color:rgba(255,152,65,.38); background:rgba(255,152,65,.09);}
 
     .pmtaBanner{
       border:1px solid rgba(255,255,255,.14);
@@ -8705,7 +8731,13 @@ This will remove it from Jobs history.`);
         : '—';
 
       chunkLine = [
-        `<div class="mini">Chunk #${cnum} · size=${Number(ci.size||0)} · workers=${Number(ci.workers||0)} · delay=${Number(ci.delay_s||0)}s · attempt=${at}</div>`,
+        `<div class="chunkMeta">`,
+          `<span class="chunkMetaPill">#️⃣ Chunk #${cnum}</span>`,
+          `<span class="chunkMetaPill">📦 size=${Number(ci.size||0)}</span>`,
+          `<span class="chunkMetaPill">⚙️ workers=${Number(ci.workers||0)}</span>`,
+          `<span class="chunkMetaPill">⏱️ delay=${Number(ci.delay_s||0)}s</span>`,
+          `<span class="chunkMetaPill">🔁 attempt=${at}</span>`,
+        `</div>`,
         `<div class="chunkList">`,
           `<div class="chunkItem"><span class="chunkIcon">📧</span><div><div class="chunkLabel">Sender</div><div class="chunkValue">${esc(sender || '—')}</div></div></div>`,
           `<div class="chunkItem"><span class="chunkIcon">🧪</span><div><div class="chunkLabel">Spam / BL</div><div class="chunkValue ${spamTone}">Spam: ${esc(spam)}</div><div class="chunkValue ${blTone}">BL: ${esc(blShort || '—')}</div></div></div>`,
@@ -8713,17 +8745,17 @@ This will remove it from Jobs history.`);
           `<div class="chunkItem"><span class="chunkIcon">🌐</span><div><div class="chunkLabel">Active domains</div><div class="chunkValue">${activeDomainsTxt}</div></div></div>`,
         `</div>`,
       ].join('') +
-      (pmtaReasonShort ? (`<div class="mini" style="margin-top:8px">PMTA reason: ${esc(pmtaReasonShort)}</div>`) : '')+
-      (pmtaSlowShort ? (`<div class="mini">PMTA slow: ${esc(pmtaSlowShort)}</div>`) : '')+
-      (adaptiveShort ? (`<div class="mini">Adaptive: ${esc(adaptiveShort)}</div>`) : '');
+      (pmtaReasonShort ? (`<div class="mini chunkNote">🛰️ PMTA reason: ${esc(pmtaReasonShort)}</div>`) : '')+
+      (pmtaSlowShort ? (`<div class="mini chunkNote">🐢 PMTA slow: ${esc(pmtaSlowShort)}</div>`) : '')+
+      (adaptiveShort ? (`<div class="mini chunkNote chunkNoteAdaptive">🧠 Adaptive: ${esc(adaptiveShort)}</div>`) : '');
     }
     qk(card,'chunkLine').innerHTML = chunkLine;
 
     // active domains for current chunk
     const cdEntries = Object.entries(cDom).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0)).slice(0,6);
     qk(card,'chunkDomains').innerHTML = cdEntries.length
-      ? ('Top active domains: ' + cdEntries.map(([d,c]) => `${esc(d)}(${Number(c||0)})`).join(' · '))
-      : 'Active domains: —';
+      ? ('<div class="mini chunkNote chunkNoteDomains">🔥 Top active domains: ' + cdEntries.map(([d,c]) => `${esc(d)}(${Number(c||0)})`).join(' · ') + '</div>')
+      : '<div class="mini chunkNote chunkNoteDomains">🔥 Top active domains: —</div>';
 
     // Backoff info (latest)
     const cs = (j.chunk_states || []).slice().reverse();
