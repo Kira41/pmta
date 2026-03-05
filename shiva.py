@@ -13,6 +13,7 @@ except Exception:  # pragma: no cover - runtime compatibility for Python builds 
 import http.client
 import subprocess
 import time
+import traceback
 import uuid
 import threading
 import queue
@@ -17085,10 +17086,35 @@ def smtp_send_job(
             job.maybe_persist(force=True)
 
     except Exception as e:
+        tb_tail = traceback.format_exc(limit=20).strip().splitlines()[-12:]
+        debug_keys = (
+            "smtp_port",
+            "smtp_timeout",
+            "delay_s",
+            "chunk_size",
+            "thread_workers",
+            "sleep_chunks",
+            "scheduler_mode",
+            "rollout_mode",
+        )
+        debug_parts: List[str] = []
+        _locals = locals()
+        for _k in debug_keys:
+            if _k not in _locals:
+                continue
+            _v = _locals.get(_k)
+            _vs = repr(_v)
+            if len(_vs) > 160:
+                _vs = _vs[:157] + "..."
+            debug_parts.append(f"{_k}={_vs}<{type(_v).__name__}>")
         with JOBS_LOCK:
             job.status = "error"
             job.last_error = str(e)
             job.log("ERROR", f"Job error: {e}")
+            if debug_parts:
+                job.log("ERROR", "Job debug context: " + " | ".join(debug_parts))
+            if tb_tail:
+                job.log("ERROR", "Job traceback tail:\n" + "\n".join(tb_tail))
             job.maybe_persist(force=True)
 
 
