@@ -1031,6 +1031,194 @@ class BudgetManager:
         }
 
 
+class LanePickerV2:
+    """Sequential lane selector (sender_idx, provider_domain) with retry priority."""
+
+    def __init__(
+        self,
+        scheduler_rng: random.Random,
+        lane_registry: Optional[LaneRegistry] = None,
+        budget_mgr: Optional[BudgetManager] = None,
+        debug: bool = False,
+        export_debug: bool = False,
+        respect_lane_states: bool = True,
+        use_budgets: bool = True,
+        use_soft_bias: bool = True,
+        max_scan: int = 50,
+        lane_weight_multiplier: Optional[Callable[[Tuple[int, str]], float]] = None,
+        debug_log: Optional[Callable[[str], None]] = None,
+    ):
+        self.scheduler_rng = scheduler_rng
+        self.lane_registry = lane_registry
+        self.budget_mgr = budget_mgr
+        self.debug = bool(debug)
+        self.export_debug = bool(export_debug)
+        self.respect_lane_states = bool(respect_lane_states)
+        self.use_budgets = bool(use_budgets)
+        self.use_soft_bias = bool(use_soft_bias)
+        self.max_scan = max(1, int(max_scan or 50))
+        self._lane_weight_multiplier = lane_weight_multiplier
+        self._debug_log = debug_log
+
+    def _lane_key(self, sender_idx: int, provider_domain: str) -> Tuple[int, str]:
+        return (int(sender_idx or 0), str(provider_domain or "").strip().lower())
+
+    def _denied(self, meta: dict, lane_key: Tuple[int, str], reason: str) -> None:
+        denied = meta.setdefault("denied_reasons", [])
+        denied.append({"lane": f"{int(lane_key[0])}|{str(lane_key[1])}", "reason": str(reason or "denied")})
+
+    def _state_denied_reason(self, lane_key: Tuple[int, str], now_ts: float) -> Optional[str]:
+        if not (self.respect_lane_states and self.lane_registry):
+            return None
+        lane_info = self.lane_registry.get_lane_info(lane_key)
+        lane_state = str(lane_info.get("state") or "HEALTHY")
+        next_allowed_ts = float(lane_info.get("next_allowed_ts") or 0.0)
+        if lane_state in {"QUARANTINED", "INFRA_FAIL"} and float(now_ts or 0.0) < next_allowed_ts:
+            return "lane_quarantine_until"
+        return None
+
+    def _budget_denied_reason(self, lane_key: Tuple[int, str], now_ts: float, is_retry: bool, is_probe: bool) -> Optional[str]:
+        if not (self.use_budgets and self.budget_mgr):
+            return None
+        allowed, reason = self.budget_mgr.can_start(lane_key, now_ts, is_retry, is_probe)
+        if allowed:
+            return None
+        return str(reason or "budget_denied")
+
+    def _retry_domains_for_sender(self, sender_idx: int, provider_retry_chunks: Dict[str, List[dict]]) -> List[str]:
+        pref = f"{int(sender_idx)}|"
+        out: List[str] = []
+        for k in (provider_retry_chunks or {}).keys():
+            sk = str(k or "")
+            if not sk.startswith(pref):
+                continue
+            _, _, dom = sk.partition("|")
+            dom2 = str(dom or "").strip().lower()
+            if dom2:
+                out.append(dom2)
+        return out
+
+    def pick_next(
+        self,
+        now_ts: float,
+        sender_cursor: int,
+        sender_buckets: Dict[int, Dict[str, List[str]]],
+        provider_retry_chunks: Dict[str, List[dict]],
+        probe_active: bool = False,
+    ) -> Tuple[Optional[Tuple[int, str]], dict]:
+        n = max(0, len(sender_buckets or {}))
+        meta: Dict[str, Any] = {
+            "pick_type": "none",
+            "sender_idx": None,
+            "provider_domain": None,
+            "scanned_senders_count": 0,
+            "scanned_candidates_count": 0,
+        }
+        if n <= 0:
+            return None, meta
+
+        for step in range(n):
+            sidx = (int(sender_cursor or 0) + step) % n
+            meta["scanned_senders_count"] = int(meta["scanned_senders_count"] or 0) + 1
+            for dom in self._retry_domains_for_sender(sidx, provider_retry_chunks):
+                lane_key = self._lane_key(sidx, dom)
+                retry_q = provider_retry_chunks.get(f"{sidx}|{dom}") or []
+                if not retry_q or float(retry_q[0].get("next_retry_ts") or 0.0) > float(now_ts or 0.0):
+                    continue
+                meta["scanned_candidates_count"] = int(meta["scanned_candidates_count"] or 0) + 1
+                deny_state = self._state_denied_reason(lane_key, now_ts)
+                if deny_state:
+                    self._denied(meta, lane_key, deny_state)
+                    continue
+                deny_budget = self._budget_denied_reason(lane_key, now_ts, True, bool(probe_active))
+                if deny_budget:
+                    self._denied(meta, lane_key, deny_budget)
+                    continue
+                meta.update({"pick_type": "retry", "sender_idx": sidx, "provider_domain": dom})
+                if self.debug and callable(self._debug_log):
+                    self._debug_log(f"LanePickerV2 pick retry lane={sidx}|{dom}")
+                return lane_key, meta
+
+        for step in range(n):
+            sidx = (int(sender_cursor or 0) + step) % n
+            domains = sender_buckets.get(sidx) or {}
+            weighted_int: List[Tuple[str, int]] = []
+            weighted_float: List[Tuple[str, float]] = []
+            scanned_for_sender = 0
+            for d, v in domains.items():
+                if scanned_for_sender >= self.max_scan:
+                    break
+                scanned_for_sender += 1
+                remaining = len(v or [])
+                if remaining <= 0:
+                    continue
+                dom = str(d or "").strip().lower()
+                lane_key = self._lane_key(sidx, dom)
+                meta["scanned_candidates_count"] = int(meta["scanned_candidates_count"] or 0) + 1
+                deny_state = self._state_denied_reason(lane_key, now_ts)
+                if deny_state:
+                    self._denied(meta, lane_key, deny_state)
+                    continue
+                deny_budget = self._budget_denied_reason(lane_key, now_ts, False, bool(probe_active))
+                if deny_budget:
+                    self._denied(meta, lane_key, deny_budget)
+                    continue
+                if not self.use_soft_bias:
+                    weighted_int.append((dom, remaining))
+                    continue
+                mul = 1.0
+                if callable(self._lane_weight_multiplier):
+                    mul = float(self._lane_weight_multiplier(lane_key))
+                adjusted = float(remaining) * max(0.0, float(mul))
+                if adjusted < 0.01:
+                    self._denied(meta, lane_key, "weight_too_low")
+                    continue
+                weighted_float.append((dom, adjusted))
+
+            if not self.use_soft_bias:
+                if not weighted_int:
+                    continue
+                total_weight = sum(w for _, w in weighted_int)
+                if total_weight <= 0:
+                    continue
+                draw = self.scheduler_rng.randint(1, total_weight)
+                acc = 0
+                selected_dom = weighted_int[-1][0]
+                for dom, w in weighted_int:
+                    acc += w
+                    if draw <= acc:
+                        selected_dom = dom
+                        break
+                lane_key = self._lane_key(sidx, selected_dom)
+                meta.update({"pick_type": "weighted", "sender_idx": sidx, "provider_domain": selected_dom})
+                if self.debug and callable(self._debug_log):
+                    self._debug_log(f"LanePickerV2 pick weighted lane={sidx}|{selected_dom}")
+                return lane_key, meta
+
+            if not weighted_float:
+                continue
+            total_weight_f = sum(w for _, w in weighted_float)
+            if total_weight_f <= 0.0:
+                continue
+            draw_f = self.scheduler_rng.random() * total_weight_f
+            acc_f = 0.0
+            selected_dom_f = weighted_float[-1][0]
+            for dom, w in weighted_float:
+                acc_f += w
+                if draw_f <= acc_f:
+                    selected_dom_f = dom
+                    break
+            lane_key = self._lane_key(sidx, selected_dom_f)
+            meta.update({"pick_type": "weighted", "sender_idx": sidx, "provider_domain": selected_dom_f})
+            if self.debug and callable(self._debug_log):
+                self._debug_log(f"LanePickerV2 pick weighted lane={sidx}|{selected_dom_f}")
+            return lane_key, meta
+
+        if self.debug and callable(self._debug_log):
+            self._debug_log("LanePickerV2 pick none")
+        return None, meta
+
+
 class ProbeController:
     """Job-scoped probe mode controller to sample early lane signals conservatively."""
 
@@ -12162,6 +12350,12 @@ def smtp_send_job(
     budget_apply_to_retry = bool(get_env_bool("SHIVA_BUDGET_APPLY_TO_RETRY", False))
     budget_apply_to_probe = bool(get_env_bool("SHIVA_BUDGET_APPLY_TO_PROBE", True))
     budget_export = bool(get_env_bool("SHIVA_BUDGET_EXPORT", False))
+    lane_v2_debug = bool(get_env_bool("SHIVA_LANE_V2_DEBUG", False))
+    lane_v2_export = bool(get_env_bool("SHIVA_LANE_V2_EXPORT", False))
+    lane_v2_respect_lane_states = bool(get_env_bool("SHIVA_LANE_V2_RESPECT_LANE_STATES", True))
+    lane_v2_use_budgets = bool(get_env_bool("SHIVA_LANE_V2_USE_BUDGETS", True))
+    lane_v2_use_soft_bias = bool(get_env_bool("SHIVA_LANE_V2_USE_SOFT_BIAS", True))
+    lane_v2_max_scan = max(1, int(get_env_int("SHIVA_LANE_V2_MAX_SCAN", 50)))
     lane_thresholds_raw = str(get_env("SHIVA_LANE_THRESHOLDS_JSON", "") or "").strip()
     lane_quarantine_base_s = max(1, int(get_env_int("SHIVA_LANE_QUARANTINE_BASE_S", 120)))
     lane_quarantine_max_s = max(lane_quarantine_base_s, int(get_env_int("SHIVA_LANE_QUARANTINE_MAX_S", 1800)))
@@ -12229,6 +12423,9 @@ def smtp_send_job(
     if budget_export:
         with JOBS_LOCK:
             job.debug_budget_status = {}
+    if lane_v2_export:
+        with JOBS_LOCK:
+            job.debug_last_lane_pick = {}
 
     budget_config = BudgetConfig(
         enabled=budget_manager_enabled,
@@ -12811,6 +13008,19 @@ def smtp_send_job(
         sender_cursor = 0
         scheduler_rng = random.Random(int(hashlib.sha256(partition_seed.encode("utf-8", errors="ignore")).hexdigest()[:16], 16))
         provider_retry_chunks: Dict[str, List[dict]] = {}
+        lane_picker_v2 = LanePickerV2(
+            scheduler_rng=scheduler_rng,
+            lane_registry=lane_registry,
+            budget_mgr=budget_mgr,
+            debug=lane_v2_debug,
+            export_debug=lane_v2_export,
+            respect_lane_states=lane_v2_respect_lane_states,
+            use_budgets=lane_v2_use_budgets,
+            use_soft_bias=lane_v2_use_soft_bias,
+            max_scan=lane_v2_max_scan,
+            lane_weight_multiplier=_lane_weight_multiplier,
+            debug_log=lambda msg: job.log("INFO", msg),
+        ) if scheduler_mode == "lane_v2" else None
         provider_buckets = build_provider_buckets([
             rcpt
             for domains in sender_bucket_by_idx.values()
@@ -12845,7 +13055,7 @@ def smtp_send_job(
 
         with JOBS_LOCK:
             if scheduler_mode != "legacy":
-                job.log("INFO", f"Scheduler mode={scheduler_mode} (no behavior change in this phase; running legacy loop).")
+                job.log("INFO", f"Scheduler mode={scheduler_mode} (Lane Picker v2 enabled; sending pipeline remains legacy/sequential).")
             job.log(
                 "INFO",
                 "Recipient partition stats: "
@@ -13171,8 +13381,21 @@ def smtp_send_job(
                 )
                 if sender_domain_pick:
                     probe_selected_this_iteration = True
+            lane_pick_meta: dict = {"pick_type": "none"}
             if not sender_domain_pick:
-                sender_domain_pick = _next_sender_domain(now_ts)
+                if scheduler_mode == "lane_v2" and lane_picker_v2:
+                    sender_domain_pick, lane_pick_meta = lane_picker_v2.pick_next(
+                        now_ts=now_ts,
+                        sender_cursor=sender_cursor,
+                        sender_buckets=sender_bucket_by_idx,
+                        provider_retry_chunks=provider_retry_chunks,
+                        probe_active=bool(probe_selected_this_iteration),
+                    )
+                    if lane_v2_export:
+                        with JOBS_LOCK:
+                            job.debug_last_lane_pick = dict(lane_pick_meta or {})
+                else:
+                    sender_domain_pick = _next_sender_domain(now_ts)
             if not sender_domain_pick:
                 wait_retry = _next_retry_wait(now_ts)
                 if wait_retry is None:
@@ -13188,7 +13411,9 @@ def smtp_send_job(
                 continue
 
             sender_idx_fixed, target_domain = sender_domain_pick
-            if probe_selected_this_iteration and len(sender_emails) > 0:
+            if scheduler_mode == "lane_v2" and len(sender_emails) > 0:
+                sender_cursor = (int(sender_idx_fixed) + 1) % len(sender_emails)
+            elif probe_selected_this_iteration and len(sender_emails) > 0:
                 sender_cursor = (int(sender_idx_fixed) + 1) % len(sender_emails)
             if probe_selected_this_iteration:
                 clamped_caps = probe_controller.apply_probe_caps(
@@ -13924,7 +14149,19 @@ APP_CONFIG_SCHEMA: List[dict] = [
 
     # Scheduler lane scaffolding (baseline/debug only in this phase)
     {"key": "SHIVA_SCHEDULER_MODE", "type": "str", "default": "legacy", "group": "Scheduler", "restart_required": False,
-     "desc": "Scheduler mode scaffold: legacy | lane_v2. lane_v2 is non-operative in this phase and keeps legacy behavior."},
+     "desc": "Scheduler mode: legacy | lane_v2. legacy remains default."},
+    {"key": "SHIVA_LANE_V2_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Emit concise LanePickerV2 pick logs (type/lane and skip reasons)."},
+    {"key": "SHIVA_LANE_V2_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Export last LanePickerV2 pick metadata into job debug payload as debug_last_lane_pick."},
+    {"key": "SHIVA_LANE_V2_RESPECT_LANE_STATES", "type": "bool", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "If enabled, LanePickerV2 skips QUARANTINED/INFRA_FAIL lanes until next_allowed_ts."},
+    {"key": "SHIVA_LANE_V2_USE_BUDGETS", "type": "bool", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "If enabled, LanePickerV2 gates candidates via BudgetManager.can_start."},
+    {"key": "SHIVA_LANE_V2_USE_SOFT_BIAS", "type": "bool", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "If enabled, LanePickerV2 weighted picks apply soft lane-state multipliers."},
+    {"key": "SHIVA_LANE_V2_MAX_SCAN", "type": "int", "default": "50", "group": "Scheduler", "restart_required": False,
+     "desc": "Maximum domains scanned per sender during LanePickerV2 weighted candidate build."},
     {"key": "SHIVA_LANE_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Enable lane debug self-check invariants (logging + fatal on hard mismatch)."},
     {"key": "SHIVA_LANE_BASELINE_REPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
