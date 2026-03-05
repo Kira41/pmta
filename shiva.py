@@ -11558,6 +11558,57 @@ def db_mark_job_recipient(job_id: str, campaign_id: str, rcpt: str) -> None:
             conn.close()
 
 
+def db_seed_job_recipient_index(job_id: str, campaign_id: str, recipients: List[str]) -> int:
+    """Index recipients and initialize their status as `not_yet` before sending."""
+    jid = (job_id or "").strip().lower()
+    cid = (campaign_id or "").strip()
+    if not jid:
+        return 0
+
+    deduped: List[str] = []
+    seen: set = set()
+    for raw in recipients or []:
+        rcpt = str(raw or "").strip().lower()
+        if not rcpt or rcpt in seen:
+            continue
+        seen.add(rcpt)
+        deduped.append(rcpt)
+
+    if not deduped:
+        return 0
+
+    ts = now_iso()
+    inserted = 0
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            for rcpt in deduped:
+                _exec_upsert_compat(
+                    conn,
+                    "INSERT INTO job_recipients(job_id, campaign_id, rcpt, first_seen_at, last_seen_at) VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(job_id, rcpt) DO UPDATE SET campaign_id=excluded.campaign_id, last_seen_at=excluded.last_seen_at",
+                    (jid, cid, rcpt, ts, ts),
+                    "UPDATE job_recipients SET campaign_id=?, last_seen_at=? WHERE job_id=? AND rcpt=?",
+                    (cid, ts, jid, rcpt),
+                    "INSERT INTO job_recipients(job_id, campaign_id, rcpt, first_seen_at, last_seen_at) VALUES(?,?,?,?,?)",
+                    (jid, cid, rcpt, ts, ts),
+                )
+                _db_set_outcome_payload(conn, {
+                    "job_id": jid,
+                    "rcpt": rcpt,
+                    "status": "not_yet",
+                    "message_id": "",
+                    "dsn_status": "",
+                    "dsn_diag": "",
+                    "updated_at": ts,
+                })
+                inserted += 1
+            conn.commit()
+        finally:
+            conn.close()
+    return inserted
+
+
 def db_find_job_ids_by_recipient(rcpt: str, limit: int = 8) -> List[str]:
     em = (rcpt or "").strip().lower()
     if not em:
@@ -13485,6 +13536,8 @@ def _transition_allowed(prev: str, new: str) -> bool:
         return True
     if p == n:
         return True
+    if p in {"not_yet", "pending", "queued", "unknown"} and n in {"delivered", "deferred", "bounced", "complained"}:
+        return True
     if p == "deferred" and n in {"delivered", "bounced", "complained"}:
         return True
     if p == "delivered" and n == "complained":
@@ -14136,17 +14189,6 @@ def _bridge_sync_job_outcomes(job_id: str, obj: dict) -> Dict[str, int]:
                     "dsn_diag": str(rec.get("dsn_diag") or rec.get("response") or ""),
                     "updated_at": now_iso(),
                 })
-
-            placeholders = ",".join(["?"] * len(pairs))
-            if placeholders:
-                params: List[Any] = [normalized_job_id]
-                params.extend(list(pairs.keys()))
-                conn.execute(
-                    f"DELETE FROM job_outcomes WHERE job_id=? AND rcpt NOT IN ({placeholders})",
-                    tuple(params),
-                )
-            else:
-                conn.execute("DELETE FROM job_outcomes WHERE job_id=?", (normalized_job_id,))
             conn.commit()
         finally:
             conn.close()
@@ -14227,11 +14269,28 @@ def _replace_job_accounting_from_bridge_count(job: SendJob, count_obj: dict) -> 
 
 def _active_jobs_for_bridge_poll() -> List['SendJob']:
     active_statuses = {"queued", "running", "backoff", "paused"}
+
+    def _has_not_yet_resolved_recipients(job: 'SendJob') -> bool:
+        total = int(getattr(job, "total", 0) or 0)
+        if total <= 0:
+            return False
+        counts = db_get_job_outcome_counts(str(getattr(job, "id", "") or ""))
+        resolved = (
+            int(counts.get("delivered") or 0)
+            + int(counts.get("deferred") or 0)
+            + int(counts.get("bounced") or 0)
+            + int(counts.get("complained") or 0)
+        )
+        return resolved < total
+
     with JOBS_LOCK:
         jobs = [
             j for j in JOBS.values()
             if not getattr(j, "deleted", False)
-            and str(getattr(j, "status", "") or "").strip().lower() in active_statuses
+            and (
+                str(getattr(j, "status", "") or "").strip().lower() in active_statuses
+                or _has_not_yet_resolved_recipients(j)
+            )
         ]
     jobs.sort(key=lambda x: str(x.created_at or ""), reverse=True)
     return jobs
@@ -19406,6 +19465,9 @@ def start():
 
     with JOBS_LOCK:
         JOBS[job_id] = job
+
+    seeded_count = db_seed_job_recipient_index(job_id, campaign_id, valid)
+    job.log("INFO", f"Recipient indexing initialized: total={seeded_count} status=not_yet.")
 
     # Persist job immediately (so it appears in Jobs even after refresh)
     job.maybe_persist(force=True)
