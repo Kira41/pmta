@@ -7243,6 +7243,24 @@ PAGE_JOBS = r"""
       padding:9px 10px;
       color: rgba(255,206,214,.95);
     }
+    .errorSummaryBox:empty{display:none;}
+    .sopHeader{
+      display:flex;
+      align-items:center;
+      gap:8px;
+      margin:0 0 10px;
+      color:rgba(255,255,255,.95);
+      font-weight:900;
+      letter-spacing:.2px;
+      font-size:14px;
+    }
+    .sopBlock{margin-top:12px; padding:10px; border:1px solid rgba(255,255,255,.1); border-radius:10px; background:rgba(255,255,255,.02);}
+    .sopBlock:first-of-type{margin-top:6px;}
+    .sopLabel{font-size:12px; font-weight:900; margin-bottom:6px; letter-spacing:.2px;}
+    .sopLabel.system{color:#9fd0ff;}
+    .sopLabel.provider{color:#c8f5b1;}
+    .sopLabel.integrity{color:#ffd9a8;}
+    .sopLine{font-size:13px; line-height:1.5; color:rgba(255,255,255,.88);}
 
     /* PMTA Live Panel (Jobs) — clearer layout */
     .pmtaLive{ margin-top:10px; }
@@ -7656,34 +7674,36 @@ PAGE_JOBS = r"""
             </div>
 
             <div class="panel">
-              <h4>System / Provider / Integrity</h4>
+              <h4 class="sopHeader">🧭 System / Provider / Integrity</h4>
 
-              <div class="mini"><b>System / Internal</b></div>
-              <div class="mini" data-k="systemSummary">—</div>
+              <div class="sopBlock">
+              <div class="sopLabel system">🖥️ System / Internal</div>
+              <div class="sopLine" data-k="systemSummary">—</div>
               <details class="errorFold">
                 <summary>View details</summary>
                 <div class="mini" style="margin-top:8px" data-k="systemDetails">—</div>
               </details>
+              </div>
 
-              <div style="height:10px"></div>
-
-              <div class="mini"><b>Provider / Deliverability</b></div>
-              <div class="mini" data-k="providerSummary">—</div>
-              <div class="mini" style="margin-top:6px" data-k="providerBreakdown">—</div>
-              <div class="mini" style="margin-top:6px" data-k="providerReasons">—</div>
+              <div class="sopBlock">
+              <div class="sopLabel provider">📬 Provider / Deliverability</div>
+              <div class="sopLine" data-k="providerSummary">—</div>
+              <div class="sopLine" style="margin-top:6px" data-k="providerBreakdown">—</div>
+              <div class="sopLine" style="margin-top:6px" data-k="providerReasons">—</div>
               <details class="errorFold">
                 <summary>View details</summary>
                 <div class="mini" style="margin-top:8px" data-k="providerDetails">—</div>
               </details>
+              </div>
 
-              <div style="height:10px"></div>
-
-              <div class="mini"><b>Data Integrity / Mapping</b></div>
-              <div class="mini" data-k="integritySummary">—</div>
+              <div class="sopBlock">
+              <div class="sopLabel integrity">🧩 Data Integrity / Mapping</div>
+              <div class="sopLine" data-k="integritySummary">—</div>
               <details class="errorFold">
                 <summary>View details</summary>
                 <div class="mini" style="margin-top:8px" data-k="integrityDetails">—</div>
               </details>
+              </div>
 
               <div class="mini" style="margin-top:12px"><b>Legacy quality + errors (unchanged data)</b></div>
               <div class="mini" style="margin-top:8px" data-k="counters">—</div>
@@ -8397,7 +8417,11 @@ This will remove it from Jobs history.`);
     }
 
     if(pmtaErrorSummaryEl){
-      pmtaErrorSummaryEl.innerHTML = [errorSummaryLine1 || '—', errorSummaryLine2 || ''].filter(Boolean).join('<br>');
+      const hasErrorSummary = (errorSummaryLine1 && errorSummaryLine1 !== '—') || !!errorSummaryLine2;
+      pmtaErrorSummaryEl.innerHTML = hasErrorSummary
+        ? [errorSummaryLine1 || '', errorSummaryLine2 || ''].filter(Boolean).join('<br>')
+        : '';
+      pmtaErrorSummaryEl.style.display = hasErrorSummary ? '' : 'none';
     }
 
     function isNetworkInternalError(x){
@@ -8478,12 +8502,12 @@ This will remove it from Jobs history.`);
     const sys = qk(card,'systemSummary');
     if(sys){
       const bits = [
-        `Bridge failures: <b>${bridgeFail === null ? '—' : bridgeFail}</b>`,
-        `Bridge last success: <b>${bridgeAge === null ? '—' : (bridgeAge + 'm ago')}</b>`,
-        `Runtime internal errors: <b>${runtimeErr || 0}</b>`,
-        `DB write failures: <b>${dbFail === null ? '—' : dbFail}</b>`,
+        `🔗 Bridge failures: <b>${bridgeFail === null ? '—' : bridgeFail}</b>`,
+        `⏱️ Last bridge success: <b>${bridgeAge === null ? '—' : (bridgeAge + 'm ago')}</b>`,
+        `⚙️ Runtime internal errors: <b>${runtimeErr || 0}</b>`,
+        `💾 DB write failures: <b>${dbFail === null ? '—' : dbFail}</b>`,
       ];
-      if(bridgeErr) bits.push(`Bridge last error: ${esc(bridgeErr.slice(0,140))}`);
+      if(bridgeErr) bits.push(`🚨 Bridge last error: ${esc(bridgeErr.slice(0,140))}`);
       sys.innerHTML = bits.join(' · ');
     }
 
@@ -8504,10 +8528,10 @@ This will remove it from Jobs history.`);
     const prov = qk(card,'providerSummary');
     if(prov){
       prov.innerHTML = [
-        `Delivered: <b>${delivered ?? '—'}</b> (${fmtRate(delivered, sent)})`,
-        `Deferred: <b>${deferred ?? '—'}</b> (${fmtRate(deferred, sent)})`,
-        `Bounced: <b>${bounced ?? '—'}</b> (${fmtRate(bounced, sent)})`,
-        `Complained: <b>${complained ?? '—'}</b> (${fmtRate(complained, sent)})`,
+        `✅ Delivered: <b>${delivered ?? '—'}</b> (${fmtRate(delivered, sent)})`,
+        `⏳ Deferred: <b>${deferred ?? '—'}</b> (${fmtRate(deferred, sent)})`,
+        `❌ Bounced: <b>${bounced ?? '—'}</b> (${fmtRate(bounced, sent)})`,
+        `📢 Complained: <b>${complained ?? '—'}</b> (${fmtRate(complained, sent)})`,
       ].join(' · ');
     }
 
@@ -8515,8 +8539,8 @@ This will remove it from Jobs history.`);
     const breakdown = Array.isArray(j.provider_breakdown) ? j.provider_breakdown : [];
     if(pb){
       pb.innerHTML = breakdown.length
-        ? ('Provider/domain breakdown: ' + breakdown.slice(0,6).map(x => `${esc(x.domain || '—')} D=${Number(x.delivered||0)} Def=${Number(x.deferred||0)} B=${Number(x.bounced||0)} C=${Number(x.complained||0)}`).join(' · '))
-        : 'Provider/domain breakdown: —';
+        ? ('🌐 Provider/domain breakdown: ' + breakdown.slice(0,6).map(x => `${esc(x.domain || '—')} D=${Number(x.delivered||0)} Def=${Number(x.deferred||0)} B=${Number(x.bounced||0)} C=${Number(x.complained||0)}`).join(' · '))
+        : '🌐 Provider/domain breakdown: —';
     }
 
     const pr = qk(card,'providerReasons');
@@ -8524,8 +8548,8 @@ This will remove it from Jobs history.`);
     const reasonEntries = Object.entries(reasons).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0)).slice(0,4);
     if(pr){
       pr.innerHTML = reasonEntries.length
-        ? ('Top reason buckets: ' + reasonEntries.map(([k,v]) => `${esc(k)}=<b>${Number(v||0)}</b>`).join(' · '))
-        : 'Top reason buckets: —';
+        ? ('🧠 Top reason buckets: ' + reasonEntries.map(([k,v]) => `${esc(k)}=<b>${Number(v||0)}</b>`).join(' · '))
+        : '🧠 Top reason buckets: —';
     }
 
     const provDet = qk(card,'providerDetails');
@@ -8542,7 +8566,7 @@ This will remove it from Jobs history.`);
     const dbwf = asNum(j.db_write_failures) || 0;
     const integ = qk(card,'integritySummary');
     if(integ){
-      integ.innerHTML = `duplicates_dropped: <b>${dup}</b> · job_not_found: <b>${jnf}</b> · missing_fields: <b>${miss}</b> · db_write_failures: <b>${dbwf}</b>`;
+      integ.innerHTML = `🧹 duplicates_dropped: <b>${dup}</b> · 🔎 job_not_found: <b>${jnf}</b> · 🧾 missing_fields: <b>${miss}</b> · 💽 db_write_failures: <b>${dbwf}</b>`;
     }
 
     const integDet = qk(card,'integrityDetails');
