@@ -1444,6 +1444,183 @@ class LaneExecutor:
         self._executor.shutdown(wait=True, cancel_futures=False)
 
 
+class FallbackController:
+    """Job-scoped safety controller that can downgrade to legacy scheduling under risk."""
+
+    def __init__(
+        self,
+        thresholds: dict,
+        window_s: int,
+        debug: bool,
+        disable_reenable: bool,
+        min_active_s: int,
+        recovery_s: int,
+        actions_config: dict,
+    ):
+        self.thresholds = dict(thresholds or {})
+        self.window_s = max(30, int(window_s or 300))
+        self.debug = bool(debug)
+        self.disable_reenable = bool(disable_reenable)
+        self.min_active_s = max(1, int(min_active_s or 180))
+        self.recovery_s = max(1, int(recovery_s or 300))
+        self.actions_config = dict(actions_config or {})
+        self._samples: deque = deque()
+        self._active = False
+        self._triggered_ts = 0.0
+        self._last_reasons: List[str] = []
+        self._actions_taken: List[str] = []
+        self._last_rates = {
+            "attempts": 0,
+            "global_deferral_rate": 0.0,
+            "global_hardfail_rate": 0.0,
+            "global_timeout_rate": 0.0,
+            "blocked_per_minute": 0.0,
+            "exceptions_per_minute": 0.0,
+            "pmta_pressure_level": 0,
+            "pmta_pressure_high_seconds": 0.0,
+        }
+        self._stable_since = 0.0
+
+    def _prune(self, now_ts: float) -> None:
+        cutoff = float(now_ts or 0.0) - float(self.window_s)
+        while self._samples and float(self._samples[0].get("ts") or 0.0) < cutoff:
+            self._samples.popleft()
+
+    def observe(self, now_ts: float, global_metrics_snapshot: dict, pmta_pressure_level: int, executor_snapshot: Optional[dict] = None) -> None:
+        ts = float(now_ts or time.time())
+        gm = dict(global_metrics_snapshot or {})
+        sample = {
+            "ts": ts,
+            "attempts_total": int(gm.get("attempts_total") or 0),
+            "deferrals_4xx": int(gm.get("deferrals_4xx") or 0),
+            "hardfails_5xx": int(gm.get("hardfails_5xx") or 0),
+            "timeouts_conn": int(gm.get("timeouts_conn") or 0),
+            "blocked_events": int(gm.get("blocked_events") or 0),
+            "exceptions_count": int(gm.get("exceptions_count") or 0),
+            "pmta_pressure_level": int(pmta_pressure_level or 0),
+            "quarantine_count": int(gm.get("quarantine_count") or 0),
+            "inflight_count": int(gm.get("inflight_count") or 0),
+        }
+        if isinstance(executor_snapshot, dict):
+            sample["inflight_count"] = int(executor_snapshot.get("inflight_count") or sample["inflight_count"] or 0)
+        self._samples.append(sample)
+        self._prune(ts)
+
+    def _rolling_rates(self) -> dict:
+        if not self._samples:
+            return dict(self._last_rates)
+        first = self._samples[0]
+        last = self._samples[-1]
+        attempts = max(0, int(last.get("attempts_total") or 0) - int(first.get("attempts_total") or 0))
+        deferrals = max(0, int(last.get("deferrals_4xx") or 0) - int(first.get("deferrals_4xx") or 0))
+        hardfails = max(0, int(last.get("hardfails_5xx") or 0) - int(first.get("hardfails_5xx") or 0))
+        timeouts = max(0, int(last.get("timeouts_conn") or 0) - int(first.get("timeouts_conn") or 0))
+        blocked = max(0, int(last.get("blocked_events") or 0) - int(first.get("blocked_events") or 0))
+        exceptions = max(0, int(last.get("exceptions_count") or 0) - int(first.get("exceptions_count") or 0))
+        elapsed = max(1.0, float(last.get("ts") or 0.0) - float(first.get("ts") or 0.0))
+        blocked_per_min = float(blocked) * (60.0 / elapsed)
+        exceptions_per_min = float(exceptions) * (60.0 / elapsed)
+        high_level = int(self.thresholds.get("pmta_pressure_level") or 3)
+        high_seconds = 0.0
+        prev = None
+        for sm in self._samples:
+            if prev is not None and int(prev.get("pmta_pressure_level") or 0) >= high_level:
+                high_seconds += max(0.0, float(sm.get("ts") or 0.0) - float(prev.get("ts") or 0.0))
+            prev = sm
+        self._last_rates = {
+            "attempts": int(attempts),
+            "global_deferral_rate": float(deferrals / max(1, attempts)),
+            "global_hardfail_rate": float(hardfails / max(1, attempts)),
+            "global_timeout_rate": float(timeouts / max(1, attempts)),
+            "blocked_per_minute": float(blocked_per_min),
+            "exceptions_per_minute": float(exceptions_per_min),
+            "pmta_pressure_level": int(last.get("pmta_pressure_level") or 0),
+            "pmta_pressure_high_seconds": float(high_seconds),
+        }
+        return dict(self._last_rates)
+
+    def should_trigger(self, now_ts: float) -> Tuple[bool, List[str]]:
+        rates = self._rolling_rates()
+        reasons: List[str] = []
+        if rates["global_deferral_rate"] >= float(self.thresholds.get("deferral_rate") or 0.35):
+            reasons.append(f"deferral_rate={rates['global_deferral_rate']:.3f}")
+        if rates["global_hardfail_rate"] >= float(self.thresholds.get("hardfail_rate") or 0.05):
+            reasons.append(f"hardfail_rate={rates['global_hardfail_rate']:.3f}")
+        if rates["global_timeout_rate"] >= float(self.thresholds.get("timeout_rate") or 0.08):
+            reasons.append(f"timeout_rate={rates['global_timeout_rate']:.3f}")
+        if rates["blocked_per_minute"] >= float(self.thresholds.get("blocked_per_min") or 10.0):
+            reasons.append(f"blocked_per_minute={rates['blocked_per_minute']:.2f}")
+        if rates["pmta_pressure_high_seconds"] >= (float(self.window_s) / 2.0):
+            reasons.append(f"pmta_pressure_high_seconds={rates['pmta_pressure_high_seconds']:.1f}")
+        if rates["exceptions_per_minute"] >= float(self.thresholds.get("exceptions_per_min") or 3.0):
+            reasons.append(f"exceptions_per_minute={rates['exceptions_per_minute']:.2f}")
+
+        ts = float(now_ts or time.time())
+        if self._active:
+            if self.disable_reenable:
+                return False, []
+            if (ts - float(self._triggered_ts or ts)) < float(self.min_active_s):
+                return False, []
+            if reasons:
+                self._stable_since = 0.0
+                return False, []
+            if self._stable_since <= 0.0:
+                self._stable_since = ts
+                return False, []
+            if (ts - self._stable_since) >= float(self.recovery_s):
+                self._active = False
+                self._actions_taken.append("reenabled_new_layers")
+            return False, []
+
+        if reasons:
+            self._last_reasons = list(reasons)
+            self._active = True
+            self._triggered_ts = ts
+            self._stable_since = 0.0
+            return True, reasons
+        return False, []
+
+    def apply_actions(self, job_context: dict) -> None:
+        if not self._active:
+            return
+        act = dict(self.actions_config or {})
+        if bool(act.get("step1_disable_concurrency", True)):
+            fn = job_context.get("disable_concurrency")
+            if callable(fn):
+                fn()
+                self._actions_taken.append("disabled_concurrency")
+        if bool(act.get("step2_disable_probe", True)):
+            fn = job_context.get("disable_probe")
+            if callable(fn):
+                fn()
+                self._actions_taken.append("disabled_probe")
+        if bool(act.get("step3_switch_to_legacy", True)):
+            fn = job_context.get("switch_scheduler_legacy")
+            if callable(fn):
+                fn()
+                self._actions_taken.append("switched_legacy")
+
+    def is_in_fallback(self, now_ts: float) -> bool:
+        if not self._active:
+            return False
+        if self.disable_reenable:
+            return True
+        return bool(float(now_ts or time.time()) - float(self._triggered_ts or 0.0) >= 0.0)
+
+    def snapshot(self) -> dict:
+        return {
+            "active": bool(self._active),
+            "triggered_ts": float(self._triggered_ts or 0.0),
+            "reasons": list(self._last_reasons),
+            "rolling": dict(self._last_rates),
+            "actions_taken": list(self._actions_taken),
+            "reenable_allowed": not bool(self.disable_reenable),
+            "window_s": int(self.window_s),
+            "min_active_s": int(self.min_active_s),
+            "recovery_s": int(self.recovery_s),
+        }
+
+
 def map_provider_domains_to_sender_indexes(provider_domains: List[str], sender_emails: List[str]) -> Dict[str, int]:
     """Distribute provider domains evenly across sender emails.
 
@@ -1526,6 +1703,7 @@ class SendJob:
     debug_probe_status: dict = field(default_factory=dict)
     debug_budget_status: dict = field(default_factory=dict)
     debug_lane_executor: dict = field(default_factory=dict)
+    debug_fallback: dict = field(default_factory=dict)
 
     # PMTA diagnostics snapshot (optional; helps classify failures quickly)
     pmta_diag: dict = field(default_factory=dict)
@@ -2436,6 +2614,7 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "debug_probe_status": job.debug_probe_status or {},
         "debug_budget_status": job.debug_budget_status or {},
         "debug_lane_executor": job.debug_lane_executor or {},
+        "debug_fallback": job.debug_fallback or {},
         "pmta_diag": job.pmta_diag or {},
         "pmta_diag_ts": job.pmta_diag_ts or "",
         "created_at": job.created_at,
@@ -3179,6 +3358,7 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job.debug_probe_status = (s.get("debug_probe_status") if isinstance(s.get("debug_probe_status"), dict) else {}) or {}
         job.debug_budget_status = (s.get("debug_budget_status") if isinstance(s.get("debug_budget_status"), dict) else {}) or {}
         job.debug_lane_executor = (s.get("debug_lane_executor") if isinstance(s.get("debug_lane_executor"), dict) else {}) or {}
+        job.debug_fallback = (s.get("debug_fallback") if isinstance(s.get("debug_fallback"), dict) else {}) or {}
         job.pmta_diag = (s.get("pmta_diag") if isinstance(s.get("pmta_diag"), dict) else {}) or {}
         job.pmta_diag_ts = str(s.get("pmta_diag_ts") or "")
         job.updated_at = str(s.get("updated_at") or "")
@@ -12450,6 +12630,21 @@ def smtp_send_job(
     lane_task_timeout_s = max(30, int(get_env_int("SHIVA_LANE_TASK_TIMEOUT_S", 900)))
     lane_concurrency_debug = bool(get_env_bool("SHIVA_LANE_CONCURRENCY_DEBUG", False))
     lane_concurrency_export = bool(get_env_bool("SHIVA_LANE_CONCURRENCY_EXPORT", False))
+    fallback_controller_enabled = bool(get_env_bool("SHIVA_FALLBACK_CONTROLLER", False))
+    fallback_debug = bool(get_env_bool("SHIVA_FALLBACK_DEBUG", False))
+    fallback_export = bool(get_env_bool("SHIVA_FALLBACK_EXPORT", False))
+    fallback_window_s = max(60, int(get_env_int("SHIVA_FALLBACK_WINDOW_S", 300)))
+    fallback_deferral_rate = min(1.0, max(0.0, float(get_env_float("SHIVA_FALLBACK_DEFERRAL_RATE", 0.35))))
+    fallback_hardfail_rate = min(1.0, max(0.0, float(get_env_float("SHIVA_FALLBACK_HARDFAIL_RATE", 0.05))))
+    fallback_timeout_rate = min(1.0, max(0.0, float(get_env_float("SHIVA_FALLBACK_TIMEOUT_RATE", 0.08))))
+    fallback_blocked_per_min = max(0.0, float(get_env_float("SHIVA_FALLBACK_BLOCKED_PER_MIN", 10.0)))
+    fallback_pmta_pressure_level = max(0, int(get_env_int("SHIVA_FALLBACK_PMTA_PRESSURE_LEVEL", 3)))
+    fallback_min_active_s = max(1, int(get_env_int("SHIVA_FALLBACK_MIN_ACTIVE_S", 180)))
+    fallback_recovery_s = max(1, int(get_env_int("SHIVA_FALLBACK_RECOVERY_S", 300)))
+    fallback_disable_reenable = bool(get_env_bool("SHIVA_FALLBACK_DISABLE_REENABLE", True))
+    fallback_step1_disable_concurrency = bool(get_env_bool("SHIVA_FALLBACK_STEP1_DISABLE_CONCURRENCY", True))
+    fallback_step2_disable_probe = bool(get_env_bool("SHIVA_FALLBACK_STEP2_DISABLE_PROBE", True))
+    fallback_step3_switch_to_legacy = bool(get_env_bool("SHIVA_FALLBACK_STEP3_SWITCH_TO_LEGACY", True))
     lane_thresholds_raw = str(get_env("SHIVA_LANE_THRESHOLDS_JSON", "") or "").strip()
     lane_quarantine_base_s = max(1, int(get_env_int("SHIVA_LANE_QUARANTINE_BASE_S", 120)))
     lane_quarantine_max_s = max(lane_quarantine_base_s, int(get_env_int("SHIVA_LANE_QUARANTINE_MAX_S", 1800)))
@@ -12523,6 +12718,9 @@ def smtp_send_job(
     if lane_concurrency_export:
         with JOBS_LOCK:
             job.debug_lane_executor = {}
+    if fallback_export:
+        with JOBS_LOCK:
+            job.debug_fallback = {}
 
     budget_config = BudgetConfig(
         enabled=budget_manager_enabled,
@@ -13154,8 +13352,79 @@ def smtp_send_job(
             with JOBS_LOCK:
                 job.debug_probe_status = probe_controller.snapshot()
 
+        scheduler_mode_runtime = str(scheduler_mode)
+        lane_concurrency_runtime = bool(lane_concurrency_enabled)
+        fallback_exception_count = 0
+        fallback_controller = FallbackController(
+            thresholds={
+                "deferral_rate": fallback_deferral_rate,
+                "hardfail_rate": fallback_hardfail_rate,
+                "timeout_rate": fallback_timeout_rate,
+                "blocked_per_min": fallback_blocked_per_min,
+                "pmta_pressure_level": fallback_pmta_pressure_level,
+                "exceptions_per_min": 3.0,
+            },
+            window_s=fallback_window_s,
+            debug=fallback_debug,
+            disable_reenable=fallback_disable_reenable,
+            min_active_s=fallback_min_active_s,
+            recovery_s=fallback_recovery_s,
+            actions_config={
+                "step1_disable_concurrency": fallback_step1_disable_concurrency,
+                "step2_disable_probe": fallback_step2_disable_probe,
+                "step3_switch_to_legacy": fallback_step3_switch_to_legacy,
+            },
+        ) if fallback_controller_enabled else None
+
+        def _switch_scheduler_legacy() -> None:
+            nonlocal scheduler_mode_runtime
+            if scheduler_mode_runtime != "legacy":
+                scheduler_mode_runtime = "legacy"
+                with JOBS_LOCK:
+                    job.log("WARN", "Fallback controller: scheduler switched to legacy mode for this job")
+
+        def _disable_concurrency_runtime() -> None:
+            nonlocal lane_concurrency_runtime
+            if lane_concurrency_runtime:
+                lane_concurrency_runtime = False
+                with JOBS_LOCK:
+                    job.log("WARN", "Fallback controller: lane concurrency disabled for this job")
+
+        def _disable_probe_runtime() -> None:
+            if probe_controller.is_active(time.time()):
+                probe_controller.stop()
+                with JOBS_LOCK:
+                    job.log("WARN", "Fallback controller: probe mode disabled for this job")
+
+        def _fallback_global_metrics_snapshot(executor_snapshot: Optional[dict] = None) -> dict:
+            out = {
+                "attempts_total": 0,
+                "deferrals_4xx": 0,
+                "hardfails_5xx": 0,
+                "timeouts_conn": 0,
+                "blocked_events": 0,
+                "exceptions_count": int(fallback_exception_count),
+                "quarantine_count": 0,
+                "inflight_count": 0,
+            }
+            if lane_metrics:
+                ms = lane_metrics.snapshot()
+                for lane in (ms.get("lanes") if isinstance(ms, dict) else []) or []:
+                    out["attempts_total"] += int(lane.get("attempts_total") or 0)
+                    out["deferrals_4xx"] += int(lane.get("deferrals_4xx") or 0)
+                    out["hardfails_5xx"] += int(lane.get("hardfails_5xx") or 0)
+                    out["timeouts_conn"] += int(lane.get("timeouts_conn") or 0)
+                    out["blocked_events"] += int(lane.get("blocked_events") or 0)
+            if lane_registry:
+                rs = lane_registry.snapshot(time.time())
+                lanes = (rs.get("lanes") if isinstance(rs, dict) else []) or []
+                out["quarantine_count"] = sum(1 for x in lanes if str(x.get("state") or "") == "QUARANTINED")
+            if isinstance(executor_snapshot, dict):
+                out["inflight_count"] = int(executor_snapshot.get("inflight_count") or 0)
+            return out
+
         with JOBS_LOCK:
-            if scheduler_mode != "legacy":
+            if scheduler_mode_runtime != "legacy":
                 job.log("INFO", f"Scheduler mode={scheduler_mode} (Lane Picker v2 enabled; sending pipeline remains legacy/sequential).")
             job.log(
                 "INFO",
@@ -13469,6 +13738,29 @@ def smtp_send_job(
                     pmta_pressure_applied = {}
 
             now_ts = time.time()
+            if fallback_controller:
+                pmta_level_now = int(pmta_pressure_applied.get("level") or 0) if isinstance(pmta_pressure_applied, dict) else 0
+                fallback_controller.observe(
+                    now_ts=now_ts,
+                    global_metrics_snapshot=_fallback_global_metrics_snapshot(),
+                    pmta_pressure_level=pmta_level_now,
+                    executor_snapshot=None,
+                )
+                should_fallback, fallback_reasons = fallback_controller.should_trigger(now_ts)
+                if should_fallback:
+                    fallback_controller.apply_actions(
+                        {
+                            "disable_concurrency": _disable_concurrency_runtime,
+                            "disable_probe": _disable_probe_runtime,
+                            "switch_scheduler_legacy": _switch_scheduler_legacy,
+                        }
+                    )
+                    with JOBS_LOCK:
+                        job.log("WARN", f"Fallback triggered: {', '.join(fallback_reasons)}")
+                if fallback_export:
+                    with JOBS_LOCK:
+                        job.debug_fallback = fallback_controller.snapshot()
+
             probe_selected_this_iteration = False
             sender_domain_pick = _pick_retry_ready_sender_domain(now_ts)
             if not sender_domain_pick and probe_controller.is_active(now_ts):
@@ -13484,7 +13776,7 @@ def smtp_send_job(
                     probe_selected_this_iteration = True
             lane_pick_meta: dict = {"pick_type": "none"}
             if not sender_domain_pick:
-                if scheduler_mode == "lane_v2" and lane_picker_v2:
+                if scheduler_mode_runtime == "lane_v2" and lane_picker_v2:
                     sender_domain_pick, lane_pick_meta = lane_picker_v2.pick_next(
                         now_ts=now_ts,
                         sender_cursor=sender_cursor,
@@ -13512,7 +13804,7 @@ def smtp_send_job(
                 continue
 
             sender_idx_fixed, target_domain = sender_domain_pick
-            if scheduler_mode == "lane_v2" and len(sender_emails) > 0:
+            if scheduler_mode_runtime == "lane_v2" and len(sender_emails) > 0:
                 sender_cursor = (int(sender_idx_fixed) + 1) % len(sender_emails)
             elif probe_selected_this_iteration and len(sender_emails) > 0:
                 sender_cursor = (int(sender_idx_fixed) + 1) % len(sender_emails)
@@ -14273,6 +14565,36 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "Emit concise lane concurrency executor logs."},
     {"key": "SHIVA_LANE_CONCURRENCY_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Export lane executor snapshot into job debug payload as debug_lane_executor."},
+    {"key": "SHIVA_FALLBACK_CONTROLLER", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Enable job-scoped fallback controller that can disable new scheduler layers and force legacy mode on risk spikes."},
+    {"key": "SHIVA_FALLBACK_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Emit concise fallback controller debug logs."},
+    {"key": "SHIVA_FALLBACK_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Export fallback controller snapshot into job debug payload as debug_fallback."},
+    {"key": "SHIVA_FALLBACK_WINDOW_S", "type": "int", "default": "300", "group": "Scheduler", "restart_required": False,
+     "desc": "Rolling window in seconds used for fallback trigger-rate calculations."},
+    {"key": "SHIVA_FALLBACK_DEFERRAL_RATE", "type": "float", "default": "0.35", "group": "Scheduler", "restart_required": False,
+     "desc": "Fallback trigger threshold for global deferrals/attempts."},
+    {"key": "SHIVA_FALLBACK_HARDFAIL_RATE", "type": "float", "default": "0.05", "group": "Scheduler", "restart_required": False,
+     "desc": "Fallback trigger threshold for global hardfails/attempts."},
+    {"key": "SHIVA_FALLBACK_TIMEOUT_RATE", "type": "float", "default": "0.08", "group": "Scheduler", "restart_required": False,
+     "desc": "Fallback trigger threshold for global timeout failures/attempts."},
+    {"key": "SHIVA_FALLBACK_BLOCKED_PER_MIN", "type": "float", "default": "10", "group": "Scheduler", "restart_required": False,
+     "desc": "Fallback trigger threshold for blocked events per minute."},
+    {"key": "SHIVA_FALLBACK_PMTA_PRESSURE_LEVEL", "type": "int", "default": "3", "group": "Scheduler", "restart_required": False,
+     "desc": "Fallback trigger threshold for PMTA pressure level sustained over half the fallback window."},
+    {"key": "SHIVA_FALLBACK_MIN_ACTIVE_S", "type": "int", "default": "180", "group": "Scheduler", "restart_required": False,
+     "desc": "Minimum time fallback remains active before any recovery checks."},
+    {"key": "SHIVA_FALLBACK_RECOVERY_S", "type": "int", "default": "300", "group": "Scheduler", "restart_required": False,
+     "desc": "Stable period required before re-enabling new layers when re-enable is allowed."},
+    {"key": "SHIVA_FALLBACK_DISABLE_REENABLE", "type": "bool", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "If enabled, fallback remains active for the entire job once triggered."},
+    {"key": "SHIVA_FALLBACK_STEP1_DISABLE_CONCURRENCY", "type": "bool", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "Fallback action step 1: disable lane concurrency for the active job."},
+    {"key": "SHIVA_FALLBACK_STEP2_DISABLE_PROBE", "type": "bool", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "Fallback action step 2: disable probe mode for the active job."},
+    {"key": "SHIVA_FALLBACK_STEP3_SWITCH_TO_LEGACY", "type": "bool", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "Fallback action step 3: force legacy scheduler selection for the active job."},
     {"key": "SHIVA_LANE_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Enable lane debug self-check invariants (logging + fatal on hard mismatch)."},
     {"key": "SHIVA_LANE_BASELINE_REPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
