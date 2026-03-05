@@ -2193,6 +2193,9 @@ def resolve_caps_for_attempt(
     policy_pack_clamps: Optional[dict] = None,
     caps_bounds_override: Optional[dict] = None,
 ) -> Tuple[dict, dict]:
+    def _coerce_num(value: Any, *, as_type: str, default: Any) -> Any:
+        return _coerce_scalar_number(value, as_type=as_type, default=default)
+
     lane = (int((lane_key or (0, ""))[0] or 0), str((lane_key or (0, ""))[1] or "").strip().lower())
     rt = dict(runtime_overrides or {})
     caps = clamp_caps_to_bounds(base_caps or {}, bounds_override=caps_bounds_override)
@@ -2213,13 +2216,13 @@ def resolve_caps_for_attempt(
     direct = dict(caps)
     if rt:
         if rt.get("chunk_size") is not None:
-            direct["chunk_size"] = int(rt.get("chunk_size") or direct["chunk_size"])
+            direct["chunk_size"] = _coerce_num(rt.get("chunk_size"), as_type="int", default=direct["chunk_size"])
         if rt.get("thread_workers") is not None:
-            direct["thread_workers"] = int(rt.get("thread_workers") or direct["thread_workers"])
+            direct["thread_workers"] = _coerce_num(rt.get("thread_workers"), as_type="int", default=direct["thread_workers"])
         if rt.get("delay_s") is not None:
-            direct["delay_s"] = float(rt.get("delay_s") or direct["delay_s"])
+            direct["delay_s"] = _coerce_num(rt.get("delay_s"), as_type="float", default=direct["delay_s"])
         if rt.get("sleep_chunks") is not None:
-            direct["sleep_chunks"] = float(rt.get("sleep_chunks") if rt.get("sleep_chunks") is not None else direct["sleep_chunks"])
+            direct["sleep_chunks"] = _coerce_num(rt.get("sleep_chunks"), as_type="float", default=direct["sleep_chunks"])
     caps = clamp_caps_to_bounds(direct, bounds_override=caps_bounds_override)
     _record("overrides", before, caps, "campaign_form runtime overrides")
 
@@ -2229,23 +2232,29 @@ def resolve_caps_for_attempt(
             return
         c2 = dict(caps)
         if src.get(chunk_key) is not None:
-            c2["chunk_size"] = min(int(c2["chunk_size"]), int(src.get(chunk_key) or c2["chunk_size"]))
+            chunk_cap = _coerce_num(src.get(chunk_key), as_type="int", default=c2["chunk_size"])
+            c2["chunk_size"] = min(_coerce_num(c2["chunk_size"], as_type="int", default=1), chunk_cap)
         if src.get(workers_key) is not None:
-            c2["thread_workers"] = min(int(c2["thread_workers"]), int(src.get(workers_key) or c2["thread_workers"]))
+            workers_cap = _coerce_num(src.get(workers_key), as_type="int", default=c2["thread_workers"])
+            c2["thread_workers"] = min(_coerce_num(c2["thread_workers"], as_type="int", default=1), workers_cap)
         if src.get(delay_key) is not None:
-            c2["delay_s"] = max(float(c2["delay_s"]), float(src.get(delay_key) or c2["delay_s"]))
+            delay_floor = _coerce_num(src.get(delay_key), as_type="float", default=c2["delay_s"])
+            c2["delay_s"] = max(_coerce_num(c2["delay_s"], as_type="float", default=0.0), delay_floor)
         if src.get(sleep_key) is not None:
-            c2["sleep_chunks"] = max(float(c2["sleep_chunks"]), float(src.get(sleep_key) or c2["sleep_chunks"]))
+            sleep_floor = _coerce_num(src.get(sleep_key), as_type="float", default=c2["sleep_chunks"])
+            c2["sleep_chunks"] = max(_coerce_num(c2["sleep_chunks"], as_type="float", default=0.0), sleep_floor)
         caps = clamp_caps_to_bounds(c2, bounds_override=caps_bounds_override)
 
     before = dict(caps)
     _apply_clamps(dict(pressure_caps or {}), chunk_key="chunk_size_max", workers_key="workers_max", delay_key="delay_min", sleep_key="sleep_min")
-    _record("pressure", before, caps, f"pmta_level={int((pressure_caps or {}).get('level') or 0)}")
+    pressure_level = _coerce_num((pressure_caps or {}).get("level"), as_type="int", default=0)
+    _record("pressure", before, caps, f"pmta_level={pressure_level}")
 
     before = dict(caps)
     health_applied = (health_caps or {}).get("applied") if isinstance(health_caps, dict) else {}
     _apply_clamps(dict(health_applied or {}), chunk_key="chunk_size", workers_key="workers", delay_key="delay_s", sleep_key="sleep_chunks")
-    _record("health", before, caps, f"health_level={int((health_caps or {}).get('level') or 0)}")
+    health_level = _coerce_num((health_caps or {}).get("level"), as_type="int", default=0)
+    _record("health", before, caps, f"health_level={health_level}")
 
     learning_caps: Dict[str, Any] = {}
     if isinstance(learning_engine, dict):
