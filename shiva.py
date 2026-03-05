@@ -7203,6 +7203,11 @@ PAGE_JOBS = r"""
     .kpiCell{border:1px solid rgba(255,255,255,.08); background: rgba(255,255,255,.03); border-radius:10px; padding:7px 9px;}
     .kpiCell .k{font-size:11px; color: rgba(255,255,255,.62); text-transform:uppercase; letter-spacing:.3px;}
     .kpiCell .v{font-size:16px; font-weight:900; margin-top:2px; display:flex; align-items:center; gap:6px;}
+    .kpiCell.kpi-del .k, .kpiCell.kpi-del .v{color:var(--good);}
+    .kpiCell.kpi-bnc .k, .kpiCell.kpi-bnc .v{color:var(--bad);}
+    .kpiCell.kpi-def .k, .kpiCell.kpi-def .v{color:var(--warn);}
+    .kpiCell.kpi-cmp .k, .kpiCell.kpi-cmp .v{color:#ff8bd6;}
+    .kpiCell.kpi-sent .k, .kpiCell.kpi-sent .v{color:#fff;}
     .kpiWarn{font-size:12px; color:var(--warn); cursor:help;}
     .ratesRow{display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:8px; margin-top:8px;}
     .rateCell{border:1px solid rgba(255,255,255,.08); background: rgba(255,255,255,.02); border-radius:10px; padding:6px 9px;}
@@ -7229,7 +7234,7 @@ PAGE_JOBS = r"""
     .more{margin-top:10px;}
     .more > summary{cursor:pointer; user-select:none; font-weight:800; color:rgba(255,255,255,.88);}
     .moreBlock{margin-top:10px;}
-    .errorFold{margin-top:8px;}
+    .errorFold{margin-top:12px; margin-left:10px;}
     .errorFold summary{cursor:pointer; color:rgba(255,255,255,.75); font-size:12px;}
 
     /* PMTA Live Panel (Jobs) — clearer layout */
@@ -7477,7 +7482,7 @@ PAGE_JOBS = r"""
       </div>
     </div>
 
-    <button class="btn secondary filterToggleBtn" type="button" id="btnToggleFilters">🎛️ Filters</button>
+    <button class="btn secondary filterToggleBtn" type="button" id="btnToggleFilters">🎛️</button>
     <div class="filterDrawerBackdrop" id="jobsFilterBackdrop"></div>
     <aside class="filterDrawer" id="jobsFilterDrawer" aria-hidden="true">
       <div class="filterBar" id="jobsFilterBar">
@@ -7566,12 +7571,12 @@ PAGE_JOBS = r"""
         <!-- 1) Compact KPI + rates -->
         <div class="kpiWrap">
           <div class="kpiRow">
-            <div class="kpiCell"><div class="k">Sent</div><div class="v"><span data-k="sent">—</span></div></div>
+            <div class="kpiCell kpi-sent"><div class="k">Sent</div><div class="v"><span data-k="sent">—</span></div></div>
             <div class="kpiCell"><div class="k">Pending</div><div class="v"><span data-k="pending">—</span><span class="kpiWarn" data-k="pendingWarn" style="display:none" title="Pending was clamped to 0 because Sent is lower than PMTA outcomes.">⚠</span></div></div>
-            <div class="kpiCell"><div class="k">Del</div><div class="v"><span data-k="delivered">—</span></div></div>
-            <div class="kpiCell"><div class="k">Bnc</div><div class="v"><span data-k="bounced">—</span></div></div>
-            <div class="kpiCell"><div class="k">Def</div><div class="v"><span data-k="deferred">—</span></div></div>
-            <div class="kpiCell"><div class="k">Cmp</div><div class="v"><span data-k="complained">—</span></div></div>
+            <div class="kpiCell kpi-del"><div class="k">Del</div><div class="v"><span data-k="delivered">—</span></div></div>
+            <div class="kpiCell kpi-bnc"><div class="k">Bnc</div><div class="v"><span data-k="bounced">—</span></div></div>
+            <div class="kpiCell kpi-def"><div class="k">Def</div><div class="v"><span data-k="deferred">—</span></div></div>
+            <div class="kpiCell kpi-cmp"><div class="k">Cmp</div><div class="v"><span data-k="complained">—</span></div></div>
           </div>
           <div class="ratesRow">
             <div class="rateCell"><div class="k">Bounce %</div><div class="v" data-k="rateBounce">—</div></div>
@@ -7583,7 +7588,7 @@ PAGE_JOBS = r"""
             <h4>PMTA Live Panel</h4>
             <div class="pmtaLive" data-k="pmtaLine">—</div>
             <div class="mini" style="margin-top:6px" data-k="pmtaNote">Note: <b>sent</b> = accepted by PMTA (client-side). Delivery may still be queued/deferred.</div>
-            <div class="mini" style="margin-top:6px" data-k="pmtaDiag">Diag: —</div>
+            <div class="chunkMeta" style="margin-top:6px" data-k="pmtaDiag"><span class="chunkMetaPill">Diag: —</span></div>
           </div>
 
           <details class="qualityMini">
@@ -8992,11 +8997,19 @@ This will remove it from Jobs history.`);
         const err = (d.queue_errors ?? '—');
         const hint = (d.remote_hint || '');
         const samp = Array.isArray(d.errors_sample) ? d.errors_sample.slice(0,2).join(' / ') : '';
-        pmDiagEl.textContent = `Diag: class=${cls} dom=${dom} def=${def} err=${err}` + (hint ? (` · hint=${hint}`) : '') + (samp ? (` · sample=${samp}`) : '');
+        pmDiagEl.innerHTML = [
+          `<span class="chunkMetaPill">Diag</span>`,
+          `<span class="chunkMetaPill">class=${esc(cls || '—')}</span>`,
+          `<span class="chunkMetaPill">dom=${esc(dom || '—')}</span>`,
+          `<span class="chunkMetaPill">def=${esc(String(def))}</span>`,
+          `<span class="chunkMetaPill">err=${esc(String(err))}</span>`,
+          hint ? `<span class="chunkMetaPill">hint=${esc(hint)}</span>` : '',
+          samp ? `<span class="chunkMetaPill">sample=${esc(samp)}</span>` : ''
+        ].join('');
       } else if(d && d.enabled && !d.ok) {
-        pmDiagEl.textContent = `Diag: ${d.reason || '—'}`;
+        pmDiagEl.innerHTML = `<span class="chunkMetaPill">Diag: ${esc(String(d.reason || '—'))}</span>`;
       } else {
-        pmDiagEl.textContent = 'Diag: —';
+        pmDiagEl.innerHTML = '<span class="chunkMetaPill">Diag: —</span>';
       }
     }
 
