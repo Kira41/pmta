@@ -2233,6 +2233,7 @@ class SendJob:
     debug_budget_status: dict = field(default_factory=dict)
     debug_lane_executor: dict = field(default_factory=dict)
     debug_fallback: dict = field(default_factory=dict)
+    debug_backoff_jitter: List[dict] = field(default_factory=list)
 
     # PMTA diagnostics snapshot (optional; helps classify failures quickly)
     pmta_diag: dict = field(default_factory=dict)
@@ -3144,6 +3145,7 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "debug_budget_status": job.debug_budget_status or {},
         "debug_lane_executor": job.debug_lane_executor or {},
         "debug_fallback": job.debug_fallback or {},
+        "debug_backoff_jitter": (job.debug_backoff_jitter or [])[-50:],
         "pmta_diag": job.pmta_diag or {},
         "pmta_diag_ts": job.pmta_diag_ts or "",
         "created_at": job.created_at,
@@ -3897,6 +3899,7 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job.debug_budget_status = (s.get("debug_budget_status") if isinstance(s.get("debug_budget_status"), dict) else {}) or {}
         job.debug_lane_executor = (s.get("debug_lane_executor") if isinstance(s.get("debug_lane_executor"), dict) else {}) or {}
         job.debug_fallback = (s.get("debug_fallback") if isinstance(s.get("debug_fallback"), dict) else {}) or {}
+        job.debug_backoff_jitter = list(s.get("debug_backoff_jitter") or [])
         job.pmta_diag = (s.get("pmta_diag") if isinstance(s.get("pmta_diag"), dict) else {}) or {}
         job.pmta_diag_ts = str(s.get("pmta_diag_ts") or "")
         job.updated_at = str(s.get("updated_at") or "")
@@ -10962,6 +10965,23 @@ except Exception:
 PMTA_QUEUE_BACKOFF = (os.getenv("PMTA_QUEUE_BACKOFF", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
 PMTA_QUEUE_REQUIRED = (os.getenv("PMTA_QUEUE_REQUIRED", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
 SHIVA_DISABLE_BACKOFF = (os.getenv("SHIVA_DISABLE_BACKOFF", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+SHIVA_BACKOFF_JITTER = (os.getenv("SHIVA_BACKOFF_JITTER", "off") or "off").strip().lower()
+if SHIVA_BACKOFF_JITTER not in {"off", "deterministic", "random"}:
+    SHIVA_BACKOFF_JITTER = "off"
+try:
+    SHIVA_BACKOFF_JITTER_PCT = float((os.getenv("SHIVA_BACKOFF_JITTER_PCT", "0.15") or "0.15").strip())
+except Exception:
+    SHIVA_BACKOFF_JITTER_PCT = 0.15
+try:
+    SHIVA_BACKOFF_JITTER_MAX_S = float((os.getenv("SHIVA_BACKOFF_JITTER_MAX_S", "120") or "120").strip())
+except Exception:
+    SHIVA_BACKOFF_JITTER_MAX_S = 120.0
+try:
+    SHIVA_BACKOFF_JITTER_MIN_S = float((os.getenv("SHIVA_BACKOFF_JITTER_MIN_S", "0") or "0").strip())
+except Exception:
+    SHIVA_BACKOFF_JITTER_MIN_S = 0.0
+SHIVA_BACKOFF_JITTER_EXPORT = (os.getenv("SHIVA_BACKOFF_JITTER_EXPORT", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+SHIVA_BACKOFF_JITTER_DEBUG = (os.getenv("SHIVA_BACKOFF_JITTER_DEBUG", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
 
 try:
     PMTA_LIVE_POLL_S = float((os.getenv("PMTA_LIVE_POLL_S", "3") or "3").strip())
@@ -12310,6 +12330,42 @@ def _compute_backoff_wait_seconds(*, attempt: int, base_s: float, max_s: float, 
     return min(max(float(max_s or tuned), 1.0), tuned)
 
 
+def apply_backoff_jitter(
+    *,
+    wait_s_base: float,
+    mode: str,
+    pct: float,
+    max_jitter_s: float,
+    min_jitter_s: float,
+    max_s: float,
+    partition_seed: str,
+    lane_key: str,
+    attempt: int,
+    failure_type: str,
+) -> Tuple[float, float]:
+    """Apply optional bounded jitter to a computed backoff wait."""
+    mode2 = str(mode or "off").strip().lower()
+    base_wait = max(0.0, float(wait_s_base or 0.0))
+    if mode2 not in {"deterministic", "random"}:
+        return min(base_wait, max(0.0, float(max_s or base_wait))), 0.0
+
+    pct2 = max(0.0, float(pct or 0.0))
+    max_jitter = max(0.0, float(max_jitter_s or 0.0))
+    min_jitter = max(0.0, float(min_jitter_s or 0.0))
+    jitter_amp = min(max_jitter, max(min_jitter, base_wait * pct2))
+
+    if mode2 == "random":
+        jitter_delta = random.uniform(-jitter_amp, jitter_amp)
+    else:
+        seed_material = f"{str(partition_seed or '').strip()}|{str(lane_key or '').strip()}|{int(attempt or 0)}|{str(failure_type or '').strip().lower()}"
+        domain_seed = int(hashlib.sha256(seed_material.encode("utf-8", errors="ignore")).hexdigest()[:16], 16)
+        rng = random.Random(domain_seed)
+        jitter_delta = rng.uniform(-jitter_amp, jitter_amp)
+
+    wait_final = min(max(0.0, base_wait + jitter_delta), max(0.0, float(max_s or base_wait)))
+    return wait_final, jitter_delta
+
+
 def _record_accounting_error(job: SendJob, rcpt: str, typ: str, ev: dict) -> None:
     kind, detail = _classify_accounting_response(ev, typ)
     job.accounting_error_counts[kind] = int(job.accounting_error_counts.get(kind, 0) or 0) + 1
@@ -13303,6 +13359,9 @@ def smtp_send_job(
     if fallback_export:
         with JOBS_LOCK:
             job.debug_fallback = {}
+    if SHIVA_BACKOFF_JITTER_EXPORT:
+        with JOBS_LOCK:
+            job.debug_backoff_jitter = []
     if learning_export:
         with JOBS_LOCK:
             job.debug_learning_policy = {}
@@ -15031,12 +15090,27 @@ def smtp_send_job(
                         )
                         break
 
-                    wait_s = _compute_backoff_wait_seconds(
+                    wait_s_base = _compute_backoff_wait_seconds(
                         attempt=attempt,
                         base_s=dynamic_backoff_base_s,
                         max_s=dynamic_backoff_max_s,
                         failure_type=failure_type,
                     )
+                    wait_s = wait_s_base
+                    jitter_delta = 0.0
+                    if SHIVA_BACKOFF_JITTER != "off":
+                        wait_s, jitter_delta = apply_backoff_jitter(
+                            wait_s_base=wait_s_base,
+                            mode=SHIVA_BACKOFF_JITTER,
+                            pct=SHIVA_BACKOFF_JITTER_PCT,
+                            max_jitter_s=SHIVA_BACKOFF_JITTER_MAX_S,
+                            min_jitter_s=SHIVA_BACKOFF_JITTER_MIN_S,
+                            max_s=dynamic_backoff_max_s,
+                            partition_seed=partition_seed,
+                            lane_key=target_key,
+                            attempt=attempt,
+                            failure_type=failure_type,
+                        )
                     next_ts = time.time() + wait_s
 
                     entry = {
@@ -15068,7 +15142,21 @@ def smtp_send_job(
                     )
                     if intervention:
                         msg += f" | intervention={intervention}"
+                    if SHIVA_BACKOFF_JITTER != "off" and SHIVA_BACKOFF_JITTER_DEBUG:
+                        msg += f" | jitter={jitter_delta:+.2f}s mode={SHIVA_BACKOFF_JITTER}"
                     job.log("WARN", msg)
+                    if SHIVA_BACKOFF_JITTER != "off" and SHIVA_BACKOFF_JITTER_EXPORT:
+                        with JOBS_LOCK:
+                            job.debug_backoff_jitter.append({
+                                "lane_key": target_key,
+                                "attempt": int(attempt or 0),
+                                "failure_type": str(failure_type or ""),
+                                "wait_base": float(wait_s_base),
+                                "jitter_delta": float(jitter_delta),
+                                "wait_final": float(wait_s),
+                            })
+                            if len(job.debug_backoff_jitter) > 50:
+                                job.debug_backoff_jitter = job.debug_backoff_jitter[-50:]
                     if lane_metrics:
                         lane_metrics.on_backoff_scheduled(
                             _lane_key(sender_idx_fixed, target_domain),
@@ -15325,6 +15413,18 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "If true and PMTA detail endpoints are unreachable: block chunk (strict mode)."},
     {"key": "SHIVA_DISABLE_BACKOFF", "type": "bool", "default": "0", "group": "Backoff", "restart_required": False,
      "desc": "If enabled: bypass all chunk backoff triggers (spam/blacklist/PMTA) and keep sending immediately."},
+    {"key": "SHIVA_BACKOFF_JITTER", "type": "str", "default": "off", "group": "Backoff", "restart_required": False,
+     "desc": "Optional backoff jitter mode: off | deterministic | random."},
+    {"key": "SHIVA_BACKOFF_JITTER_PCT", "type": "float", "default": "0.15", "group": "Backoff", "restart_required": False,
+     "desc": "Jitter amplitude as percentage of computed backoff wait (e.g., 0.15 => ±15%)."},
+    {"key": "SHIVA_BACKOFF_JITTER_MAX_S", "type": "float", "default": "120", "group": "Backoff", "restart_required": False,
+     "desc": "Absolute cap in seconds for applied backoff jitter."},
+    {"key": "SHIVA_BACKOFF_JITTER_MIN_S", "type": "float", "default": "0", "group": "Backoff", "restart_required": False,
+     "desc": "Absolute floor in seconds for jitter amplitude before sign is applied."},
+    {"key": "SHIVA_BACKOFF_JITTER_EXPORT", "type": "bool", "default": "0", "group": "Backoff", "restart_required": False,
+     "desc": "Export recent jitter applications into job debug payload (debug_backoff_jitter)."},
+    {"key": "SHIVA_BACKOFF_JITTER_DEBUG", "type": "bool", "default": "0", "group": "Backoff", "restart_required": False,
+     "desc": "Log concise jitter lines for blocked/backoff scheduling events."},
     {"key": "PMTA_LIVE_POLL_S", "type": "float", "default": "3", "group": "PMTA Live", "restart_required": False,
      "desc": "Polling interval for PMTA live panel (seconds)."},
     {"key": "PMTA_DOMAIN_CHECK_TOP_N", "type": "int", "default": "2", "group": "PMTA Backoff", "restart_required": False,
@@ -15725,6 +15825,8 @@ def reload_runtime_config() -> dict:
         global PMTA_MONITOR_TIMEOUT_S, PMTA_MONITOR_BASE_URL, PMTA_MONITOR_SCHEME, PMTA_MONITOR_API_KEY, PMTA_HEALTH_REQUIRED
         global PMTA_DIAG_ON_ERROR, PMTA_DIAG_RATE_S, PMTA_QUEUE_TOP_N
         global PMTA_QUEUE_BACKOFF, PMTA_QUEUE_REQUIRED, SHIVA_DISABLE_BACKOFF
+        global SHIVA_BACKOFF_JITTER, SHIVA_BACKOFF_JITTER_PCT, SHIVA_BACKOFF_JITTER_MAX_S, SHIVA_BACKOFF_JITTER_MIN_S
+        global SHIVA_BACKOFF_JITTER_EXPORT, SHIVA_BACKOFF_JITTER_DEBUG
         global PMTA_LIVE_POLL_S, PMTA_DOMAIN_CHECK_TOP_N, PMTA_DETAIL_CACHE_TTL_S
         global PMTA_DOMAIN_DEFERRALS_BACKOFF, PMTA_DOMAIN_ERRORS_BACKOFF, PMTA_DOMAIN_DEFERRALS_SLOW, PMTA_DOMAIN_ERRORS_SLOW
         global PMTA_SLOW_DELAY_S, PMTA_SLOW_WORKERS_MAX
@@ -15771,6 +15873,14 @@ def reload_runtime_config() -> dict:
         PMTA_QUEUE_BACKOFF = bool(cfg_get_bool("PMTA_QUEUE_BACKOFF", True))
         PMTA_QUEUE_REQUIRED = bool(cfg_get_bool("PMTA_QUEUE_REQUIRED", False))
         SHIVA_DISABLE_BACKOFF = bool(cfg_get_bool("SHIVA_DISABLE_BACKOFF", False))
+        SHIVA_BACKOFF_JITTER = (cfg_get_str("SHIVA_BACKOFF_JITTER", SHIVA_BACKOFF_JITTER) or SHIVA_BACKOFF_JITTER).strip().lower()
+        if SHIVA_BACKOFF_JITTER not in {"off", "deterministic", "random"}:
+            SHIVA_BACKOFF_JITTER = "off"
+        SHIVA_BACKOFF_JITTER_PCT = max(0.0, float(cfg_get_float("SHIVA_BACKOFF_JITTER_PCT", SHIVA_BACKOFF_JITTER_PCT)))
+        SHIVA_BACKOFF_JITTER_MAX_S = max(0.0, float(cfg_get_float("SHIVA_BACKOFF_JITTER_MAX_S", SHIVA_BACKOFF_JITTER_MAX_S)))
+        SHIVA_BACKOFF_JITTER_MIN_S = max(0.0, float(cfg_get_float("SHIVA_BACKOFF_JITTER_MIN_S", SHIVA_BACKOFF_JITTER_MIN_S)))
+        SHIVA_BACKOFF_JITTER_EXPORT = bool(cfg_get_bool("SHIVA_BACKOFF_JITTER_EXPORT", SHIVA_BACKOFF_JITTER_EXPORT))
+        SHIVA_BACKOFF_JITTER_DEBUG = bool(cfg_get_bool("SHIVA_BACKOFF_JITTER_DEBUG", SHIVA_BACKOFF_JITTER_DEBUG))
         PMTA_LIVE_POLL_S = float(cfg_get_float("PMTA_LIVE_POLL_S", 3.0))
         PMTA_DOMAIN_CHECK_TOP_N = int(cfg_get_int("PMTA_DOMAIN_CHECK_TOP_N", 2))
         PMTA_DETAIL_CACHE_TTL_S = float(cfg_get_float("PMTA_DETAIL_CACHE_TTL_S", 3.0))
@@ -16018,6 +16128,7 @@ def job_api(job_id: str):
                 "current_chunk": job.current_chunk,
                 "chunk_states": job.chunk_states[-120:],
                 "backoff_items": job.backoff_items[-120:],
+                "debug_backoff_jitter": (job.debug_backoff_jitter or [])[-50:],
                 "domain_plan": job.domain_plan,
                 "domain_sent": job.domain_sent,
                 "domain_failed": job.domain_failed,
