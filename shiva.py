@@ -8670,7 +8670,8 @@ This will remove it from Jobs history.`);
 
     function _renderPmtaPanel(pm, pr){
       if(!pm || !pm.enabled){
-        return `<div class="pmtaBanner warn">PMTA: disabled</div>`;
+        const why = (pm && pm.reason) ? String(pm.reason) : '';
+        return `<div class="pmtaBanner warn">PMTA: disabled${why ? (`<br><span class="muted">${esc(why)}</span>`) : ''}</div>`;
       }
       if(!pm.ok){
         const why = (pm.reason || 'unreachable').toString();
@@ -12589,7 +12590,9 @@ def pmta_live_panel(*, smtp_host: str) -> dict:
 
     base = _pmta_base_from_smtp_host(smtp_host)
     if not base:
-        return {"enabled": False, "ok": True, "reason": "disabled", "ts": now_iso()}
+        host_txt = (smtp_host or "").strip()
+        reason = "disabled: invalid_or_missing_smtp_host" if not host_txt else "disabled: cannot_build_monitor_base"
+        return {"enabled": False, "ok": True, "reason": reason, "ts": now_iso()}
 
     status_url = f"{base}/status?format=json"
     ok, js, err = _http_get_json(status_url, timeout_s=PMTA_MONITOR_TIMEOUT_S)
