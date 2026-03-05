@@ -1096,6 +1096,203 @@ class BudgetConfig:
     export: bool = False
 
 
+class PolicyPackLoader:
+    """Loads/validates provider policy packs from JSON with safe built-in defaults."""
+
+    BUILTIN_DEFAULT_PACK: Dict[str, Any] = {
+        "provider_defaults": {
+            "google": {"max_inflight": 1, "min_gap_s": 20.0, "cooldown_s": 120.0, "delay_floor": 1.0, "chunk_cap": 150, "workers_cap": 3},
+            "gmail": {"max_inflight": 1, "min_gap_s": 20.0, "cooldown_s": 120.0, "delay_floor": 1.0, "chunk_cap": 150, "workers_cap": 3},
+            "microsoft": {"max_inflight": 1, "min_gap_s": 10.0, "cooldown_s": 60.0, "delay_floor": 0.7, "chunk_cap": 200, "workers_cap": 4},
+            "yahoo": {"max_inflight": 1, "min_gap_s": 15.0, "cooldown_s": 90.0, "delay_floor": 0.8, "chunk_cap": 180, "workers_cap": 3},
+            "other": {"max_inflight": 2, "min_gap_s": 0.0, "cooldown_s": 0.0, "delay_floor": 0.4, "chunk_cap": 300, "workers_cap": 5},
+            "*": {"max_inflight": 2, "min_gap_s": 0.0, "cooldown_s": 0.0, "delay_floor": 0.4, "chunk_cap": 300, "workers_cap": 5},
+        },
+        "single_domain_wave": {"max_inflight": 1, "burst_tokens": 400, "refill_per_sec": 3.0, "max_burst": 1200.0, "max_refill": 10.0},
+        "resource_governor": {"max_total_workers": 40},
+        "fallback": {"deferral_rate": 0.35, "hardfail_rate": 0.05, "timeout_rate": 0.08},
+    }
+
+    @staticmethod
+    def _f(v: Any, default: float, min_v: float, max_v: float) -> float:
+        try:
+            out = float(v)
+        except Exception:
+            out = float(default)
+        return max(min_v, min(max_v, out))
+
+    @staticmethod
+    def _i(v: Any, default: int, min_v: int, max_v: int) -> int:
+        try:
+            out = int(v)
+        except Exception:
+            out = int(default)
+        return max(min_v, min(max_v, out))
+
+    @classmethod
+    def validate_and_normalize(cls, pack_raw: Any) -> dict:
+        src = dict(pack_raw or {}) if isinstance(pack_raw, dict) else {}
+        builtins = dict(cls.BUILTIN_DEFAULT_PACK)
+        provider_src = src.get("provider_defaults") if isinstance(src.get("provider_defaults"), dict) else {}
+        provider_defaults: Dict[str, dict] = {}
+        for k, v in provider_src.items():
+            if not isinstance(v, dict):
+                continue
+            kk = str(k or "").strip().lower()
+            if not kk:
+                continue
+            provider_defaults[kk] = {
+                "max_inflight": cls._i(v.get("max_inflight"), 1, 1, 10),
+                "min_gap_s": cls._f(v.get("min_gap_s"), 0.0, 0.0, 3600.0),
+                "cooldown_s": cls._f(v.get("cooldown_s"), 0.0, 0.0, 3600.0),
+                "delay_floor": cls._f(v.get("delay_floor"), 0.4, 0.0, 10.0),
+                "chunk_cap": cls._i(v.get("chunk_cap"), 300, 1, 50000),
+                "workers_cap": cls._i(v.get("workers_cap"), 5, 1, 200),
+            }
+        if not provider_defaults:
+            provider_defaults = dict((builtins.get("provider_defaults") or {}))
+        if "other" not in provider_defaults and "*" in provider_defaults:
+            provider_defaults["other"] = dict(provider_defaults["*"])
+        if "*" not in provider_defaults and "other" in provider_defaults:
+            provider_defaults["*"] = dict(provider_defaults["other"])
+
+        wave_src = src.get("single_domain_wave") if isinstance(src.get("single_domain_wave"), dict) else {}
+        wave_defaults = dict((builtins.get("single_domain_wave") or {}))
+        wave = {
+            "max_inflight": cls._i(wave_src.get("max_inflight"), wave_defaults.get("max_inflight", 1), 1, 10),
+            "burst_tokens": cls._i(wave_src.get("burst_tokens"), wave_defaults.get("burst_tokens", 400), 1, 200000),
+            "refill_per_sec": cls._f(wave_src.get("refill_per_sec"), wave_defaults.get("refill_per_sec", 3.0), 0.01, 200.0),
+            "max_burst": cls._f(wave_src.get("max_burst"), wave_defaults.get("max_burst", 1200.0), 1.0, 500000.0),
+            "max_refill": cls._f(wave_src.get("max_refill"), wave_defaults.get("max_refill", 10.0), 0.01, 500.0),
+        }
+
+        gov_src = src.get("resource_governor") if isinstance(src.get("resource_governor"), dict) else {}
+        fallback_src = src.get("fallback") if isinstance(src.get("fallback"), dict) else {}
+        fb_defaults = dict((builtins.get("fallback") or {}))
+        return {
+            "provider_defaults": provider_defaults,
+            "single_domain_wave": wave,
+            "resource_governor": {
+                "max_total_workers": cls._i(gov_src.get("max_total_workers"), int((builtins.get("resource_governor") or {}).get("max_total_workers", 40)), 1, 10000),
+            },
+            "fallback": {
+                "deferral_rate": cls._f(fallback_src.get("deferral_rate"), fb_defaults.get("deferral_rate", 0.35), 0.0, 1.0),
+                "hardfail_rate": cls._f(fallback_src.get("hardfail_rate"), fb_defaults.get("hardfail_rate", 0.05), 0.0, 1.0),
+                "timeout_rate": cls._f(fallback_src.get("timeout_rate"), fb_defaults.get("timeout_rate", 0.08), 0.0, 1.0),
+            },
+        }
+
+    @classmethod
+    def load(cls, packs_json: str, default_pack_name: str) -> dict:
+        parsed = {}
+        txt = str(packs_json or "").strip()
+        if txt:
+            try:
+                candidate = json.loads(txt)
+                if isinstance(candidate, dict):
+                    parsed = candidate
+            except Exception:
+                parsed = {}
+        out: Dict[str, dict] = {}
+        for name, pack_raw in (parsed or {}).items():
+            pname = str(name or "").strip().lower()
+            if not pname:
+                continue
+            out[pname] = cls.validate_and_normalize(pack_raw)
+        if not out:
+            out = {"default": cls.validate_and_normalize(cls.BUILTIN_DEFAULT_PACK)}
+        default_name = str(default_pack_name or "default").strip().lower() or "default"
+        if default_name not in out:
+            out[default_name] = cls.validate_and_normalize(out.get("default") or cls.BUILTIN_DEFAULT_PACK)
+        if "default" not in out:
+            out["default"] = cls.validate_and_normalize(out.get(default_name) or cls.BUILTIN_DEFAULT_PACK)
+        return out
+
+
+class PolicyPackApplier:
+    def __init__(self, pack: dict, enforce: bool):
+        self.pack = dict(pack or {})
+        self.enforce = bool(enforce)
+
+    def _provider_settings(self, provider_key: str) -> dict:
+        defaults = dict(self.pack.get("provider_defaults") or {})
+        p = str(provider_key or "").strip().lower()
+        return dict(defaults.get(p) or defaults.get("other") or defaults.get("*") or {})
+
+    def compute_recommendations(self, job_context: dict) -> dict:
+        provider_keys = [str(x or "").strip().lower() for x in (job_context.get("provider_keys") or []) if str(x or "").strip()]
+        providers = {k: self._provider_settings(k) for k in sorted(set(provider_keys))}
+        return {
+            "provider_defaults": providers,
+            "single_domain_wave": dict(self.pack.get("single_domain_wave") or {}),
+            "resource_governor": dict(self.pack.get("resource_governor") or {}),
+            "fallback": dict(self.pack.get("fallback") or {}),
+        }
+
+    def apply_job_local_overrides(self, job_context: dict) -> dict:
+        if not self.enforce:
+            return {}
+        applied: Dict[str, Any] = {"budget_manager": {}, "caps_resolver": {}, "wave": {}, "resource_governor": {}, "fallback": {}}
+        provider_keys = [str(x or "").strip().lower() for x in (job_context.get("provider_keys") or []) if str(x or "").strip()]
+
+        budget_config = job_context.get("budget_config")
+        for provider_key in sorted(set(provider_keys)):
+            pset = self._provider_settings(provider_key)
+            if not pset:
+                continue
+            if budget_config is not None:
+                cur_max = int((budget_config.provider_max_inflight_map or {}).get(provider_key, budget_config.provider_max_inflight_default))
+                cur_gap = float((budget_config.provider_min_gap_s_map or {}).get(provider_key, budget_config.provider_min_gap_s_default))
+                cur_cd = float((budget_config.provider_cooldown_s_map or {}).get(provider_key, budget_config.provider_cooldown_s_default))
+                budget_config.provider_max_inflight_map[provider_key] = min(int(cur_max), int(pset.get("max_inflight", cur_max)))
+                budget_config.provider_min_gap_s_map[provider_key] = max(float(cur_gap), float(pset.get("min_gap_s", cur_gap)))
+                budget_config.provider_cooldown_s_map[provider_key] = max(float(cur_cd), float(pset.get("cooldown_s", cur_cd)))
+                applied["budget_manager"][provider_key] = {
+                    "max_inflight": int(budget_config.provider_max_inflight_map[provider_key]),
+                    "min_gap_s": float(budget_config.provider_min_gap_s_map[provider_key]),
+                    "cooldown_s": float(budget_config.provider_cooldown_s_map[provider_key]),
+                }
+
+            caps_clamps = job_context.setdefault("policy_pack_caps_clamps", {})
+            lane_clamp = dict(caps_clamps.get(provider_key) or {})
+            if pset.get("chunk_cap") is not None:
+                lane_clamp["chunk_size_cap"] = min(int(lane_clamp.get("chunk_size_cap") or 50000), int(pset.get("chunk_cap") or 50000))
+            if pset.get("workers_cap") is not None:
+                lane_clamp["workers_cap"] = min(int(lane_clamp.get("workers_cap") or 200), int(pset.get("workers_cap") or 200))
+            if pset.get("delay_floor") is not None:
+                lane_clamp["delay_floor"] = max(float(lane_clamp.get("delay_floor") or 0.0), float(pset.get("delay_floor") or 0.0))
+            caps_clamps[provider_key] = lane_clamp
+            applied["caps_resolver"][provider_key] = dict(lane_clamp)
+
+        wave_controller = job_context.get("wave_controller")
+        wave_cfg = dict(self.pack.get("single_domain_wave") or {})
+        if wave_controller is not None and wave_cfg:
+            wave_controller.burst_tokens = min(float(wave_controller.burst_tokens), float(wave_cfg.get("max_burst") or wave_cfg.get("burst_tokens") or wave_controller.burst_tokens))
+            wave_controller.tokens_current = min(float(wave_controller.tokens_current), float(wave_controller.burst_tokens))
+            wave_controller.refill_per_sec = min(float(wave_controller.refill_per_sec), float(wave_cfg.get("max_refill") or wave_cfg.get("refill_per_sec") or wave_controller.refill_per_sec))
+            applied["wave"] = {
+                "burst_tokens": float(wave_controller.burst_tokens),
+                "refill_per_sec": float(wave_controller.refill_per_sec),
+            }
+
+        resource_governor = job_context.get("resource_governor")
+        if resource_governor is not None:
+            cfg = dict(self.pack.get("resource_governor") or {})
+            if cfg.get("max_total_workers") is not None:
+                resource_governor.max_total_workers = min(int(resource_governor.max_total_workers), int(cfg.get("max_total_workers") or resource_governor.max_total_workers))
+                applied["resource_governor"] = {"max_total_workers": int(resource_governor.max_total_workers)}
+
+        fb_thresholds = job_context.get("fallback_thresholds")
+        if isinstance(fb_thresholds, dict):
+            fb_cfg = dict(self.pack.get("fallback") or {})
+            if fb_cfg:
+                for key in ("deferral_rate", "hardfail_rate", "timeout_rate"):
+                    if key in fb_cfg and key in fb_thresholds:
+                        fb_thresholds[key] = min(float(fb_thresholds.get(key) or 0.0), float(fb_cfg.get(key) or fb_thresholds.get(key) or 0.0))
+                applied["fallback"] = {k: float(fb_thresholds.get(k) or 0.0) for k in ("deferral_rate", "hardfail_rate", "timeout_rate")}
+        return applied
+
+
 @dataclass
 class ProviderPolicy:
     provider_max_inflight_suggested: Optional[int] = None
@@ -1986,6 +2183,7 @@ def resolve_caps_for_attempt(
     lane_registry: Optional[LaneRegistry],
     learning_engine=None,
     probe_selected: bool = False,
+    policy_pack_clamps: Optional[dict] = None,
 ) -> Tuple[dict, dict]:
     lane = (int((lane_key or (0, ""))[0] or 0), str((lane_key or (0, ""))[1] or "").strip().lower())
     rt = dict(runtime_overrides or {})
@@ -1993,7 +2191,7 @@ def resolve_caps_for_attempt(
     meta: Dict[str, Any] = {
         "lane_key": f"{lane[0]}|{lane[1]}",
         "timestamp": float(now_ts or time.time()),
-        "source_order": ["base", "overrides", "pressure", "health", "learning", "lane_state", "probe"],
+        "source_order": ["base", "overrides", "pressure", "health", "learning", "lane_state", "probe", "policy_pack"],
         "steps": [],
         "lane_state": None,
         "learning": {},
@@ -2080,6 +2278,11 @@ def resolve_caps_for_attempt(
         before = dict(caps)
         _apply_clamps(probe_caps, chunk_key="chunk_size_cap", workers_key="workers_cap", delay_key="delay_floor", sleep_key="sleep_floor")
         _record("probe", before, caps, "probe-selected lane clamp")
+
+    if isinstance(policy_pack_clamps, dict) and policy_pack_clamps:
+        before = dict(caps)
+        _apply_clamps(policy_pack_clamps, chunk_key="chunk_size_cap", workers_key="workers_cap", delay_key="delay_floor", sleep_key="sleep_floor")
+        _record("policy_pack", before, caps, "policy-pack clamp-only")
 
     meta["final"] = dict(caps)
     return caps, meta
@@ -2720,6 +2923,7 @@ class SendJob:
     debug_backoff_jitter: List[dict] = field(default_factory=list)
     debug_rollout: dict = field(default_factory=dict)
     debug_wave_status: dict = field(default_factory=dict)
+    debug_policy_pack: dict = field(default_factory=dict)
     debug_learning_policy: dict = field(default_factory=dict)
     debug_last_lane_pick: dict = field(default_factory=dict)
     debug_last_caps_resolve: dict = field(default_factory=dict)
@@ -3641,6 +3845,7 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "debug_backoff_jitter": (job.debug_backoff_jitter or [])[-50:],
         "debug_rollout": job.debug_rollout or {},
         "debug_wave_status": job.debug_wave_status or {},
+        "debug_policy_pack": job.debug_policy_pack or {},
         "debug_learning_policy": job.debug_learning_policy or {},
         "debug_last_lane_pick": job.debug_last_lane_pick or {},
         "debug_last_caps_resolve": job.debug_last_caps_resolve or {},
@@ -4615,6 +4820,7 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job.debug_backoff_jitter = list(s.get("debug_backoff_jitter") or [])
         job.debug_rollout = (s.get("debug_rollout") if isinstance(s.get("debug_rollout"), dict) else {}) or {}
         job.debug_wave_status = (s.get("debug_wave_status") if isinstance(s.get("debug_wave_status"), dict) else {}) or {}
+        job.debug_policy_pack = (s.get("debug_policy_pack") if isinstance(s.get("debug_policy_pack"), dict) else {}) or {}
         job.debug_learning_policy = (s.get("debug_learning_policy") if isinstance(s.get("debug_learning_policy"), dict) else {}) or {}
         job.debug_last_lane_pick = (s.get("debug_last_lane_pick") if isinstance(s.get("debug_last_lane_pick"), dict) else {}) or {}
         job.debug_last_caps_resolve = (s.get("debug_last_caps_resolve") if isinstance(s.get("debug_last_caps_resolve"), dict) else {}) or {}
@@ -14037,6 +14243,12 @@ def smtp_send_job(
     provider_canon_enabled = bool(get_env_bool("SHIVA_PROVIDER_CANON", False))
     provider_canon_enforce = bool(get_env_bool("SHIVA_PROVIDER_CANON_ENFORCE", False))
     provider_canon_export = bool(get_env_bool("SHIVA_PROVIDER_CANON_EXPORT", False))
+    policy_packs_enabled = bool(get_env_bool("SHIVA_POLICY_PACKS", False))
+    policy_packs_enforce = bool(get_env_bool("SHIVA_POLICY_PACKS_ENFORCE", False))
+    policy_pack_name_default = str(get_env("SHIVA_POLICY_PACK_NAME", "default") or "default").strip().lower() or "default"
+    policy_packs_json = str(get_env("SHIVA_POLICY_PACKS_JSON", "") or "")
+    policy_packs_export = bool(get_env_bool("SHIVA_POLICY_PACKS_EXPORT", False))
+    policy_packs_debug = bool(get_env_bool("SHIVA_POLICY_PACKS_DEBUG", False))
     provider_alias_json = str(get_env("SHIVA_PROVIDER_ALIAS_JSON", "") or "").strip()
     provider_suffix_json = str(get_env("SHIVA_PROVIDER_SUFFIX_JSON", "") or "").strip()
     provider_mx_fingerprint = bool(get_env_bool("SHIVA_PROVIDER_MX_FINGERPRINT", False))
@@ -14200,6 +14412,9 @@ def smtp_send_job(
     if lane_accounting_recon_export:
         with JOBS_LOCK:
             job.debug_lane_accounting = {}
+    if policy_packs_export:
+        with JOBS_LOCK:
+            job.debug_policy_pack = {}
 
     provider_canon = ProviderCanon.from_env(
         enabled=provider_canon_enabled,
@@ -14592,6 +14807,7 @@ def smtp_send_job(
 
         out["urls_list"] = parse_multiline(str(form.get("urls_list") or ""), dedupe_lower=False) or urls_list
         out["src_list"] = parse_multiline(str(form.get("src_list") or ""), dedupe_lower=False) or src_list
+        out["policy_pack_name"] = str(form.get("policy_pack_name") or "").strip().lower()
 
         return out
 
@@ -14982,9 +15198,57 @@ def smtp_send_job(
         ])[0]
         provider_counts = {str(d or "").strip().lower(): int(len(v or [])) for d, v in (provider_buckets or {}).items() if str(d or "").strip()}
         provider_canon.ingest_provider_counts(provider_counts, mx_by_domain={})
+        policy_pack_caps_clamps: Dict[str, dict] = {}
+        policy_pack_snapshot: dict = {}
+        selected_pack: dict = {}
+        policy_applier: Optional[PolicyPackApplier] = None
+        pack_provider_keys: Set[str] = set()
 
         def _lane_budget_key(lane_key: Tuple[int, str]) -> Tuple[int, str]:
             return provider_canon.lane_provider_key(lane_key)
+
+        if policy_packs_enabled:
+            form_policy = db_get_campaign_form_raw(job.campaign_id) if job.campaign_id else {}
+            requested_pack = str((form_policy.get("policy_pack_name") if isinstance(form_policy, dict) else "") or policy_pack_name_default or "default").strip().lower() or "default"
+            packs = PolicyPackLoader.load(policy_packs_json, requested_pack)
+            selected_pack = dict(packs.get(requested_pack) or packs.get(policy_pack_name_default) or packs.get("default") or {})
+            policy_applier = PolicyPackApplier(selected_pack, enforce=policy_packs_enforce)
+            for provider_domain in provider_counts.keys():
+                dom = str(provider_domain or "").strip().lower()
+                if not dom:
+                    continue
+                if provider_canon.enforce:
+                    pack_provider_keys.add(provider_canon.group_for_domain(dom))
+                else:
+                    pack_provider_keys.add(dom)
+                    grp = provider_canon.group_for_domain(dom)
+                    if grp:
+                        pack_provider_keys.add(grp)
+            pack_provider_keys.add("other")
+            recommendations = policy_applier.compute_recommendations({"provider_keys": sorted(pack_provider_keys)})
+            applied_overrides = policy_applier.apply_job_local_overrides({
+                "provider_keys": sorted(pack_provider_keys),
+                "budget_config": budget_config,
+                "policy_pack_caps_clamps": policy_pack_caps_clamps,
+                "resource_governor": resource_governor,
+            }) if policy_packs_enforce else {}
+            policy_pack_snapshot = {
+                "pack_name": requested_pack,
+                "enforce": bool(policy_packs_enforce),
+                "provider_defaults": dict(recommendations.get("provider_defaults") or {}),
+                "applied_overrides": dict(applied_overrides or {}),
+                "notes": [
+                    "recommendation_only" if not policy_packs_enforce else "enforce_clamp_only",
+                    "job_local_only",
+                    "no_env_mutation",
+                ],
+            }
+            if policy_packs_debug:
+                with JOBS_LOCK:
+                    job.log("INFO", f"PolicyPack: name={requested_pack} enforce={int(policy_packs_enforce)} providers={','.join(sorted(pack_provider_keys))}")
+            if policy_packs_export:
+                with JOBS_LOCK:
+                    job.debug_policy_pack = dict(policy_pack_snapshot)
 
         if provider_canon.enabled and provider_canon.export:
             with JOBS_LOCK:
@@ -15087,15 +15351,34 @@ def smtp_send_job(
 
         fallback_exception_count = 0
         fallback_controller_runtime = bool(fallback_controller_enabled or lane_v2_rollout_enabled)
+        fallback_thresholds = {
+            "deferral_rate": fallback_deferral_rate,
+            "hardfail_rate": fallback_hardfail_rate,
+            "timeout_rate": fallback_timeout_rate,
+            "blocked_per_min": fallback_blocked_per_min,
+            "pmta_pressure_level": fallback_pmta_pressure_level,
+            "exceptions_per_min": 3.0,
+        }
+        if policy_packs_enabled and policy_packs_enforce and policy_applier:
+            _pp_applied_late = policy_applier.apply_job_local_overrides({
+                "provider_keys": sorted(pack_provider_keys),
+                "wave_controller": wave_controller,
+                "resource_governor": resource_governor,
+                "fallback_thresholds": fallback_thresholds,
+            })
+            if isinstance(policy_pack_snapshot, dict):
+                merged = dict(policy_pack_snapshot.get("applied_overrides") or {})
+                for k, v in (_pp_applied_late or {}).items():
+                    if isinstance(v, dict):
+                        merged.setdefault(k, {}).update(v)
+                    else:
+                        merged[k] = v
+                policy_pack_snapshot["applied_overrides"] = merged
+                if policy_packs_export:
+                    with JOBS_LOCK:
+                        job.debug_policy_pack = dict(policy_pack_snapshot)
         fallback_controller = FallbackController(
-            thresholds={
-                "deferral_rate": fallback_deferral_rate,
-                "hardfail_rate": fallback_hardfail_rate,
-                "timeout_rate": fallback_timeout_rate,
-                "blocked_per_min": fallback_blocked_per_min,
-                "pmta_pressure_level": fallback_pmta_pressure_level,
-                "exceptions_per_min": 3.0,
-            },
+            thresholds=fallback_thresholds,
             window_s=fallback_window_s,
             debug=fallback_debug,
             disable_reenable=fallback_disable_reenable,
@@ -15645,6 +15928,11 @@ def smtp_send_job(
                     lane_registry=lane_registry,
                     learning_engine=learning_caps,
                     probe_selected=bool(probe_selected_this_iteration),
+                    policy_pack_clamps=(
+                        policy_pack_caps_clamps.get(provider_canon.group_for_domain(target_domain))
+                        if provider_canon.enforce
+                        else (policy_pack_caps_clamps.get(str(target_domain or "").strip().lower()) or policy_pack_caps_clamps.get(provider_canon.group_for_domain(target_domain)))
+                    ),
                 )
                 cs = int(effective_caps.get("chunk_size") or cs)
                 workers2 = int(effective_caps.get("thread_workers") or workers2)
@@ -16654,6 +16942,18 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "Fallback provider-group key for unmatched domains."},
     {"key": "SHIVA_PROVIDER_CANON_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Emit concise provider canonicalization debug logs (raw domain + canonical group)."},
+    {"key": "SHIVA_POLICY_PACKS", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Enable provider policy-pack recommendation engine (job-local, additive; no behavior change unless enforce=1)."},
+    {"key": "SHIVA_POLICY_PACKS_ENFORCE", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Apply policy-pack clamp-only enforcement (never increases aggressiveness)."},
+    {"key": "SHIVA_POLICY_PACK_NAME", "type": "str", "default": "default", "group": "Scheduler", "restart_required": False,
+     "desc": "Policy-pack name to use when packs are enabled (campaign_form.policy_pack_name can override per job)."},
+    {"key": "SHIVA_POLICY_PACKS_JSON", "type": "str", "default": "", "group": "Scheduler", "restart_required": False,
+     "desc": "Optional JSON object defining named provider policy packs; invalid/missing JSON falls back to built-in safe defaults."},
+    {"key": "SHIVA_POLICY_PACKS_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Export policy-pack snapshot into job debug payload as debug_policy_pack."},
+    {"key": "SHIVA_POLICY_PACKS_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Enable concise policy-pack decision logs for selected pack and provider scope."},
     {"key": "SHIVA_SINGLE_DOMAIN_WAVES", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Enable single-provider-domain wave pacing mode (provider-wide token bucket + deterministic stagger)."},
     {"key": "SHIVA_SINGLE_DOMAIN_WAVES_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
