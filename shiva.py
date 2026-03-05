@@ -14401,6 +14401,24 @@ def _smtp_connect(
     return server
 
 
+def _coerce_scalar_number(value: Any, *, as_type: str, default: Any) -> Any:
+    """Coerce potentially list-like values into a scalar int/float safely."""
+    try:
+        v = value
+        if isinstance(v, (list, tuple)):
+            if not v:
+                return default
+            v = v[0]
+        s = str(v).strip()
+        if not s:
+            return default
+        if as_type == "int":
+            return int(float(s)) if "." in s else int(s)
+        return float(s)
+    except Exception:
+        return default
+
+
 def smtp_send_job(
     job_id: str,
     smtp_host: str,
@@ -14436,6 +14454,13 @@ def smtp_send_job(
     - Live settings sync (phase 1): before each chunk + each retry, we read campaign_form from SQLite and apply
       delay/workers/sleep/spam_threshold + sender/subject/body lists.
     """
+
+    smtp_port = _coerce_scalar_number(smtp_port, as_type="int", default=2525)
+    smtp_timeout = _coerce_scalar_number(smtp_timeout, as_type="int", default=25)
+    delay_s = _coerce_scalar_number(delay_s, as_type="float", default=0.0)
+    chunk_size = _coerce_scalar_number(chunk_size, as_type="int", default=50)
+    thread_workers = _coerce_scalar_number(thread_workers, as_type="int", default=5)
+    sleep_chunks = _coerce_scalar_number(sleep_chunks, as_type="float", default=0.0)
 
     with JOBS_LOCK:
         job = JOBS.get(job_id)
