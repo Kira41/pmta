@@ -671,6 +671,217 @@ class LaneMetrics:
         self._lanes = {}
 
 
+class LaneRegistry:
+    """Read-only lane state machine (HEALTHY/THROTTLED/QUARANTINED/INFRA_FAIL).
+
+    This registry is intentionally non-enforcing in this phase. It computes per-lane state,
+    next_allowed_ts, and recommended caps from LaneMetrics + blocked/backoff signals and only
+    exports debug snapshots.
+    """
+
+    def __init__(self, thresholds: Optional[dict], quarantine_base_s: int, quarantine_max_s: int):
+        self.thresholds = self._normalize_thresholds(thresholds or {})
+        self.quarantine_base_s = max(1, int(quarantine_base_s or 120))
+        self.quarantine_max_s = max(self.quarantine_base_s, int(quarantine_max_s or 1800))
+        self._lanes: Dict[str, dict] = {}
+        self._quarantine_decay_s = 1800.0
+
+    def _lane_id(self, lane_key: Tuple[int, str]) -> str:
+        sender_idx, provider_domain = lane_key
+        return f"{int(sender_idx)}|{str(provider_domain or '').strip().lower()}"
+
+    def _normalize_thresholds(self, raw: dict) -> dict:
+        defaults = {
+            "timeout_rate_infra": 0.05,
+            "hardfail_rate_quarantine": 0.02,
+            "deferral_rate_quarantine": 0.30,
+            "deferral_rate_throttled": 0.15,
+            "throttle_workers_mul": 0.50,
+            "throttle_chunk_mul": 0.60,
+            "throttle_delay_mul": 1.50,
+        }
+        out = dict(defaults)
+
+        def _clamp_rate(v: Any, d: float) -> float:
+            try:
+                return min(1.0, max(0.0, float(v)))
+            except Exception:
+                return d
+
+        def _clamp_mul(v: Any, d: float, lo: float, hi: float) -> float:
+            try:
+                return min(hi, max(lo, float(v)))
+            except Exception:
+                return d
+
+        out["timeout_rate_infra"] = _clamp_rate(raw.get("timeout_rate_infra"), defaults["timeout_rate_infra"])
+        out["hardfail_rate_quarantine"] = _clamp_rate(raw.get("hardfail_rate_quarantine"), defaults["hardfail_rate_quarantine"])
+        out["deferral_rate_quarantine"] = _clamp_rate(raw.get("deferral_rate_quarantine"), defaults["deferral_rate_quarantine"])
+        out["deferral_rate_throttled"] = _clamp_rate(raw.get("deferral_rate_throttled"), defaults["deferral_rate_throttled"])
+        if out["deferral_rate_throttled"] > out["deferral_rate_quarantine"]:
+            out["deferral_rate_throttled"] = out["deferral_rate_quarantine"]
+        out["throttle_workers_mul"] = _clamp_mul(raw.get("throttle_workers_mul"), defaults["throttle_workers_mul"], 0.1, 1.0)
+        out["throttle_chunk_mul"] = _clamp_mul(raw.get("throttle_chunk_mul"), defaults["throttle_chunk_mul"], 0.1, 1.0)
+        out["throttle_delay_mul"] = _clamp_mul(raw.get("throttle_delay_mul"), defaults["throttle_delay_mul"], 1.0, 5.0)
+        return out
+
+    def ensure_lane(self, lane_key: Tuple[int, str], sender_label: str = "", provider_domain: str = "") -> dict:
+        lid = self._lane_id(lane_key)
+        lane = self._lanes.get(lid)
+        if lane is None:
+            lane = {
+                "sender_idx": int(lane_key[0] or 0),
+                "sender_label": str(sender_label or "").strip(),
+                "provider_domain": str(provider_domain or lane_key[1] or "").strip().lower(),
+                "state": "HEALTHY",
+                "last_state_change_ts": 0.0,
+                "next_allowed_ts": 0.0,
+                "last_reason": "init",
+                "recommended_caps": {},
+                "deferral_rate": 0.0,
+                "hardfail_rate": 0.0,
+                "timeout_rate": 0.0,
+                "recent_error_samples": [],
+                "blocked_events": 0,
+                "blocked_reasons": deque(maxlen=5),
+                "last_backoff": {"wait_s": 0.0, "failure_type": ""},
+                "infra_fail_hits": 0,
+                "quarantine_hits": 0,
+                "last_quarantine_ts": 0.0,
+            }
+            self._lanes[lid] = lane
+        else:
+            if sender_label:
+                lane["sender_label"] = str(sender_label).strip()
+            if provider_domain:
+                lane["provider_domain"] = str(provider_domain).strip().lower()
+        return lane
+
+    def _build_caps(self, state: str, base_caps_hint: Optional[dict]) -> dict:
+        base = base_caps_hint if isinstance(base_caps_hint, dict) else {}
+        base_workers = max(1, int(base.get("workers") or 1))
+        base_chunk = max(1, int(base.get("chunk_size") or 100))
+        base_delay = max(0.0, float(base.get("delay_s") or 0.0))
+        base_sleep = max(0.0, float(base.get("sleep_chunks") or 0.0))
+
+        if state == "HEALTHY":
+            return {
+                "chunk_size_cap": None,
+                "workers_cap": None,
+                "delay_floor": None,
+                "sleep_floor": None,
+            }
+        if state == "INFRA_FAIL":
+            return {
+                "chunk_size_cap": 50,
+                "workers_cap": 1,
+                "delay_floor": max(1.0, base_delay),
+                "sleep_floor": max(base_sleep, base_sleep + 2.0),
+            }
+
+        workers_cap = max(1, int(math.floor(base_workers * float(self.thresholds.get("throttle_workers_mul") or 0.5))))
+        chunk_cap = max(50, int(math.floor(base_chunk * float(self.thresholds.get("throttle_chunk_mul") or 0.6))))
+        delay_mul = float(self.thresholds.get("throttle_delay_mul") or 1.5)
+        return {
+            "chunk_size_cap": chunk_cap,
+            "workers_cap": workers_cap,
+            "delay_floor": max(base_delay * delay_mul, base_delay + 0.3),
+            "sleep_floor": max(base_sleep, base_sleep + 1.0),
+        }
+
+    def _derive_state(self, lane: dict, metrics: dict) -> Tuple[str, str]:
+        d = float(metrics.get("deferral_rate") or 0.0)
+        h = float(metrics.get("hardfail_rate") or 0.0)
+        t = float(metrics.get("timeout_rate") or 0.0)
+        backoff_type = str((lane.get("last_backoff") or {}).get("failure_type") or "").strip().lower()
+        blocked_recent = len(lane.get("blocked_reasons") or []) > 0
+        if t >= float(self.thresholds.get("timeout_rate_infra") or 0.05):
+            return "INFRA_FAIL", f"timeout_rate={t:.3f}"
+        if any(x in backoff_type for x in ("timeout", "connect", "connection", "auth")) and (t >= 0.02 or blocked_recent):
+            return "INFRA_FAIL", f"backoff_type={backoff_type or 'infra'}"
+        if h >= float(self.thresholds.get("hardfail_rate_quarantine") or 0.02):
+            return "QUARANTINED", f"hardfail_rate={h:.3f}"
+        if d >= float(self.thresholds.get("deferral_rate_quarantine") or 0.30):
+            return "QUARANTINED", f"deferral_rate={d:.3f}"
+        if d >= float(self.thresholds.get("deferral_rate_throttled") or 0.15):
+            return "THROTTLED", f"deferral_rate={d:.3f}"
+        return "HEALTHY", "within_thresholds"
+
+    def update_from_metrics(self, now_ts: float, lane_key: Tuple[int, str], lane_metrics_snapshot_for_lane: dict, base_caps_hint: Optional[dict] = None) -> None:
+        lane = self.ensure_lane(lane_key, provider_domain=str(lane_key[1] or ""))
+        snap = lane_metrics_snapshot_for_lane if isinstance(lane_metrics_snapshot_for_lane, dict) else {}
+        lane["deferral_rate"] = float(snap.get("deferral_rate") or 0.0)
+        lane["hardfail_rate"] = float(snap.get("hardfail_rate") or 0.0)
+        lane["timeout_rate"] = float(snap.get("timeout_rate") or 0.0)
+        lane["recent_error_samples"] = list(snap.get("last_error_samples") or [])[-5:]
+        lane["blocked_events"] = int(snap.get("blocked_events") or lane.get("blocked_events") or 0)
+        lane["last_backoff"] = dict(snap.get("last_backoff") or lane.get("last_backoff") or {"wait_s": 0.0, "failure_type": ""})
+
+        next_state, reason = self._derive_state(lane, snap)
+        prev_state = str(lane.get("state") or "HEALTHY")
+        if next_state != prev_state:
+            lane["state"] = next_state
+            lane["last_state_change_ts"] = float(now_ts or time.time())
+            lane["last_reason"] = str(reason or "")[:200]
+            if next_state == "QUARANTINED":
+                if (float(now_ts or 0.0) - float(lane.get("last_quarantine_ts") or 0.0)) > self._quarantine_decay_s:
+                    lane["quarantine_hits"] = 0
+                lane["quarantine_hits"] = int(lane.get("quarantine_hits") or 0) + 1
+                lane["last_quarantine_ts"] = float(now_ts or 0.0)
+                wait_s = min(self.quarantine_max_s, self.quarantine_base_s * (2 ** max(0, int(lane.get("quarantine_hits") or 1) - 1)))
+                lane["next_allowed_ts"] = float(now_ts or 0.0) + float(wait_s)
+            elif next_state == "INFRA_FAIL":
+                lane["infra_fail_hits"] = int(lane.get("infra_fail_hits") or 0) + 1
+                wait_s = min(self.quarantine_max_s, self.quarantine_base_s * (2 ** max(0, int(lane.get("infra_fail_hits") or 1) - 1)))
+                lane["next_allowed_ts"] = float(now_ts or 0.0) + float(wait_s)
+            else:
+                lane["next_allowed_ts"] = 0.0
+        else:
+            lane["last_reason"] = str(reason or lane.get("last_reason") or "")[:200]
+            if next_state not in {"QUARANTINED", "INFRA_FAIL"}:
+                lane["next_allowed_ts"] = 0.0
+
+        lane["recommended_caps"] = self._build_caps(next_state, base_caps_hint)
+
+    def set_signal_blocked(self, lane_key: Tuple[int, str], reason: str) -> None:
+        lane = self.ensure_lane(lane_key, provider_domain=str(lane_key[1] or ""))
+        lane["blocked_events"] = int(lane.get("blocked_events") or 0) + 1
+        lane["blocked_reasons"].append(str(reason or "blocked")[:160])
+
+    def set_signal_backoff(self, lane_key: Tuple[int, str], wait_s: float, failure_type: str) -> None:
+        lane = self.ensure_lane(lane_key, provider_domain=str(lane_key[1] or ""))
+        lane["last_backoff"] = {"wait_s": float(wait_s or 0.0), "failure_type": str(failure_type or "")[:80]}
+
+    def get_lane_info(self, lane_key: Tuple[int, str]) -> dict:
+        lane = self.ensure_lane(lane_key, provider_domain=str(lane_key[1] or ""))
+        return {
+            "sender_idx": int(lane.get("sender_idx") or 0),
+            "sender_label": str(lane.get("sender_label") or ""),
+            "provider_domain": str(lane.get("provider_domain") or ""),
+            "state": str(lane.get("state") or "HEALTHY"),
+            "last_state_change_ts": float(lane.get("last_state_change_ts") or 0.0),
+            "next_allowed_ts": float(lane.get("next_allowed_ts") or 0.0),
+            "last_reason": str(lane.get("last_reason") or ""),
+            "recommended_caps": dict(lane.get("recommended_caps") or {}),
+            "deferral_rate": float(lane.get("deferral_rate") or 0.0),
+            "hardfail_rate": float(lane.get("hardfail_rate") or 0.0),
+            "timeout_rate": float(lane.get("timeout_rate") or 0.0),
+            "recent_error_samples": list(lane.get("recent_error_samples") or []),
+            "blocked_events": int(lane.get("blocked_events") or 0),
+            "last_backoff": dict(lane.get("last_backoff") or {}),
+            "quarantine_hits": int(lane.get("quarantine_hits") or 0),
+            "infra_fail_hits": int(lane.get("infra_fail_hits") or 0),
+        }
+
+    def snapshot(self) -> dict:
+        return {
+            "thresholds": dict(self.thresholds),
+            "quarantine_base_s": int(self.quarantine_base_s),
+            "quarantine_max_s": int(self.quarantine_max_s),
+            "lanes": {lid: self.get_lane_info((int(v.get("sender_idx") or 0), str(v.get("provider_domain") or ""))) for lid, v in self._lanes.items()},
+        }
+
+
 def map_provider_domains_to_sender_indexes(provider_domains: List[str], sender_emails: List[str]) -> Dict[str, int]:
     """Distribute provider domains evenly across sender emails.
 
@@ -749,6 +960,7 @@ class SendJob:
     # Scheduler baseline snapshot (optional; debug-only, additive)
     debug_baseline_report: dict = field(default_factory=dict)
     debug_lane_metrics_snapshot: dict = field(default_factory=dict)
+    debug_lane_states_snapshot: dict = field(default_factory=dict)
 
     # PMTA diagnostics snapshot (optional; helps classify failures quickly)
     pmta_diag: dict = field(default_factory=dict)
@@ -1655,6 +1867,7 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "pmta_pressure_ts": job.pmta_pressure_ts or "",
         "debug_baseline_report": job.debug_baseline_report or {},
         "lane_metrics": job.debug_lane_metrics_snapshot or {},
+        "lane_states": job.debug_lane_states_snapshot or {},
         "pmta_diag": job.pmta_diag or {},
         "pmta_diag_ts": job.pmta_diag_ts or "",
         "created_at": job.created_at,
@@ -2394,6 +2607,7 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job.pmta_pressure_ts = str(s.get("pmta_pressure_ts") or "")
         job.debug_baseline_report = (s.get("debug_baseline_report") if isinstance(s.get("debug_baseline_report"), dict) else {}) or {}
         job.debug_lane_metrics_snapshot = (s.get("lane_metrics") if isinstance(s.get("lane_metrics"), dict) else {}) or {}
+        job.debug_lane_states_snapshot = (s.get("lane_states") if isinstance(s.get("lane_states"), dict) else {}) or {}
         job.pmta_diag = (s.get("pmta_diag") if isinstance(s.get("pmta_diag"), dict) else {}) or {}
         job.pmta_diag_ts = str(s.get("pmta_diag_ts") or "")
         job.updated_at = str(s.get("updated_at") or "")
@@ -11623,11 +11837,36 @@ def smtp_send_job(
     lane_metrics_window = max(1, int(get_env_int("SHIVA_LANE_METRICS_WINDOW", 200)))
     lane_metrics_use_ema = bool(get_env_bool("SHIVA_LANE_METRICS_EMA", True))
     lane_metrics_export = bool(get_env_bool("SHIVA_LANE_METRICS_EXPORT", False))
+    lane_registry_enabled = bool(get_env_bool("SHIVA_LANE_REGISTRY", False))
+    lane_state_export = bool(get_env_bool("SHIVA_LANE_STATE_EXPORT", False))
+    lane_thresholds_raw = str(get_env("SHIVA_LANE_THRESHOLDS_JSON", "") or "").strip()
+    lane_quarantine_base_s = max(1, int(get_env_int("SHIVA_LANE_QUARANTINE_BASE_S", 120)))
+    lane_quarantine_max_s = max(lane_quarantine_base_s, int(get_env_int("SHIVA_LANE_QUARANTINE_MAX_S", 1800)))
     lane_metrics = LaneMetrics(window=lane_metrics_window, use_ema=lane_metrics_use_ema) if lane_metrics_enabled else None
+
+    lane_thresholds_override = {}
+    if lane_thresholds_raw:
+        try:
+            parsed = json.loads(lane_thresholds_raw)
+            if isinstance(parsed, dict):
+                lane_thresholds_override = parsed
+            else:
+                job.log("WARN", "SHIVA_LANE_THRESHOLDS_JSON ignored: expected JSON object")
+        except Exception as e:
+            job.log("WARN", f"SHIVA_LANE_THRESHOLDS_JSON parse failed: {e}")
+
+    lane_registry = LaneRegistry(
+        thresholds=lane_thresholds_override,
+        quarantine_base_s=lane_quarantine_base_s,
+        quarantine_max_s=lane_quarantine_max_s,
+    ) if lane_registry_enabled else None
 
     if lane_metrics_export:
         with JOBS_LOCK:
             job.debug_lane_metrics_snapshot = {}
+    if lane_state_export:
+        with JOBS_LOCK:
+            job.debug_lane_states_snapshot = {}
 
     def _lane_key(sender_idx: int, provider_domain: str) -> Tuple[int, str]:
         return (int(sender_idx or 0), str(provider_domain or "").strip().lower())
@@ -11678,12 +11917,21 @@ def smtp_send_job(
             "error_signatures": signatures[:5],
         }
 
-    def _lane_metrics_export_snapshot() -> None:
-        if not (lane_metrics and lane_metrics_export):
+    def _lane_registry_update(now_ts: float, lane_key: Tuple[int, str], base_caps_hint: Optional[dict] = None) -> None:
+        if not (lane_registry and lane_metrics):
             return
-        snap = lane_metrics.snapshot()
-        with JOBS_LOCK:
-            job.debug_lane_metrics_snapshot = snap
+        lane_id = f"{int(lane_key[0] or 0)}|{str(lane_key[1] or '').strip().lower()}"
+        lane_snap = ((lane_metrics.snapshot().get("lanes") or {}).get(lane_id) if lane_metrics else None) or {}
+        lane_registry.update_from_metrics(now_ts, lane_key, lane_snap, base_caps_hint=base_caps_hint)
+
+    def _lane_metrics_export_snapshot() -> None:
+        if lane_metrics and lane_metrics_export:
+            snap = lane_metrics.snapshot()
+            with JOBS_LOCK:
+                job.debug_lane_metrics_snapshot = snap
+        if lane_registry and lane_state_export:
+            with JOBS_LOCK:
+                job.debug_lane_states_snapshot = lane_registry.snapshot()
 
     smtp_host_ips = _resolve_ipv4(smtp_host) if smtp_host else []
 
@@ -12415,6 +12663,16 @@ def smtp_send_job(
                     sender_email=sender_email_for_lane,
                     sender_domain=sender_domain_for_lane,
                 )
+                _lane_registry_update(
+                    time.time(),
+                    _lane_key(sender_idx_fixed, target_domain),
+                    base_caps_hint={
+                        "chunk_size": cs,
+                        "workers": workers2,
+                        "delay_s": delay2,
+                        "sleep_chunks": sleep2,
+                    },
+                )
 
             chunk_url = _cyclic_pick(urls2, chunk_idx_local)
             chunk_src = _cyclic_pick(src2, chunk_idx_local)
@@ -12643,6 +12901,18 @@ def smtp_send_job(
                             sender_email=fe,
                             sender_domain=active_sender_domain,
                         )
+                        if lane_registry:
+                            lane_registry.set_signal_blocked(_lane_key(sender_idx_fixed, target_domain), pmta_reason or "pmta policy block")
+                        _lane_registry_update(
+                            time.time(),
+                            _lane_key(sender_idx_fixed, target_domain),
+                            base_caps_hint={
+                                "chunk_size": cs,
+                                "workers": workers2,
+                                "delay_s": delay2,
+                                "sleep_chunks": sleep2,
+                            },
+                        )
 
                 blocked = spam_blocked or blacklist_blocked or pmta_blocked
                 failure_type, intervention = _classify_backoff_failure(
@@ -12768,6 +13038,18 @@ def smtp_send_job(
                             sender_email=fe,
                             sender_domain=active_sender_domain,
                         )
+                        if lane_registry:
+                            lane_registry.set_signal_backoff(_lane_key(sender_idx_fixed, target_domain), wait_s, failure_type)
+                        _lane_registry_update(
+                            time.time(),
+                            _lane_key(sender_idx_fixed, target_domain),
+                            base_caps_hint={
+                                "chunk_size": cs,
+                                "workers": workers2,
+                                "delay_s": delay2,
+                                "sleep_chunks": sleep2,
+                            },
+                        )
                         _lane_metrics_export_snapshot()
 
                     retry_queue = provider_retry_chunks.setdefault(target_key, [])
@@ -12831,6 +13113,16 @@ def smtp_send_job(
                         _lane_chunk_result_from_recent(recent_slice, len(chunk)),
                         sender_email=fe,
                         sender_domain=active_sender_domain,
+                    )
+                    _lane_registry_update(
+                        time.time(),
+                        _lane_key(sender_idx_fixed, target_domain),
+                        base_caps_hint={
+                            "chunk_size": cs,
+                            "workers": workers2,
+                            "delay_s": delay2,
+                            "sleep_chunks": sleep2,
+                        },
                     )
                     _lane_metrics_export_snapshot()
                 db_log_email_attempt(
@@ -13048,6 +13340,16 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "Compatibility flag for lane metrics smoothing mode (rolling window implementation is used in this phase)."},
     {"key": "SHIVA_LANE_METRICS_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Export lane metrics snapshot into job debug payload as additive field lane_metrics."},
+    {"key": "SHIVA_LANE_REGISTRY", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Enable read-only lane registry/state machine updates from lane metrics and blocked/backoff signals."},
+    {"key": "SHIVA_LANE_STATE_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Export lane state snapshot into job debug payload as additive field lane_states."},
+    {"key": "SHIVA_LANE_THRESHOLDS_JSON", "type": "str", "default": "", "group": "Scheduler", "restart_required": False,
+     "desc": "Optional JSON overrides for lane state thresholds/multipliers (safe-parse, clamped)."},
+    {"key": "SHIVA_LANE_QUARANTINE_BASE_S", "type": "int", "default": "120", "group": "Scheduler", "restart_required": False,
+     "desc": "Base quarantine seconds used by read-only lane state machine for QUARANTINED/INFRA_FAIL transitions."},
+    {"key": "SHIVA_LANE_QUARANTINE_MAX_S", "type": "int", "default": "1800", "group": "Scheduler", "restart_required": False,
+     "desc": "Maximum quarantine seconds cap used by read-only lane state machine."},
 
     # App (restart-only)
     {"key": "SHIVA_HOST", "type": "str", "default": "0.0.0.0", "group": "App", "restart_required": True,
