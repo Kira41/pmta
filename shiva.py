@@ -7076,17 +7076,16 @@ PAGE_JOBS = r"""
     .filterToggleBtn{
       position: fixed;
       top: 86px;
-      right: -34px;
+      right: 14px;
       z-index: 45;
-      border-radius: 999px 0 0 999px;
-      padding: 11px 16px 11px 12px;
+      border-radius: 999px;
+      padding: 11px 12px;
       box-shadow: var(--shadow);
       background: rgba(10,16,34,.95);
       border: 1px solid rgba(255,255,255,.24);
-      border-right: 0;
-      transition: right .2s ease;
+      transition: opacity .2s ease;
     }
-    body.filterMenuOpen .filterToggleBtn{ right: 14px; border-radius: 999px; border-right:1px solid rgba(255,255,255,.24); }
+    body.filterMenuOpen .filterToggleBtn{ opacity:.92; }
 
     .filterDrawerBackdrop{
       position: fixed;
@@ -7236,6 +7235,14 @@ PAGE_JOBS = r"""
     .moreBlock{margin-top:10px;}
     .errorFold{margin-top:12px; margin-left:10px;}
     .errorFold summary{cursor:pointer; color:rgba(255,255,255,.75); font-size:12px;}
+    .errorSummaryBox{
+      margin-top:8px;
+      border:1px solid rgba(255,94,115,.45);
+      background: rgba(90,18,32,.36);
+      border-radius:10px;
+      padding:9px 10px;
+      color: rgba(255,206,214,.95);
+    }
 
     /* PMTA Live Panel (Jobs) — clearer layout */
     .pmtaLive{ margin-top:10px; }
@@ -7589,6 +7596,8 @@ PAGE_JOBS = r"""
             <div class="pmtaLive" data-k="pmtaLine">—</div>
             <div class="mini" style="margin-top:6px" data-k="pmtaNote">Note: <b>sent</b> = accepted by PMTA (client-side). Delivery may still be queued/deferred.</div>
             <div class="chunkMeta" style="margin-top:6px" data-k="pmtaDiag"><span class="chunkMetaPill">Diag: —</span></div>
+            <div class="mini" style="margin-top:8px"><b>Error summary</b></div>
+            <div class="mini errorSummaryBox" data-k="pmtaErrorSummary">—</div>
           </div>
 
           <details class="qualityMini">
@@ -7676,17 +7685,15 @@ PAGE_JOBS = r"""
                 <div class="mini" style="margin-top:8px" data-k="integrityDetails">—</div>
               </details>
 
-              <details class="errorFold" style="margin-top:8px">
-                <summary>Legacy quality + errors (unchanged data)</summary>
-                <div class="mini" style="margin-top:8px" data-k="counters">—</div>
-                <div class="mini" style="margin-top:8px"><b>Error type</b></div>
-                <div class="mini" data-k="errorTypes">—</div>
-                <div class="mini" style="margin-top:8px"><b>Error summary</b></div>
-                <div class="mini" data-k="lastErrors">—</div>
-                <div class="mini" style="margin-top:8px" data-k="lastErrors2">—</div>
-                <div class="mini" style="margin-top:8px" data-k="internalErrors">—</div>
-                <div class="mini" style="margin-top:8px" data-k="bridgeReceiver">—</div>
-              </details>
+              <div class="mini" style="margin-top:12px"><b>Legacy quality + errors (unchanged data)</b></div>
+              <div class="mini" style="margin-top:8px" data-k="counters">—</div>
+              <div class="mini" style="margin-top:8px"><b>Error type</b></div>
+              <div class="mini" data-k="errorTypes">—</div>
+              <div class="mini" style="margin-top:8px"><b>Error summary</b></div>
+              <div class="mini" data-k="lastErrors">—</div>
+              <div class="mini" style="margin-top:8px" data-k="lastErrors2">—</div>
+              <div class="mini" style="margin-top:8px" data-k="internalErrors">—</div>
+              <div class="mini" style="margin-top:8px" data-k="bridgeReceiver">—</div>
             </div>
 
           </div>
@@ -8343,36 +8350,40 @@ This will remove it from Jobs history.`);
 
     // Error 1 (summary): latest status keyword from PMTA (bounced/deferred/complained/blocked/backoff...)
     const el2 = qk(card,'lastErrors');
+    const pmtaErrorSummaryEl = qk(card,'pmtaErrorSummary');
+    let errorSummaryLine1 = '—';
     if(el2){
       if(!latestError){
         if(hasOutcomeFailures){
           if(bouncedN + complainedN > 0){
-            el2.innerHTML = `• [5XX*] bounced/complained · count=${esc(String(bouncedN + complainedN))}`;
+            errorSummaryLine1 = `• [5XX*] bounced/complained · count=${esc(String(bouncedN + complainedN))}`;
           }else{
-            el2.innerHTML = `• [4XX*] deferred · count=${esc(String(deferredN))}`;
+            errorSummaryLine1 = `• [4XX*] deferred · count=${esc(String(deferredN))}`;
           }
         }else{
-          el2.textContent = '—';
+          errorSummaryLine1 = '—';
         }
       }
       else{
         const detail = (latestError.detail || '').toString();
         const code = pickErrorCode(detail) || ((latestError.kind === 'temporary_error') ? '4XX' : '5XX');
         const summary = pickErrorSummary(latestError) || shortWords(detail, 4) || 'unknown';
-        el2.innerHTML = `• [${esc(code)}] ${esc(summary)}`;
+        errorSummaryLine1 = `• [${esc(code)}] ${esc(summary)}`;
       }
+      el2.innerHTML = errorSummaryLine1;
     }
 
     // Error 2 (details): latest full PowerMTA response detail
     const el3 = qk(card,'lastErrors2');
+    let errorSummaryLine2 = '';
     if(el3){
       if(!latestError){
         if(hasOutcomeFailures){
           const mode = ((j.bridge_mode || '').toString().toLowerCase() || 'counts');
           const src = (mode === 'legacy') ? 'event ingestion' : 'bridge snapshot';
-          el3.innerHTML = `• aggregate outcomes present (bounced=${esc(String(bouncedN))} · deferred=${esc(String(deferredN))} · complained=${esc(String(complainedN))}) · source=${esc(src)} · no per-recipient SMTP detail in this mode`;
+          errorSummaryLine2 = `• aggregate outcomes present (bounced=${esc(String(bouncedN))} · deferred=${esc(String(deferredN))} · complained=${esc(String(complainedN))}) · source=${esc(src)} · no per-recipient SMTP detail in this mode`;
         }else{
-          el3.textContent = '—';
+          errorSummaryLine2 = '';
         }
       }
       else{
@@ -8380,8 +8391,13 @@ This will remove it from Jobs history.`);
         const kind = (latestError.kind || '').toString();
         const code = pickErrorCode(latestError.detail || '');
         const codePart = code ? ` · code=${esc(code)}` : '';
-        el3.innerHTML = `• ${esc(latestError.email || '—')} · type=${esc(typ || 'unknown')} · kind=${esc(kind || 'unknown')}${codePart} · ${esc(latestError.detail || '')}`;
+        errorSummaryLine2 = `• ${esc(latestError.email || '—')} · type=${esc(typ || 'unknown')} · kind=${esc(kind || 'unknown')}${codePart} · ${esc(latestError.detail || '')}`;
       }
+      el3.innerHTML = errorSummaryLine2 || '—';
+    }
+
+    if(pmtaErrorSummaryEl){
+      pmtaErrorSummaryEl.innerHTML = [errorSummaryLine1 || '—', errorSummaryLine2 || ''].filter(Boolean).join('<br>');
     }
 
     function isNetworkInternalError(x){
