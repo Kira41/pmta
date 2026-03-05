@@ -11839,6 +11839,14 @@ def smtp_send_job(
     lane_metrics_export = bool(get_env_bool("SHIVA_LANE_METRICS_EXPORT", False))
     lane_registry_enabled = bool(get_env_bool("SHIVA_LANE_REGISTRY", False))
     lane_state_export = bool(get_env_bool("SHIVA_LANE_STATE_EXPORT", False))
+    soft_provider_budgets_enabled = bool(get_env_bool("SHIVA_SOFT_PROVIDER_BUDGETS", False))
+    soft_provider_budget_debug = bool(get_env_bool("SHIVA_SOFT_BUDGET_DEBUG", False))
+    provider_cooldown_s = max(1, int(get_env_int("SHIVA_PROVIDER_COOLDOWN_S", 90)))
+    provider_quarantine_respect = bool(get_env_bool("SHIVA_PROVIDER_QUARANTINE_RESPECT", True))
+    provider_state_bias_enabled = bool(get_env_bool("SHIVA_PROVIDER_STATE_BIAS", True))
+    provider_bias_throttled = float(get_env_float("SHIVA_PROVIDER_BIAS_THROTTLED", 0.35))
+    provider_bias_quarantined = float(get_env_float("SHIVA_PROVIDER_BIAS_QUAR", 0.05))
+    provider_bias_infra = float(get_env_float("SHIVA_PROVIDER_BIAS_INFRA", 0.05))
     lane_thresholds_raw = str(get_env("SHIVA_LANE_THRESHOLDS_JSON", "") or "").strip()
     lane_quarantine_base_s = max(1, int(get_env_int("SHIVA_LANE_QUARANTINE_BASE_S", 120)))
     lane_quarantine_max_s = max(lane_quarantine_base_s, int(get_env_int("SHIVA_LANE_QUARANTINE_MAX_S", 1800)))
@@ -11867,6 +11875,8 @@ def smtp_send_job(
     if lane_state_export:
         with JOBS_LOCK:
             job.debug_lane_states_snapshot = {}
+
+    provider_cooldown_until: Dict[str, float] = {}
 
     def _lane_key(sender_idx: int, provider_domain: str) -> Tuple[int, str]:
         return (int(sender_idx or 0), str(provider_domain or "").strip().lower())
@@ -11920,9 +11930,61 @@ def smtp_send_job(
     def _lane_registry_update(now_ts: float, lane_key: Tuple[int, str], base_caps_hint: Optional[dict] = None) -> None:
         if not (lane_registry and lane_metrics):
             return
+        prev_info = lane_registry.get_lane_info(lane_key)
         lane_id = f"{int(lane_key[0] or 0)}|{str(lane_key[1] or '').strip().lower()}"
         lane_snap = ((lane_metrics.snapshot().get("lanes") or {}).get(lane_id) if lane_metrics else None) or {}
         lane_registry.update_from_metrics(now_ts, lane_key, lane_snap, base_caps_hint=base_caps_hint)
+        next_info = lane_registry.get_lane_info(lane_key)
+        prev_state = str((prev_info or {}).get("state") or "HEALTHY")
+        next_state = str((next_info or {}).get("state") or "HEALTHY")
+        provider_domain = str(lane_key[1] or "").strip().lower()
+        if provider_domain and (next_state != prev_state) and next_state in {"QUARANTINED", "INFRA_FAIL"}:
+            provider_cooldown_until[provider_domain] = max(
+                float(provider_cooldown_until.get(provider_domain) or 0.0),
+                float(now_ts or time.time()) + float(provider_cooldown_s),
+            )
+
+    def _lane_weight_multiplier(lane_key: Tuple[int, str]) -> float:
+        if not soft_provider_budgets_enabled:
+            return 1.0
+        if not provider_state_bias_enabled:
+            return 1.0
+        if not lane_registry:
+            return 1.0
+        lane_info = lane_registry.get_lane_info(lane_key)
+        lane_state = str(lane_info.get("state") or "HEALTHY")
+        if lane_state == "THROTTLED":
+            mul = provider_bias_throttled
+        elif lane_state == "QUARANTINED":
+            mul = provider_bias_quarantined
+        elif lane_state == "INFRA_FAIL":
+            mul = provider_bias_infra
+        else:
+            mul = 1.0
+        return min(1.0, max(0.01, float(mul)))
+
+    def _is_lane_temporarily_blocked(lane_key: Tuple[int, str], now_ts: float) -> bool:
+        if not soft_provider_budgets_enabled:
+            return False
+        provider_domain = str(lane_key[1] or "").strip().lower()
+        if not provider_domain:
+            return False
+        cooldown_until = float(provider_cooldown_until.get(provider_domain) or 0.0)
+        if now_ts < cooldown_until:
+            if lane_debug_enabled or soft_provider_budget_debug:
+                with JOBS_LOCK:
+                    job.log("INFO", f"SoftBudget: skipped provider {provider_domain} due to cooldown until {int(cooldown_until)}")
+            return True
+        if provider_quarantine_respect and lane_registry:
+            lane_info = lane_registry.get_lane_info(lane_key)
+            lane_state = str(lane_info.get("state") or "HEALTHY")
+            next_allowed_ts = float(lane_info.get("next_allowed_ts") or 0.0)
+            if lane_state in {"QUARANTINED", "INFRA_FAIL"} and now_ts < next_allowed_ts:
+                if lane_debug_enabled or soft_provider_budget_debug:
+                    with JOBS_LOCK:
+                        job.log("INFO", f"SoftBudget: skipped lane {lane_key[0]}|{provider_domain} state={lane_state} next_allowed_ts={int(next_allowed_ts)}")
+                return True
+        return False
 
     def _lane_metrics_export_snapshot() -> None:
         if lane_metrics and lane_metrics_export:
@@ -12426,16 +12488,43 @@ def smtp_send_job(
                 waits.append(max(0.0, next_ts - now_ts))
             return min(waits) if waits else None
 
-        def _pick_weighted_domain(sender_idx: int) -> Optional[str]:
+        def _pick_weighted_domain(sender_idx: int, now_ts: float) -> Optional[str]:
             domains = sender_bucket_by_idx.get(sender_idx) or {}
-            weighted = [(d, len(v)) for d, v in domains.items() if v]
+            if not soft_provider_budgets_enabled:
+                weighted_legacy = [(d, len(v)) for d, v in domains.items() if v]
+                if not weighted_legacy:
+                    return None
+                total_weight_legacy = sum(w for _, w in weighted_legacy)
+                if total_weight_legacy <= 0:
+                    return None
+                draw_legacy = scheduler_rng.randint(1, total_weight_legacy)
+                acc_legacy = 0
+                for dom2, w in weighted_legacy:
+                    acc_legacy += w
+                    if draw_legacy <= acc_legacy:
+                        return dom2
+                return weighted_legacy[-1][0]
+
+            weighted: List[Tuple[str, float]] = []
+            for d, v in domains.items():
+                if not v:
+                    continue
+                lane_key = _lane_key(sender_idx, d)
+                if _is_lane_temporarily_blocked(lane_key, now_ts):
+                    continue
+                lane_mul = _lane_weight_multiplier(lane_key)
+                if (lane_debug_enabled or soft_provider_budget_debug) and lane_mul != 1.0:
+                    with JOBS_LOCK:
+                        job.log("INFO", f"SoftBudget: provider {d} weight multiplier={lane_mul:.2f}")
+                adjusted_weight = max(0.01, float(len(v)) * lane_mul)
+                weighted.append((d, adjusted_weight))
             if not weighted:
                 return None
             total_weight = sum(w for _, w in weighted)
-            if total_weight <= 0:
+            if total_weight <= 0.0:
                 return None
-            draw = scheduler_rng.randint(1, total_weight)
-            acc = 0
+            draw = scheduler_rng.random() * total_weight
+            acc = 0.0
             for dom2, w in weighted:
                 acc += w
                 if draw <= acc:
@@ -12459,7 +12548,7 @@ def smtp_send_job(
                         if retry_q2 and float(retry_q2[0].get("next_retry_ts") or 0.0) <= now_ts:
                             sender_cursor = (sender_idx2 + 1) % n
                             return sender_idx2, dom2
-                dom_weighted = _pick_weighted_domain(sender_idx2)
+                dom_weighted = _pick_weighted_domain(sender_idx2, now_ts)
                 if dom_weighted:
                     sender_cursor = (sender_idx2 + 1) % n
                     return sender_idx2, dom_weighted
@@ -13350,6 +13439,22 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "Base quarantine seconds used by read-only lane state machine for QUARANTINED/INFRA_FAIL transitions."},
     {"key": "SHIVA_LANE_QUARANTINE_MAX_S", "type": "int", "default": "1800", "group": "Scheduler", "restart_required": False,
      "desc": "Maximum quarantine seconds cap used by read-only lane state machine."},
+    {"key": "SHIVA_SOFT_PROVIDER_BUDGETS", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Enable soft provider-aware filtering/bias in legacy scheduler weighted picks (sequential only, additive)."},
+    {"key": "SHIVA_PROVIDER_COOLDOWN_S", "type": "int", "default": "90", "group": "Scheduler", "restart_required": False,
+     "desc": "Minimum cooldown seconds applied per provider_domain after lane state transitions to QUARANTINED/INFRA_FAIL."},
+    {"key": "SHIVA_PROVIDER_QUARANTINE_RESPECT", "type": "bool", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "If enabled, weighted picks skip lanes in QUARANTINED/INFRA_FAIL while now < lane.next_allowed_ts."},
+    {"key": "SHIVA_PROVIDER_STATE_BIAS", "type": "bool", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "If enabled, weighted picks apply lane-state multipliers (THROTTLED/QUARANTINED/INFRA_FAIL)."},
+    {"key": "SHIVA_PROVIDER_BIAS_THROTTLED", "type": "float", "default": "0.35", "group": "Scheduler", "restart_required": False,
+     "desc": "Weighted-pick multiplier for lanes in THROTTLED state."},
+    {"key": "SHIVA_PROVIDER_BIAS_QUAR", "type": "float", "default": "0.05", "group": "Scheduler", "restart_required": False,
+     "desc": "Weighted-pick multiplier for lanes in QUARANTINED state (when otherwise allowed)."},
+    {"key": "SHIVA_PROVIDER_BIAS_INFRA", "type": "float", "default": "0.05", "group": "Scheduler", "restart_required": False,
+     "desc": "Weighted-pick multiplier for lanes in INFRA_FAIL state (when otherwise allowed)."},
+    {"key": "SHIVA_SOFT_BUDGET_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Emit concise soft-budget scheduler debug logs (skips/cooldowns/bias multipliers)."},
 
     # App (restart-only)
     {"key": "SHIVA_HOST", "type": "str", "default": "0.0.0.0", "group": "App", "restart_required": True,
