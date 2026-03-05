@@ -2509,6 +2509,12 @@ class SendJob:
     debug_fallback: dict = field(default_factory=dict)
     debug_provider_canon: dict = field(default_factory=dict)
     debug_backoff_jitter: List[dict] = field(default_factory=list)
+    debug_rollout: dict = field(default_factory=dict)
+    debug_wave_status: dict = field(default_factory=dict)
+    debug_learning_policy: dict = field(default_factory=dict)
+    debug_last_lane_pick: dict = field(default_factory=dict)
+    debug_last_caps_resolve: dict = field(default_factory=dict)
+    debug_shadow_events: List[dict] = field(default_factory=list)
 
     # PMTA diagnostics snapshot (optional; helps classify failures quickly)
     pmta_diag: dict = field(default_factory=dict)
@@ -3422,6 +3428,12 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "debug_fallback": job.debug_fallback or {},
         "debug_provider_canon": job.debug_provider_canon or {},
         "debug_backoff_jitter": (job.debug_backoff_jitter or [])[-50:],
+        "debug_rollout": job.debug_rollout or {},
+        "debug_wave_status": job.debug_wave_status or {},
+        "debug_learning_policy": job.debug_learning_policy or {},
+        "debug_last_lane_pick": job.debug_last_lane_pick or {},
+        "debug_last_caps_resolve": job.debug_last_caps_resolve or {},
+        "debug_shadow_events": (job.debug_shadow_events or [])[-50:],
         "pmta_diag": job.pmta_diag or {},
         "pmta_diag_ts": job.pmta_diag_ts or "",
         "created_at": job.created_at,
@@ -4177,6 +4189,12 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job.debug_fallback = (s.get("debug_fallback") if isinstance(s.get("debug_fallback"), dict) else {}) or {}
         job.debug_provider_canon = (s.get("debug_provider_canon") if isinstance(s.get("debug_provider_canon"), dict) else {}) or {}
         job.debug_backoff_jitter = list(s.get("debug_backoff_jitter") or [])
+        job.debug_rollout = (s.get("debug_rollout") if isinstance(s.get("debug_rollout"), dict) else {}) or {}
+        job.debug_wave_status = (s.get("debug_wave_status") if isinstance(s.get("debug_wave_status"), dict) else {}) or {}
+        job.debug_learning_policy = (s.get("debug_learning_policy") if isinstance(s.get("debug_learning_policy"), dict) else {}) or {}
+        job.debug_last_lane_pick = (s.get("debug_last_lane_pick") if isinstance(s.get("debug_last_lane_pick"), dict) else {}) or {}
+        job.debug_last_caps_resolve = (s.get("debug_last_caps_resolve") if isinstance(s.get("debug_last_caps_resolve"), dict) else {}) or {}
+        job.debug_shadow_events = list(s.get("debug_shadow_events") or [])
         job.pmta_diag = (s.get("pmta_diag") if isinstance(s.get("pmta_diag"), dict) else {}) or {}
         job.pmta_diag_ts = str(s.get("pmta_diag_ts") or "")
         job.updated_at = str(s.get("updated_at") or "")
@@ -9316,6 +9334,31 @@ PAGE_JOB = r"""
       </div>
     </div>
 
+    <div class="card" id="schedulerTelemetryCard" style="display:none;">
+      <details open>
+        <summary style="cursor:pointer; font-weight:700; margin-bottom:8px">Scheduler + Lanes Telemetry</summary>
+        <div class="muted" id="telemetryHeader">—</div>
+        <div style="margin-top:8px" id="telemetryProviderGroups" class="muted"></div>
+        <div style="overflow:auto; max-height:260px; margin-top:10px">
+          <table>
+            <thead>
+              <tr>
+                <th>Lane + Provider</th>
+                <th>State</th>
+                <th>Def/HF/TO</th>
+                <th>Next allowed</th>
+                <th>Inflight</th>
+                <th>Last reason/error</th>
+                <th>Suggested caps</th>
+              </tr>
+            </thead>
+            <tbody id="telemetryLanes"></tbody>
+          </table>
+        </div>
+        <div style="margin-top:10px" class="muted" id="telemetryEvents">—</div>
+      </details>
+    </div>
+
     <div class="card">
       <h3 style="margin:0 0 10px">Logs (last 80)</h3>
       <div id="logs" class="muted" style="white-space:pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px"></div>
@@ -9332,6 +9375,56 @@ PAGE_JOB = r"""
   function pct(n,d){
     const nn = Number(n||0), dd = Number(d||0);
     return dd ? Math.min(100, Math.round((nn/dd)*100)) : 0;
+  }
+
+  function fmtRate(v){ return (Number(v||0) * 100).toFixed(1) + '%'; }
+
+  function renderSchedulerTelemetry(t){
+    const card = document.getElementById('schedulerTelemetryCard');
+    if(!card) return;
+    if(!t){ card.style.display = 'none'; return; }
+    card.style.display = '';
+
+    const rollout = t.rollout || {};
+    const scheduler = t.scheduler || {};
+    const fallback = t.fallback || {};
+    const hdr = `mode=${esc(scheduler.mode || 'legacy')} · rollout=${esc(rollout.effective_mode || 'off')} · concurrency=${scheduler.concurrency_enabled ? 'on' : 'off'} (${Number(scheduler.max_parallel_lanes||1)}) · fallback=${fallback.active ? 'ACTIVE' : 'inactive'}`;
+    const h = document.getElementById('telemetryHeader');
+    if(h) h.textContent = hdr;
+
+    const groups = ((t.provider_canonicalization || {}).groups || {});
+    const gtxt = Object.entries(groups).map(([k,v]) => `${k}:${v}`).join(' · ');
+    const gp = document.getElementById('telemetryProviderGroups');
+    if(gp) gp.textContent = gtxt ? (`Provider groups: ${gtxt}`) : 'Provider groups: —';
+
+    const lanes = (t.lanes || []);
+    const tbody = document.getElementById('telemetryLanes');
+    if(tbody){
+      tbody.innerHTML = lanes.map((ln) => {
+        const next = Number(ln.seconds_remaining || 0) > 0 ? `${Number(ln.seconds_remaining).toFixed(0)}s` : 'now';
+        const err = (ln.last_denial_reason || ln.last_reason || (ln.last_error_samples||[])[0] || '').toString();
+        const laneCaps = ((ln.recommended_caps||{}).lane || {});
+        const learnCaps = ((ln.recommended_caps||{}).learning || {});
+        const compactCaps = `C:${laneCaps.chunk_size_cap ?? '-'} W:${laneCaps.workers_cap ?? '-'} D:${laneCaps.delay_floor ?? '-'} · L:C${learnCaps.chunk_size_cap ?? '-'} W${learnCaps.workers_cap ?? '-'}`;
+        return `<tr>`+
+          `<td>${esc(ln.sender_label || ('sender#' + Number(ln.sender_idx||0)))} · ${esc(ln.provider_domain || '')}</td>`+
+          `<td>${esc(ln.state || 'HEALTHY')}</td>`+
+          `<td>${fmtRate(ln.deferral_rate)} / ${fmtRate(ln.hardfail_rate)} / ${fmtRate(ln.timeout_rate)}</td>`+
+          `<td>${esc(next)}</td>`+
+          `<td>${ln.inflight ? 'yes' : 'no'}</td>`+
+          `<td title="${esc((ln.last_error_samples||[]).join(' | '))}">${esc(err.slice(0, 80))}</td>`+
+          `<td>${esc(compactCaps)}</td>`+
+        `</tr>`;
+      }).join('') || `<tr><td colspan="7" class="muted">No scheduler lanes telemetry.</td></tr>`;
+    }
+
+    const ev = document.getElementById('telemetryEvents');
+    if(ev){
+      const fReasons = (fallback.reasons || []).map(x => esc(String(x))).join(' | ') || 'none';
+      const completions = (t.executor || {}).recent_completions || [];
+      const lastExec = completions.slice(-5).map(x => `${x.lane}:${x.status}`).join(' | ') || 'none';
+      ev.textContent = `Fallback reasons: ${fReasons} · Executor recent: ${lastExec}`;
+    }
   }
 
   function renderResultsPager(){
@@ -9438,6 +9531,8 @@ PAGE_JOB = r"""
     }).join("");
     document.getElementById("results").innerHTML = rrows || `<tr><td colspan="4" class="muted">No results yet...</td></tr>`;
     renderResultsPager();
+
+    renderSchedulerTelemetry(j.scheduler_telemetry || null);
 
     // Logs
     const logs = (j.logs || []).slice(-80).map(l => `[${l.ts}] ${l.level}: ${l.message}`).join("\n");
@@ -16086,6 +16181,14 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "Emergency kill-switch: force legacy scheduler for all jobs."},
     {"key": "SHIVA_FORCE_DISABLE_CONCURRENCY", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Emergency kill-switch: disable lane concurrency at runtime."},
+    {"key": "SHIVA_UI_TELEMETRY", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Enable additive scheduler_telemetry field in job API + Jobs UI telemetry panel."},
+    {"key": "SHIVA_UI_TELEMETRY_MAX_LANES", "type": "int", "default": "30", "group": "Scheduler", "restart_required": False,
+     "desc": "Max lanes included in scheduler_telemetry snapshot."},
+    {"key": "SHIVA_UI_TELEMETRY_MAX_EVENTS", "type": "int", "default": "20", "group": "Scheduler", "restart_required": False,
+     "desc": "Max events included in scheduler_telemetry snapshot."},
+    {"key": "SHIVA_UI_TELEMETRY_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Verbose UI telemetry debug logging for snapshot assembly."},
     {"key": "SHIVA_RUN_SELFTESTS", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Run lightweight deterministic rollout self-tests at startup."},
 
@@ -16437,6 +16540,161 @@ def job_page(job_id: str):
     return render_template_string(PAGE_JOB, job_id=job_id, campaign_id=cid)
 
 
+def build_scheduler_telemetry_snapshot(job: 'SendJob') -> dict:
+    """Build bounded, read-only scheduler telemetry for Jobs UI."""
+    now_ts = time.time()
+
+    def _env_int(key: str, default: int) -> int:
+        try:
+            return int(get_env(key, str(default)))
+        except Exception:
+            return int(default)
+
+    max_lanes = max(1, min(100, _env_int("SHIVA_UI_TELEMETRY_MAX_LANES", 30)))
+    max_events = max(1, min(100, _env_int("SHIVA_UI_TELEMETRY_MAX_EVENTS", 20)))
+    telemetry_debug = bool(get_env_bool("SHIVA_UI_TELEMETRY_DEBUG", False))
+
+    lane_metrics = getattr(job, "debug_lane_metrics_snapshot", {}) or {}
+    lane_states = getattr(job, "debug_lane_states_snapshot", {}) or {}
+    budget_status = getattr(job, "debug_budget_status", {}) or {}
+    lane_executor = getattr(job, "debug_lane_executor", {}) or {}
+    fallback = getattr(job, "debug_fallback", {}) or {}
+    provider_canon = getattr(job, "debug_provider_canon", {}) or {}
+    shadow_events = list(getattr(job, "debug_shadow_events", []) or [])
+    rollout = getattr(job, "debug_rollout", {}) or {}
+    wave_status = getattr(job, "debug_wave_status", {}) or {}
+    last_caps = getattr(job, "debug_last_caps_resolve", {}) or {}
+    probe_status = getattr(job, "debug_probe_status", {}) or {}
+
+    lane_rows: List[dict] = []
+    metrics_lanes = (lane_metrics.get("lanes") if isinstance(lane_metrics, dict) else {}) or {}
+    state_lanes = (lane_states.get("lanes") if isinstance(lane_states, dict) else {}) or {}
+    inflight_by_lane = {}
+    inflight_list = list((lane_executor.get("inflight_lanes") if isinstance(lane_executor, dict) else []) or [])
+    for item in inflight_list:
+        lid = str(item.get("lane") or "")
+        if lid:
+            inflight_by_lane[lid] = item
+
+    denial_by_lane = {}
+    for den in list((budget_status.get("last_denied_reasons") if isinstance(budget_status, dict) else []) or [])[-max_events:]:
+        lid = str((den or {}).get("lane") or "")
+        if lid:
+            denial_by_lane[lid] = str((den or {}).get("reason") or "")
+
+    all_lane_ids = sorted(set(list(metrics_lanes.keys()) + list(state_lanes.keys())))
+    for lane_id in all_lane_ids:
+        m = metrics_lanes.get(lane_id) if isinstance(metrics_lanes.get(lane_id), dict) else {}
+        st = state_lanes.get(lane_id) if isinstance(state_lanes.get(lane_id), dict) else {}
+        sender_idx = int(st.get("sender_idx") or m.get("sender_idx") or 0)
+        provider = str(st.get("provider_domain") or m.get("provider_domain") or "")
+        next_allowed_ts = float(st.get("next_allowed_ts") or 0.0)
+        seconds_remaining = max(0.0, next_allowed_ts - now_ts) if next_allowed_ts > 0 else 0.0
+        rec_caps = st.get("recommended_caps") if isinstance(st.get("recommended_caps"), dict) else {}
+        learning_caps = st.get("recommended_caps_learning") if isinstance(st.get("recommended_caps_learning"), dict) else {}
+        final_caps = (last_caps.get("final") if isinstance(last_caps, dict) else {}) or {}
+        inflight_item = inflight_by_lane.get(lane_id) or {}
+        lane_rows.append({
+            "lane_id": lane_id,
+            "sender_idx": sender_idx,
+            "sender_label": str(st.get("sender_label") or m.get("sender_email") or f"sender#{sender_idx}"),
+            "provider_domain": provider,
+            "state": str(st.get("state") or "HEALTHY"),
+            "next_allowed_ts": next_allowed_ts,
+            "seconds_remaining": round(seconds_remaining, 1),
+            "deferral_rate": float(st.get("deferral_rate") or m.get("deferral_rate") or 0.0),
+            "hardfail_rate": float(st.get("hardfail_rate") or m.get("hardfail_rate") or 0.0),
+            "timeout_rate": float(st.get("timeout_rate") or m.get("timeout_rate") or 0.0),
+            "blocked_events": int(st.get("blocked_events") or m.get("blocked_events") or 0),
+            "backoff_scheduled_count": int(m.get("backoff_events") or 0),
+            "last_error_samples": list((st.get("recent_error_samples") or m.get("last_error_samples") or [])[-3:]),
+            "recommended_caps": {
+                "lane": rec_caps,
+                "learning": learning_caps,
+            },
+            "final_caps": final_caps,
+            "inflight": bool(inflight_item),
+            "started_ts": float(inflight_item.get("started_ts") or 0.0),
+            "last_denial_reason": denial_by_lane.get(lane_id, ""),
+            "last_reason": str(st.get("last_reason") or ""),
+        })
+
+    state_rank = {"QUARANTINED": 0, "INFRA_FAIL": 0, "THROTTLED": 1, "HEALTHY": 2}
+    lane_rows.sort(key=lambda x: (
+        state_rank.get(str(x.get("state") or "HEALTHY"), 3),
+        0 if x.get("inflight") else 1,
+        -float(x.get("deferral_rate") or 0.0),
+        -float(x.get("seconds_remaining") or 0.0),
+        str(x.get("lane_id") or ""),
+    ))
+
+    provider_groups = provider_canon.get("provider_groups") if isinstance(provider_canon, dict) else {}
+    fallback_reasons = list((fallback.get("reasons") if isinstance(fallback, dict) else []) or [])[-max_events:]
+    recent_completions = list((lane_executor.get("recent_completions") if isinstance(lane_executor, dict) else []) or [])[-max_events:]
+    bounded_offsets = list(sorted(((wave_status.get("next_allowed_ts_by_sender") if isinstance(wave_status, dict) else {}) or {}).items(), key=lambda kv: kv[0]))[:max_lanes]
+
+    out = {
+        "rollout": {
+            "effective_mode": str(rollout.get("effective_mode") or rollout.get("selected_mode") or "legacy"),
+            "is_canary": bool(rollout.get("is_canary") or rollout.get("selected_mode") == "canary"),
+            "is_shadow": bool(rollout.get("is_shadow") or rollout.get("selected_mode") == "shadow"),
+            "force_legacy": bool(rollout.get("force_legacy") or False),
+            "force_disable_concurrency": bool(rollout.get("force_disable_concurrency") or False),
+        },
+        "scheduler": {
+            "mode": "lane_v2" if bool(rollout.get("lane_v2_enabled") or rollout.get("effective_mode") in {"on", "canary", "shadow"}) else "legacy",
+            "concurrency_enabled": bool(rollout.get("lane_concurrency_enabled") or False),
+            "max_parallel_lanes": int(rollout.get("max_parallel_lanes") or 1),
+        },
+        "probe": {
+            "active": bool(probe_status.get("probe_active") or probe_status.get("active") or False),
+            "rounds_remaining": int(probe_status.get("rounds_remaining") or 0),
+            "duration_left_s": float(probe_status.get("duration_left_s") or 0.0),
+        },
+        "fallback": {
+            "active": bool(fallback.get("active") or False),
+            "reasons": fallback_reasons,
+            "triggered_ts": float(fallback.get("triggered_ts") or 0.0),
+            "actions_taken": list((fallback.get("actions_taken") if isinstance(fallback, dict) else []) or [])[-max_events:],
+        },
+        "wave": {
+            "enabled": bool(wave_status.get("enabled") or False),
+            "provider_domain": str(wave_status.get("provider_domain") or ""),
+            "tokens_current": float(wave_status.get("tokens_current") or 0.0),
+            "refill_per_sec": float(wave_status.get("refill_per_sec") or 0.0),
+            "burst_tokens": float(wave_status.get("burst_tokens") or 0.0),
+            "stagger_offsets": [{"sender_idx": str(k), "next_allowed_ts": float(v)} for k, v in bounded_offsets],
+        },
+        "caps_resolver": {
+            "enabled": bool(last_caps),
+            "final": dict((last_caps.get("final") if isinstance(last_caps, dict) else {}) or {}),
+            "applied_clamps": list((last_caps.get("applied_clamps") if isinstance(last_caps, dict) else []) or [])[-max_events:],
+        },
+        "provider_canonicalization": {
+            "enabled": bool(provider_canon.get("enabled") if isinstance(provider_canon, dict) else False),
+            "groups": dict(provider_groups or {}),
+        },
+        "lanes": lane_rows[:max_lanes],
+        "executor": {
+            "enabled": bool(lane_executor),
+            "inflight_lanes": inflight_list[:max_lanes],
+            "recent_completions": recent_completions,
+        },
+        "events": {
+            "fallback_reasons": fallback_reasons,
+            "shadow_events": shadow_events[-max_events:],
+            "executor_recent": recent_completions,
+        },
+    }
+    if telemetry_debug:
+        out["_debug"] = {
+            "total_lanes_seen": len(all_lane_ids),
+            "max_lanes": max_lanes,
+            "max_events": max_events,
+        }
+    return out
+
+
 @app.get("/api/job/<job_id>")
 def job_api(job_id: str):
     try:
@@ -16559,6 +16817,7 @@ def job_api(job_id: str):
                 "provider_reason_buckets": provider_reason_buckets,
                 "internal_last_samples": internal_samples,
                 "integrity_last_samples": integrity_samples,
+                **({"scheduler_telemetry": build_scheduler_telemetry_snapshot(job)} if bool(get_env_bool("SHIVA_UI_TELEMETRY", False)) else {}),
             }
         )
 
