@@ -2154,7 +2154,7 @@ class ProbeController:
         }
 
 
-def clamp_caps_to_bounds(caps: dict) -> dict:
+def clamp_caps_to_bounds(caps: dict, bounds_override: Optional[dict] = None) -> dict:
     out = dict(caps or {})
     min_chunk = max(1, int(_env_int("SHIVA_CAPS_MIN_CHUNK", 50)))
     max_chunk = max(min_chunk, int(_env_int("SHIVA_CAPS_MAX_CHUNK", 2000)))
@@ -2164,6 +2164,13 @@ def clamp_caps_to_bounds(caps: dict) -> dict:
     max_delay = max(min_delay, float(_env_float("SHIVA_CAPS_MAX_DELAY_S", 5.0)))
     min_sleep = max(0.0, float(_env_float("SHIVA_CAPS_MIN_SLEEP_CHUNKS", 0)))
     max_sleep = max(min_sleep, float(_env_float("SHIVA_CAPS_MAX_SLEEP_CHUNKS", 60)))
+    if isinstance(bounds_override, dict):
+        if bounds_override.get("max_chunk") is not None:
+            max_chunk = min(max_chunk, max(1, int(bounds_override.get("max_chunk") or max_chunk)))
+        if bounds_override.get("max_workers") is not None:
+            max_workers = min(max_workers, max(1, int(bounds_override.get("max_workers") or max_workers)))
+        if bounds_override.get("max_delay_s") is not None:
+            max_delay = min(max_delay, max(0.0, float(bounds_override.get("max_delay_s") or max_delay)))
 
     out["chunk_size"] = max(min_chunk, min(max_chunk, int(out.get("chunk_size") or min_chunk)))
     out["thread_workers"] = max(min_workers, min(max_workers, int(out.get("thread_workers") or out.get("workers") or min_workers)))
@@ -2184,10 +2191,11 @@ def resolve_caps_for_attempt(
     learning_engine=None,
     probe_selected: bool = False,
     policy_pack_clamps: Optional[dict] = None,
+    caps_bounds_override: Optional[dict] = None,
 ) -> Tuple[dict, dict]:
     lane = (int((lane_key or (0, ""))[0] or 0), str((lane_key or (0, ""))[1] or "").strip().lower())
     rt = dict(runtime_overrides or {})
-    caps = clamp_caps_to_bounds(base_caps or {})
+    caps = clamp_caps_to_bounds(base_caps or {}, bounds_override=caps_bounds_override)
     meta: Dict[str, Any] = {
         "lane_key": f"{lane[0]}|{lane[1]}",
         "timestamp": float(now_ts or time.time()),
@@ -2212,7 +2220,7 @@ def resolve_caps_for_attempt(
             direct["delay_s"] = float(rt.get("delay_s") or direct["delay_s"])
         if rt.get("sleep_chunks") is not None:
             direct["sleep_chunks"] = float(rt.get("sleep_chunks") if rt.get("sleep_chunks") is not None else direct["sleep_chunks"])
-    caps = clamp_caps_to_bounds(direct)
+    caps = clamp_caps_to_bounds(direct, bounds_override=caps_bounds_override)
     _record("overrides", before, caps, "campaign_form runtime overrides")
 
     def _apply_clamps(src: dict, *, chunk_key: str, workers_key: str, delay_key: str, sleep_key: str) -> None:
@@ -2228,7 +2236,7 @@ def resolve_caps_for_attempt(
             c2["delay_s"] = max(float(c2["delay_s"]), float(src.get(delay_key) or c2["delay_s"]))
         if src.get(sleep_key) is not None:
             c2["sleep_chunks"] = max(float(c2["sleep_chunks"]), float(src.get(sleep_key) or c2["sleep_chunks"]))
-        caps = clamp_caps_to_bounds(c2)
+        caps = clamp_caps_to_bounds(c2, bounds_override=caps_bounds_override)
 
     before = dict(caps)
     _apply_clamps(dict(pressure_caps or {}), chunk_key="chunk_size_max", workers_key="workers_max", delay_key="delay_min", sleep_key="sleep_min")
@@ -2796,6 +2804,99 @@ class EffectivePlan:
     ui_telemetry_enabled: bool = False
 
 
+@dataclass
+class ValidationResult:
+    ok: bool = True
+    critical_issues: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    clamps_applied: List[dict] = field(default_factory=list)
+
+
+class GuardrailsValidator:
+    """Job-local runtime safety validator for scheduler plan/config."""
+
+    def __init__(self, limits: dict, strict: bool = False, debug: bool = False):
+        self.limits = dict(limits or {})
+        self.strict = bool(strict)
+        self.debug = bool(debug)
+
+    def validate_plan(self, plan: EffectivePlan, config_snapshot: dict) -> ValidationResult:
+        cfg = dict(config_snapshot or {})
+        out = ValidationResult(ok=True)
+
+        def _critical(msg: str) -> None:
+            out.critical_issues.append(str(msg))
+
+        def _warn(msg: str) -> None:
+            out.warnings.append(str(msg))
+
+        def _clamp(name: str, before: Any, after: Any, reason: str) -> None:
+            if before == after:
+                return
+            out.clamps_applied.append({"field": name, "before": before, "after": after, "reason": str(reason)})
+            _warn(f"Guardrails clamp applied: {name} {before} -> {after} ({reason})")
+
+        max_parallel_lanes = int(cfg.get("lane_max_parallel") or 1)
+        max_total_workers = int(cfg.get("max_total_workers") or 1)
+        caps_max_workers = int(cfg.get("caps_max_workers") or 1)
+        caps_max_chunk = int(cfg.get("caps_max_chunk") or 1)
+        caps_max_delay_s = float(cfg.get("caps_max_delay_s") or 0.0)
+        provider_min_gap_s = float(cfg.get("provider_min_gap_s") or 0.0)
+        provider_cooldown_s = int(cfg.get("provider_cooldown_s") or 0)
+        wave_max_parallel_single_domain = int(cfg.get("wave_max_parallel_single_domain") or 1)
+        wave_burst_tokens = int(cfg.get("wave_burst_tokens") or 1)
+        wave_refill_per_sec = float(cfg.get("wave_refill_per_sec") or 0.1)
+        jitter_mode = str(cfg.get("backoff_jitter_mode") or "off").strip().lower() or "off"
+        jitter_pct = max(0.0, float(cfg.get("backoff_jitter_pct") or 0.0))
+        rollout_effective_mode = str(cfg.get("rollout_effective_mode") or "legacy").strip().lower() or "legacy"
+        fallback_requested = bool(cfg.get("fallback_controller_enabled_requested"))
+        resource_gov_requested = bool(cfg.get("resource_governor_enabled_requested"))
+
+        if plan.concurrency_enabled:
+            if not bool(plan.fallback_controller_enabled):
+                _critical("Concurrency requires fallback controller to be enabled.")
+            if (not bool(plan.resource_governor_enabled)) and max_total_workers > int(self.limits.get("max_total_workers", 80)):
+                _critical("Concurrency without resource governor exceeds safe max_total_workers limit.")
+            if not fallback_requested:
+                _critical("Concurrency is enabled while fallback controller is explicitly disabled by operator configuration.")
+            if (not resource_gov_requested) and max_total_workers > int(self.limits.get("max_total_workers", 80)):
+                _critical("Concurrency is enabled while resource governor is explicitly disabled and workers exceed safe cap.")
+
+        if plan.waves_enabled and wave_max_parallel_single_domain != 1:
+            _critical("Single-domain waves require SHIVA_WAVE_MAX_PARALLEL_LANES_SINGLE_DOMAIN=1.")
+
+        if rollout_effective_mode in {"v2", "on", "canary"} and not bool(plan.fallback_controller_enabled):
+            _critical("Rollout canary/on requires fallback controller.")
+        if rollout_effective_mode in {"v2", "on", "canary"} and not bool(cfg.get("guardrails_export")):
+            _warn("Guardrails telemetry export is recommended during canary/on rollout.")
+
+        if jitter_mode == "random":
+            _warn("Backoff jitter mode=random reduces reproducibility; deterministic is recommended.")
+        if jitter_pct > 0.30:
+            _clamp("backoff_jitter_pct", jitter_pct, 0.30, "max jitter pct safety cap")
+
+        _clamp("lane_max_parallel", max_parallel_lanes, min(max_parallel_lanes, int(self.limits.get("max_parallel_lanes", 8))), "max parallel lanes safety cap")
+        _clamp("max_total_workers", max_total_workers, min(max_total_workers, int(self.limits.get("max_total_workers", 80))), "max total workers safety cap")
+        _clamp("caps_max_workers", caps_max_workers, min(caps_max_workers, int(self.limits.get("max_workers_per_lane", 12))), "max workers per lane safety cap")
+        _clamp("caps_max_chunk", caps_max_chunk, min(caps_max_chunk, int(self.limits.get("max_chunk_size", 1000))), "max chunk size safety cap")
+        _clamp("caps_max_delay_s", caps_max_delay_s, min(caps_max_delay_s, float(self.limits.get("max_delay_s", 5.0))), "max delay safety cap")
+        _clamp("provider_min_gap_s", provider_min_gap_s, min(provider_min_gap_s, float(self.limits.get("max_min_gap_s", 300.0))), "provider min gap sanity cap")
+        _clamp("provider_cooldown_s", provider_cooldown_s, min(provider_cooldown_s, int(self.limits.get("max_cooldown_s", 3600))), "provider cooldown sanity cap")
+        if plan.waves_enabled:
+            _clamp("wave_max_parallel_single_domain", wave_max_parallel_single_domain, 1, "single-domain wave inflight safety")
+            _clamp("wave_burst_tokens", wave_burst_tokens, min(wave_burst_tokens, 400), "single-domain wave burst cap")
+            _clamp("wave_refill_per_sec", wave_refill_per_sec, min(wave_refill_per_sec, 3.0), "single-domain wave refill cap")
+
+        if out.critical_issues:
+            out.ok = not self.strict
+            if not self.strict:
+                if not bool(plan.fallback_controller_enabled) and plan.concurrency_enabled:
+                    _clamp("plan.fallback_controller_enabled", False, True, "dependency safety auto-enable")
+                if (not bool(plan.resource_governor_enabled)) and plan.concurrency_enabled:
+                    _clamp("plan.resource_governor_enabled", False, True, "dependency safety auto-enable")
+        return out
+
+
 class ModeOrchestrator:
     """Job-local feature plan resolver with safe dependency ordering."""
 
@@ -3110,6 +3211,7 @@ class SendJob:
     debug_last_caps_resolve: dict = field(default_factory=dict)
     debug_shadow_events: List[dict] = field(default_factory=list)
     debug_lane_accounting: dict = field(default_factory=dict)
+    debug_guardrails: dict = field(default_factory=dict)
 
     # PMTA diagnostics snapshot (optional; helps classify failures quickly)
     pmta_diag: dict = field(default_factory=dict)
@@ -4033,6 +4135,7 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "debug_last_caps_resolve": job.debug_last_caps_resolve or {},
         "debug_shadow_events": (job.debug_shadow_events or [])[-50:],
         "debug_lane_accounting": job.debug_lane_accounting or {},
+        "debug_guardrails": job.debug_guardrails or {},
         "pmta_diag": job.pmta_diag or {},
         "pmta_diag_ts": job.pmta_diag_ts or "",
         "created_at": job.created_at,
@@ -5009,6 +5112,7 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job.debug_last_caps_resolve = (s.get("debug_last_caps_resolve") if isinstance(s.get("debug_last_caps_resolve"), dict) else {}) or {}
         job.debug_shadow_events = list(s.get("debug_shadow_events") or [])
         job.debug_lane_accounting = (s.get("debug_lane_accounting") if isinstance(s.get("debug_lane_accounting"), dict) else {}) or {}
+        job.debug_guardrails = (s.get("debug_guardrails") if isinstance(s.get("debug_guardrails"), dict) else {}) or {}
         job.pmta_diag = (s.get("pmta_diag") if isinstance(s.get("pmta_diag"), dict) else {}) or {}
         job.pmta_diag_ts = str(s.get("pmta_diag_ts") or "")
         job.updated_at = str(s.get("updated_at") or "")
@@ -14356,6 +14460,7 @@ def smtp_send_job(
         subjects = ["(no subject)"]
 
     ai_enabled = bool(use_ai_rewrite and (ai_token or "").strip())
+    jitter_pct_runtime = float(SHIVA_BACKOFF_JITTER_PCT)
     ai_subject_chain = [str(x).strip() for x in (subjects or []) if str(x).strip()] or ["(no subject)"]
     ai_body_chain = str(body or "")
 
@@ -14432,6 +14537,19 @@ def smtp_send_job(
     policy_packs_json = str(get_env("SHIVA_POLICY_PACKS_JSON", "") or "")
     policy_packs_export = bool(get_env_bool("SHIVA_POLICY_PACKS_EXPORT", False))
     policy_packs_debug = bool(get_env_bool("SHIVA_POLICY_PACKS_DEBUG", False))
+    guardrails_enabled = bool(get_env_bool("SHIVA_GUARDRAILS", False))
+    guardrails_strict = bool(get_env_bool("SHIVA_GUARDRAILS_STRICT", False))
+    guardrails_export = bool(get_env_bool("SHIVA_GUARDRAILS_EXPORT", False))
+    guardrails_debug = bool(get_env_bool("SHIVA_GUARDRAILS_DEBUG", False))
+    guard_limits = {
+        "max_parallel_lanes": max(1, int(get_env_int("SHIVA_GUARD_MAX_PARALLEL_LANES", 8))),
+        "max_total_workers": max(1, int(get_env_int("SHIVA_GUARD_MAX_TOTAL_WORKERS", 80))),
+        "max_workers_per_lane": max(1, int(get_env_int("SHIVA_GUARD_MAX_WORKERS_PER_LANE", 12))),
+        "max_chunk_size": max(1, int(get_env_int("SHIVA_GUARD_MAX_CHUNK_SIZE", 1000))),
+        "max_delay_s": max(0.0, float(get_env_float("SHIVA_GUARD_MAX_DELAY_S", 5.0))),
+        "max_min_gap_s": max(1.0, float(get_env_float("SHIVA_GUARD_MAX_MIN_GAP_S", 300))),
+        "max_cooldown_s": max(1, int(get_env_int("SHIVA_GUARD_MAX_COOLDOWN_S", 3600))),
+    }
     provider_alias_json = str(get_env("SHIVA_PROVIDER_ALIAS_JSON", "") or "").strip()
     provider_suffix_json = str(get_env("SHIVA_PROVIDER_SUFFIX_JSON", "") or "").strip()
     provider_mx_fingerprint = bool(get_env_bool("SHIVA_PROVIDER_MX_FINGERPRINT", False))
@@ -14508,6 +14626,7 @@ def smtp_send_job(
     lane_quarantine_base_s = max(1, int(get_env_int("SHIVA_LANE_QUARANTINE_BASE_S", 120)))
     lane_quarantine_max_s = max(lane_quarantine_base_s, int(get_env_int("SHIVA_LANE_QUARANTINE_MAX_S", 1800)))
     lane_metrics = LaneMetrics(window=lane_metrics_window, use_ema=lane_metrics_use_ema) if lane_metrics_enabled else None
+    guard_caps_bounds_override: Dict[str, Any] = {}
 
     def _parse_budget_json_map(raw: str, *, value_type: str, min_v: float, max_v: float) -> Dict[str, Any]:
         txt = str(raw or "").strip()
@@ -15383,6 +15502,73 @@ def smtp_send_job(
             },
             rollout,
         )
+        if guardrails_enabled:
+            guard_config_snapshot = {
+                "lane_max_parallel": int(lane_max_parallel),
+                "max_total_workers": int(max_total_workers),
+                "caps_max_workers": int(_env_int("SHIVA_CAPS_MAX_WORKERS", 50)),
+                "caps_max_chunk": int(_env_int("SHIVA_CAPS_MAX_CHUNK", 2000)),
+                "caps_max_delay_s": float(_env_float("SHIVA_CAPS_MAX_DELAY_S", 5.0)),
+                "provider_min_gap_s": float(budget_provider_min_gap_default),
+                "provider_cooldown_s": int(provider_cooldown_s),
+                "wave_max_parallel_single_domain": int(wave_max_parallel_single_domain),
+                "wave_burst_tokens": int(wave_burst_tokens),
+                "wave_refill_per_sec": float(wave_refill_per_sec),
+                "backoff_jitter_mode": str(SHIVA_BACKOFF_JITTER),
+                "backoff_jitter_pct": float(SHIVA_BACKOFF_JITTER_PCT),
+                "rollout_effective_mode": str(rollout_effective_mode),
+                "fallback_controller_enabled_requested": bool(get_env_bool("SHIVA_FALLBACK_CONTROLLER", False)),
+                "resource_governor_enabled_requested": bool(get_env_bool("SHIVA_RESOURCE_GOVERNOR", False)),
+                "guardrails_export": bool(guardrails_export),
+            }
+            guard_result = GuardrailsValidator(guard_limits, strict=guardrails_strict, debug=guardrails_debug).validate_plan(mode_plan, guard_config_snapshot)
+            if guardrails_export:
+                with JOBS_LOCK:
+                    job.debug_guardrails = {
+                        "ok": bool(guard_result.ok),
+                        "critical_issues": list(guard_result.critical_issues or []),
+                        "warnings": list(guard_result.warnings or []),
+                        "clamps_applied": list(guard_result.clamps_applied or []),
+                    }
+            if guard_result.critical_issues and guardrails_strict:
+                with JOBS_LOCK:
+                    for issue in guard_result.critical_issues:
+                        job.log("ERROR", f"Guardrails(strict): {issue}")
+                    job.status = "error"
+                    job.last_error = "Guardrails strict validation failed; job aborted safely before sending"
+                return
+            for warn_msg in (guard_result.warnings or []):
+                with JOBS_LOCK:
+                    job.log("WARN", f"Guardrails: {warn_msg}")
+            for clamp in (guard_result.clamps_applied or []):
+                field_name = str(clamp.get("field") or "")
+                after_v = clamp.get("after")
+                if field_name == "lane_max_parallel":
+                    lane_max_parallel = int(after_v)
+                elif field_name == "max_total_workers":
+                    max_total_workers = int(after_v)
+                elif field_name == "caps_max_workers":
+                    guard_caps_bounds_override["max_workers"] = int(after_v)
+                elif field_name == "caps_max_chunk":
+                    guard_caps_bounds_override["max_chunk"] = int(after_v)
+                elif field_name == "caps_max_delay_s":
+                    guard_caps_bounds_override["max_delay_s"] = float(after_v)
+                elif field_name == "provider_min_gap_s":
+                    budget_provider_min_gap_default = float(after_v)
+                elif field_name == "provider_cooldown_s":
+                    provider_cooldown_s = int(after_v)
+                elif field_name == "wave_max_parallel_single_domain":
+                    wave_max_parallel_single_domain = int(after_v)
+                elif field_name == "wave_burst_tokens":
+                    wave_burst_tokens = int(after_v)
+                elif field_name == "wave_refill_per_sec":
+                    wave_refill_per_sec = float(after_v)
+                elif field_name == "backoff_jitter_pct":
+                    jitter_pct_runtime = float(after_v)
+                elif field_name == "plan.fallback_controller_enabled":
+                    mode_plan.fallback_controller_enabled = bool(after_v)
+                elif field_name == "plan.resource_governor_enabled":
+                    mode_plan.resource_governor_enabled = bool(after_v)
         scheduler_mode_runtime = str(mode_plan.scheduler_mode)
         lane_concurrency_runtime = bool(mode_plan.concurrency_enabled)
         probe_mode_enabled = bool(mode_plan.probe_enabled)
@@ -16160,6 +16346,7 @@ def smtp_send_job(
                         if provider_canon.enforce
                         else (policy_pack_caps_clamps.get(str(target_domain or "").strip().lower()) or policy_pack_caps_clamps.get(provider_canon.group_for_domain(target_domain)))
                     ),
+                    caps_bounds_override=guard_caps_bounds_override,
                 )
                 cs = int(effective_caps.get("chunk_size") or cs)
                 workers2 = int(effective_caps.get("thread_workers") or workers2)
@@ -16581,7 +16768,7 @@ def smtp_send_job(
                         wait_s, jitter_delta = apply_backoff_jitter(
                             wait_s_base=wait_s_base,
                             mode=backoff_jitter_mode_runtime,
-                            pct=SHIVA_BACKOFF_JITTER_PCT,
+                            pct=jitter_pct_runtime,
                             max_jitter_s=SHIVA_BACKOFF_JITTER_MAX_S,
                             min_jitter_s=SHIVA_BACKOFF_JITTER_MIN_S,
                             max_s=dynamic_backoff_max_s,
@@ -17247,6 +17434,28 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "Emergency kill-switch: force legacy scheduler for all jobs."},
     {"key": "SHIVA_FORCE_DISABLE_CONCURRENCY", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Emergency kill-switch: disable lane concurrency at runtime."},
+    {"key": "SHIVA_GUARDRAILS", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Enable additive guardrails validator for runtime scheduler safety checks/clamps."},
+    {"key": "SHIVA_GUARDRAILS_STRICT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "If enabled with guardrails, critical issues abort jobs safely before sending."},
+    {"key": "SHIVA_GUARDRAILS_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Export guardrails validation snapshot to job.debug_guardrails."},
+    {"key": "SHIVA_GUARDRAILS_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Verbose guardrails diagnostics in job logs."},
+    {"key": "SHIVA_GUARD_MAX_PARALLEL_LANES", "type": "int", "default": "8", "group": "Scheduler", "restart_required": False,
+     "desc": "Guardrails safety cap for max parallel lanes per job."},
+    {"key": "SHIVA_GUARD_MAX_TOTAL_WORKERS", "type": "int", "default": "80", "group": "Scheduler", "restart_required": False,
+     "desc": "Guardrails safety cap for total workers."},
+    {"key": "SHIVA_GUARD_MAX_WORKERS_PER_LANE", "type": "int", "default": "12", "group": "Scheduler", "restart_required": False,
+     "desc": "Guardrails safety cap for per-lane workers via CapsResolver bounds."},
+    {"key": "SHIVA_GUARD_MAX_CHUNK_SIZE", "type": "int", "default": "1000", "group": "Scheduler", "restart_required": False,
+     "desc": "Guardrails safety cap for chunk size via CapsResolver bounds."},
+    {"key": "SHIVA_GUARD_MAX_DELAY_S", "type": "float", "default": "5.0", "group": "Scheduler", "restart_required": False,
+     "desc": "Guardrails safety cap for max delay seconds via CapsResolver bounds."},
+    {"key": "SHIVA_GUARD_MAX_MIN_GAP_S", "type": "int", "default": "300", "group": "Scheduler", "restart_required": False,
+     "desc": "Guardrails sanity cap for provider min gap seconds."},
+    {"key": "SHIVA_GUARD_MAX_COOLDOWN_S", "type": "int", "default": "3600", "group": "Scheduler", "restart_required": False,
+     "desc": "Guardrails sanity cap for provider cooldown seconds."},
     {"key": "SHIVA_UI_TELEMETRY", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Enable additive scheduler_telemetry field in job API + Jobs UI telemetry panel."},
     {"key": "SHIVA_UI_TELEMETRY_MAX_LANES", "type": "int", "default": "30", "group": "Scheduler", "restart_required": False,
