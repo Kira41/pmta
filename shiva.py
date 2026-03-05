@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from email import policy as email_policy
 from email.message import EmailMessage
 from email.utils import formataddr, format_datetime
-from typing import Optional, Any, Tuple, Dict, List, Set
+from typing import Optional, Any, Tuple, Dict, List, Set, Callable
 from concurrent.futures import ThreadPoolExecutor
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -887,6 +887,150 @@ class LaneRegistry:
         }
 
 
+@dataclass
+class BudgetConfig:
+    enabled: bool = False
+    debug: bool = False
+    provider_max_inflight_default: int = 1
+    provider_max_inflight_map: Dict[str, int] = field(default_factory=dict)
+    provider_min_gap_s_default: float = 0.0
+    provider_min_gap_s_map: Dict[str, float] = field(default_factory=dict)
+    provider_cooldown_s_default: float = 0.0
+    provider_cooldown_s_map: Dict[str, float] = field(default_factory=dict)
+    sender_max_inflight: int = 1
+    apply_to_retry: bool = False
+    apply_to_probe: bool = True
+    export: bool = False
+
+
+class BudgetManager:
+    """Job-scoped budget gate for lane start decisions (sequential today, concurrency-ready)."""
+
+    def __init__(self, config: BudgetConfig, lane_registry: Optional[LaneRegistry] = None, debug: bool = False):
+        self.config = config or BudgetConfig()
+        self.lane_registry = lane_registry
+        self.debug = bool(debug)
+        self.inflight_by_provider: Dict[str, int] = {}
+        self.inflight_by_sender: Dict[int, int] = {}
+        self.provider_last_start_ts: Dict[str, float] = {}
+        self.provider_cooldown_until: Dict[str, float] = {}
+        self.lane_inflight: Dict[str, bool] = {}
+        self.last_denied_reasons: List[dict] = []
+
+    def _lane_id(self, lane_key: Tuple[int, str]) -> str:
+        return f"{int((lane_key or (0, ''))[0])}|{str((lane_key or (0, ''))[1] or '').strip().lower()}"
+
+    def _provider_name(self, provider_domain: str) -> str:
+        return str(provider_domain or "").strip().lower()
+
+    def _int_provider_value(self, provider_domain: str, mapping: Dict[str, int], default_v: int) -> int:
+        p = self._provider_name(provider_domain)
+        return int(mapping.get(p, mapping.get("*", default_v)))
+
+    def _float_provider_value(self, provider_domain: str, mapping: Dict[str, float], default_v: float) -> float:
+        p = self._provider_name(provider_domain)
+        return float(mapping.get(p, mapping.get("*", default_v)))
+
+    def provider_max_inflight(self, provider_domain: str) -> int:
+        return max(1, min(10, self._int_provider_value(provider_domain, self.config.provider_max_inflight_map, self.config.provider_max_inflight_default)))
+
+    def provider_min_gap(self, provider_domain: str) -> float:
+        return max(0.0, min(3600.0, self._float_provider_value(provider_domain, self.config.provider_min_gap_s_map, self.config.provider_min_gap_s_default)))
+
+    def provider_cooldown_s(self, provider_domain: str) -> float:
+        return max(0.0, min(3600.0, self._float_provider_value(provider_domain, self.config.provider_cooldown_s_map, self.config.provider_cooldown_s_default)))
+
+    def _push_denial(self, lane_key: Tuple[int, str], reason: str, now_ts: float) -> None:
+        self.last_denied_reasons.append({
+            "ts": float(now_ts or time.time()),
+            "lane": self._lane_id(lane_key),
+            "reason": str(reason or "denied"),
+        })
+        if len(self.last_denied_reasons) > 10:
+            self.last_denied_reasons = self.last_denied_reasons[-10:]
+
+    def can_start(self, lane_key: Tuple[int, str], now_ts: float, is_retry: bool, is_probe: bool) -> Tuple[bool, str]:
+        if not self.config.enabled:
+            return True, "disabled"
+        sender_idx = int((lane_key or (0, ""))[0] or 0)
+        provider_domain = self._provider_name((lane_key or (0, ""))[1])
+
+        if self.lane_registry:
+            lane_info = self.lane_registry.get_lane_info((sender_idx, provider_domain))
+            lane_state = str(lane_info.get("state") or "HEALTHY")
+            lane_next_allowed = float(lane_info.get("next_allowed_ts") or 0.0)
+            if lane_state in {"QUARANTINED", "INFRA_FAIL"} and float(now_ts or 0.0) < lane_next_allowed:
+                self._push_denial((sender_idx, provider_domain), "lane_quarantine_until", now_ts)
+                return False, "lane_quarantine_until"
+
+        cooldown_until = float(self.provider_cooldown_until.get(provider_domain) or 0.0)
+        if float(now_ts or 0.0) < cooldown_until:
+            self._push_denial((sender_idx, provider_domain), "provider_cooldown_until", now_ts)
+            return False, "provider_cooldown_until"
+
+        min_gap = self.provider_min_gap(provider_domain)
+        if min_gap > 0.0:
+            last_start_ts = float(self.provider_last_start_ts.get(provider_domain) or 0.0)
+            if last_start_ts > 0.0 and (float(now_ts or 0.0) - last_start_ts) < min_gap:
+                self._push_denial((sender_idx, provider_domain), "provider_min_gap", now_ts)
+                return False, "provider_min_gap"
+
+        if int(self.inflight_by_provider.get(provider_domain) or 0) >= int(self.provider_max_inflight(provider_domain)):
+            self._push_denial((sender_idx, provider_domain), "provider_inflight_cap", now_ts)
+            return False, "provider_inflight_cap"
+        if int(self.inflight_by_sender.get(sender_idx) or 0) >= int(max(1, min(10, self.config.sender_max_inflight))):
+            self._push_denial((sender_idx, provider_domain), "sender_inflight_cap", now_ts)
+            return False, "sender_inflight_cap"
+        return True, "allow"
+
+    def on_start(self, lane_key: Tuple[int, str], now_ts: float) -> None:
+        if not self.config.enabled:
+            return
+        sender_idx = int((lane_key or (0, ""))[0] or 0)
+        provider_domain = self._provider_name((lane_key or (0, ""))[1])
+        self.inflight_by_provider[provider_domain] = int(self.inflight_by_provider.get(provider_domain) or 0) + 1
+        self.inflight_by_sender[sender_idx] = int(self.inflight_by_sender.get(sender_idx) or 0) + 1
+        self.provider_last_start_ts[provider_domain] = float(now_ts or time.time())
+        self.lane_inflight[self._lane_id((sender_idx, provider_domain))] = True
+
+    def on_finish(self, lane_key: Tuple[int, str], now_ts: float) -> None:
+        if not self.config.enabled:
+            return
+        sender_idx = int((lane_key or (0, ""))[0] or 0)
+        provider_domain = self._provider_name((lane_key or (0, ""))[1])
+        self.inflight_by_provider[provider_domain] = max(0, int(self.inflight_by_provider.get(provider_domain) or 0) - 1)
+        self.inflight_by_sender[sender_idx] = max(0, int(self.inflight_by_sender.get(sender_idx) or 0) - 1)
+        self.lane_inflight[self._lane_id((sender_idx, provider_domain))] = False
+
+    def on_lane_state_signal(self, lane_key: Tuple[int, str], state: str, now_ts: float, failure_type: Optional[str] = None) -> None:
+        if not self.config.enabled:
+            return
+        provider_domain = self._provider_name((lane_key or (0, ""))[1])
+        state_v = str(state or "").strip().upper()
+        severe_failure = str(failure_type or "").strip().lower()
+        severe = state_v in {"QUARANTINED", "INFRA_FAIL"} or severe_failure in {"infra", "timeout", "network", "connection"}
+        if not severe:
+            return
+        cooldown_s = self.provider_cooldown_s(provider_domain)
+        if cooldown_s <= 0:
+            return
+        self.provider_cooldown_until[provider_domain] = max(
+            float(self.provider_cooldown_until.get(provider_domain) or 0.0),
+            float(now_ts or time.time()) + float(cooldown_s),
+        )
+
+    def snapshot(self) -> dict:
+        return {
+            "enabled": bool(self.config.enabled),
+            "inflight_by_provider": {k: int(v) for k, v in sorted(self.inflight_by_provider.items()) if int(v) != 0},
+            "inflight_by_sender": {str(k): int(v) for k, v in sorted(self.inflight_by_sender.items(), key=lambda x: x[0]) if int(v) != 0},
+            "provider_last_start_ts": {k: float(v) for k, v in sorted(self.provider_last_start_ts.items())},
+            "provider_cooldown_until": {k: float(v) for k, v in sorted(self.provider_cooldown_until.items()) if float(v) > 0.0},
+            "lane_inflight": {k: bool(v) for k, v in sorted(self.lane_inflight.items()) if bool(v)},
+            "last_denied_reasons": list(self.last_denied_reasons[-10:]),
+        }
+
+
 class ProbeController:
     """Job-scoped probe mode controller to sample early lane signals conservatively."""
 
@@ -949,6 +1093,7 @@ class ProbeController:
         sender_buckets: Dict[int, Dict[str, List[str]]],
         lane_registry: Optional[LaneRegistry],
         soft_budgets: Optional[dict],
+        budget_can_start: Optional[Callable[[Tuple[int, str], float, bool, bool], Tuple[bool, str]]],
         sender_cursor: int,
     ) -> Optional[Tuple[int, str]]:
         if not self.is_active(now_ts):
@@ -973,6 +1118,10 @@ class ProbeController:
                     lane_key = (int(sender_idx), provider)
                     if callable(blocked_fn) and blocked_fn(lane_key, now_ts):
                         continue
+                    if callable(budget_can_start):
+                        allowed, _reason = budget_can_start(lane_key, now_ts, False, True)
+                        if not allowed:
+                            continue
                     if lane_registry:
                         lane_info = lane_registry.get_lane_info(lane_key)
                         if float(lane_info.get("next_allowed_ts") or 0.0) > float(now_ts or 0.0):
@@ -1102,6 +1251,7 @@ class SendJob:
     debug_lane_metrics_snapshot: dict = field(default_factory=dict)
     debug_lane_states_snapshot: dict = field(default_factory=dict)
     debug_probe_status: dict = field(default_factory=dict)
+    debug_budget_status: dict = field(default_factory=dict)
 
     # PMTA diagnostics snapshot (optional; helps classify failures quickly)
     pmta_diag: dict = field(default_factory=dict)
@@ -2010,6 +2160,7 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "lane_metrics": job.debug_lane_metrics_snapshot or {},
         "lane_states": job.debug_lane_states_snapshot or {},
         "debug_probe_status": job.debug_probe_status or {},
+        "debug_budget_status": job.debug_budget_status or {},
         "pmta_diag": job.pmta_diag or {},
         "pmta_diag_ts": job.pmta_diag_ts or "",
         "created_at": job.created_at,
@@ -11999,10 +12150,55 @@ def smtp_send_job(
     probe_sleep_floor_s = max(0.0, float(get_env_float("SHIVA_PROBE_SLEEP_FLOOR_S", 2)))
     probe_min_providers = max(1, int(get_env_int("SHIVA_PROBE_MIN_PROVIDERS", 3)))
     probe_export = bool(get_env_bool("SHIVA_PROBE_EXPORT", False))
+    budget_manager_enabled = bool(get_env_bool("SHIVA_BUDGET_MANAGER", False))
+    budget_debug = bool(get_env_bool("SHIVA_BUDGET_DEBUG", False))
+    budget_provider_max_inflight_default = max(1, min(10, int(get_env_int("SHIVA_PROVIDER_MAX_INFLIGHT_DEFAULT", 1))))
+    budget_provider_max_inflight_json = str(get_env("SHIVA_PROVIDER_MAX_INFLIGHT_JSON", "") or "").strip()
+    budget_provider_min_gap_default = max(0.0, min(3600.0, float(get_env_float("SHIVA_PROVIDER_MIN_GAP_S_DEFAULT", 0.0))))
+    budget_provider_min_gap_json = str(get_env("SHIVA_PROVIDER_MIN_GAP_S_JSON", "") or "").strip()
+    budget_provider_cooldown_default = max(0.0, min(3600.0, float(get_env_float("SHIVA_PROVIDER_COOLDOWN_S_DEFAULT", 0.0))))
+    budget_provider_cooldown_json = str(get_env("SHIVA_PROVIDER_COOLDOWN_S_JSON", "") or "").strip()
+    budget_sender_max_inflight = max(1, min(10, int(get_env_int("SHIVA_SENDER_MAX_INFLIGHT", 1))))
+    budget_apply_to_retry = bool(get_env_bool("SHIVA_BUDGET_APPLY_TO_RETRY", False))
+    budget_apply_to_probe = bool(get_env_bool("SHIVA_BUDGET_APPLY_TO_PROBE", True))
+    budget_export = bool(get_env_bool("SHIVA_BUDGET_EXPORT", False))
     lane_thresholds_raw = str(get_env("SHIVA_LANE_THRESHOLDS_JSON", "") or "").strip()
     lane_quarantine_base_s = max(1, int(get_env_int("SHIVA_LANE_QUARANTINE_BASE_S", 120)))
     lane_quarantine_max_s = max(lane_quarantine_base_s, int(get_env_int("SHIVA_LANE_QUARANTINE_MAX_S", 1800)))
     lane_metrics = LaneMetrics(window=lane_metrics_window, use_ema=lane_metrics_use_ema) if lane_metrics_enabled else None
+
+    def _parse_budget_json_map(raw: str, *, value_type: str, min_v: float, max_v: float) -> Dict[str, Any]:
+        txt = str(raw or "").strip()
+        if not txt:
+            return {}
+        try:
+            parsed = json.loads(txt)
+        except Exception as e:
+            with JOBS_LOCK:
+                job.log("WARN", f"Budget JSON parse failed ({value_type}): {e}")
+            return {}
+        if not isinstance(parsed, dict):
+            with JOBS_LOCK:
+                job.log("WARN", f"Budget JSON ignored ({value_type}): expected object")
+            return {}
+        out: Dict[str, Any] = {}
+        for k, v in parsed.items():
+            key = str(k or "").strip().lower()
+            if not key:
+                continue
+            if value_type == "int":
+                try:
+                    iv = int(v)
+                except Exception:
+                    continue
+                out[key] = max(int(min_v), min(int(max_v), iv))
+            else:
+                try:
+                    fv = float(v)
+                except Exception:
+                    continue
+                out[key] = max(float(min_v), min(float(max_v), fv))
+        return out
 
     lane_thresholds_override = {}
     if lane_thresholds_raw:
@@ -12030,6 +12226,25 @@ def smtp_send_job(
     if probe_export:
         with JOBS_LOCK:
             job.debug_probe_status = {}
+    if budget_export:
+        with JOBS_LOCK:
+            job.debug_budget_status = {}
+
+    budget_config = BudgetConfig(
+        enabled=budget_manager_enabled,
+        debug=budget_debug,
+        provider_max_inflight_default=budget_provider_max_inflight_default,
+        provider_max_inflight_map=_parse_budget_json_map(budget_provider_max_inflight_json, value_type="int", min_v=1, max_v=10),
+        provider_min_gap_s_default=budget_provider_min_gap_default,
+        provider_min_gap_s_map=_parse_budget_json_map(budget_provider_min_gap_json, value_type="float", min_v=0, max_v=3600),
+        provider_cooldown_s_default=budget_provider_cooldown_default,
+        provider_cooldown_s_map=_parse_budget_json_map(budget_provider_cooldown_json, value_type="float", min_v=0, max_v=3600),
+        sender_max_inflight=budget_sender_max_inflight,
+        apply_to_retry=budget_apply_to_retry,
+        apply_to_probe=budget_apply_to_probe,
+        export=budget_export,
+    )
+    budget_mgr = BudgetManager(budget_config, lane_registry=lane_registry, debug=budget_debug) if budget_manager_enabled else None
 
     provider_cooldown_until: Dict[str, float] = {}
 
@@ -12098,6 +12313,8 @@ def smtp_send_job(
                 float(provider_cooldown_until.get(provider_domain) or 0.0),
                 float(now_ts or time.time()) + float(provider_cooldown_s),
             )
+            if budget_mgr:
+                budget_mgr.on_lane_state_signal(lane_key, next_state, now_ts)
 
     def _lane_weight_multiplier(lane_key: Tuple[int, str]) -> float:
         if not soft_provider_budgets_enabled:
@@ -12141,6 +12358,15 @@ def smtp_send_job(
                 return True
         return False
 
+    def _budget_can_start(lane_key: Tuple[int, str], now_ts: float, is_retry: bool, is_probe: bool) -> Tuple[bool, str]:
+        if not budget_mgr:
+            return True, "disabled"
+        allowed, reason = budget_mgr.can_start(lane_key, now_ts, is_retry, is_probe)
+        if (not allowed) and (lane_debug_enabled or budget_debug):
+            with JOBS_LOCK:
+                job.log("INFO", f"BudgetManager: denied lane {lane_key[0]}|{lane_key[1]} reason={reason}")
+        return allowed, reason
+
     def _lane_metrics_export_snapshot() -> None:
         if lane_metrics and lane_metrics_export:
             snap = lane_metrics.snapshot()
@@ -12149,6 +12375,9 @@ def smtp_send_job(
         if lane_registry and lane_state_export:
             with JOBS_LOCK:
                 job.debug_lane_states_snapshot = lane_registry.snapshot()
+        if budget_mgr and budget_config.export:
+            with JOBS_LOCK:
+                job.debug_budget_status = budget_mgr.snapshot()
 
     smtp_host_ips = _resolve_ipv4(smtp_host) if smtp_host else []
 
@@ -12685,6 +12914,11 @@ def smtp_send_job(
                 for dom2 in (sender_bucket_by_idx.get(sender_idx2) or {}).keys():
                     retry_q2 = provider_retry_chunks.get(_sd_key(sender_idx2, dom2)) or []
                     if retry_q2 and float(retry_q2[0].get("next_retry_ts") or 0.0) <= now_ts:
+                        lane_key2 = _lane_key(sender_idx2, dom2)
+                        if budget_mgr and budget_config.apply_to_retry:
+                            allowed2, _reason2 = _budget_can_start(lane_key2, now_ts, True, False)
+                            if not allowed2:
+                                continue
                         sender_cursor = (sender_idx2 + 1) % n
                         return sender_idx2, dom2
             return None
@@ -12692,7 +12926,16 @@ def smtp_send_job(
         def _pick_weighted_domain(sender_idx: int, now_ts: float) -> Optional[str]:
             domains = sender_bucket_by_idx.get(sender_idx) or {}
             if not soft_provider_budgets_enabled:
-                weighted_legacy = [(d, len(v)) for d, v in domains.items() if v]
+                weighted_legacy: List[Tuple[str, int]] = []
+                for d, v in domains.items():
+                    if not v:
+                        continue
+                    lane_key = _lane_key(sender_idx, d)
+                    if budget_mgr:
+                        allowed_legacy, _reason_legacy = _budget_can_start(lane_key, now_ts, False, False)
+                        if not allowed_legacy:
+                            continue
+                    weighted_legacy.append((d, len(v)))
                 if not weighted_legacy:
                     return None
                 total_weight_legacy = sum(w for _, w in weighted_legacy)
@@ -12711,6 +12954,10 @@ def smtp_send_job(
                 if not v:
                     continue
                 lane_key = _lane_key(sender_idx, d)
+                if budget_mgr:
+                    allowed, _reason = _budget_can_start(lane_key, now_ts, False, False)
+                    if not allowed:
+                        continue
                 if _is_lane_temporarily_blocked(lane_key, now_ts):
                     continue
                 lane_mul = _lane_weight_multiplier(lane_key)
@@ -12747,6 +12994,11 @@ def smtp_send_job(
                     if _domain_has_ready_work(sender_idx2, dom2, now_ts):
                         retry_q2 = provider_retry_chunks.get(_sd_key(sender_idx2, dom2)) or []
                         if retry_q2 and float(retry_q2[0].get("next_retry_ts") or 0.0) <= now_ts:
+                            lane_key2 = _lane_key(sender_idx2, dom2)
+                            if budget_mgr and budget_config.apply_to_retry:
+                                allowed2, _reason2 = _budget_can_start(lane_key2, now_ts, True, False)
+                                if not allowed2:
+                                    continue
                             sender_cursor = (sender_idx2 + 1) % n
                             return sender_idx2, dom2
                 dom_weighted = _pick_weighted_domain(sender_idx2, now_ts)
@@ -12914,6 +13166,7 @@ def smtp_send_job(
                     sender_bucket_by_idx,
                     lane_registry,
                     {"is_lane_temporarily_blocked": _is_lane_temporarily_blocked},
+                    _budget_can_start if (budget_mgr and budget_config.apply_to_probe) else None,
                     sender_cursor,
                 )
                 if sender_domain_pick:
@@ -13374,6 +13627,8 @@ def smtp_send_job(
                         )
                         if lane_registry:
                             lane_registry.set_signal_backoff(_lane_key(sender_idx_fixed, target_domain), wait_s, failure_type)
+                        if budget_mgr:
+                            budget_mgr.on_lane_state_signal(_lane_key(sender_idx_fixed, target_domain), "INFRA_FAIL", time.time(), failure_type=failure_type)
                         _lane_registry_update(
                             time.time(),
                             _lane_key(sender_idx_fixed, target_domain),
@@ -13424,20 +13679,27 @@ def smtp_send_job(
                 with JOBS_LOCK:
                     before_recent_len = len(job.recent_results or [])
 
-                _send_chunk(
-                    chunk_idx=chunk_idx_local,
-                    chunk_rcpts=chunk,
-                    from_name=fn,
-                    from_email=fe,
-                    subject=sb,
-                    body_used=b_used,
-                    body_format2=body_format2,
-                    reply_to2=reply_to2,
-                    delay2=delay2,
-                    workers2=workers2,
-                    chunk_url=chunk_url,
-                    chunk_src=chunk_src,
-                )
+                lane_key_current = _lane_key(sender_idx_fixed, target_domain)
+                if budget_mgr:
+                    budget_mgr.on_start(lane_key_current, time.time())
+                try:
+                    _send_chunk(
+                        chunk_idx=chunk_idx_local,
+                        chunk_rcpts=chunk,
+                        from_name=fn,
+                        from_email=fe,
+                        subject=sb,
+                        body_used=b_used,
+                        body_format2=body_format2,
+                        reply_to2=reply_to2,
+                        delay2=delay2,
+                        workers2=workers2,
+                        chunk_url=chunk_url,
+                        chunk_src=chunk_src,
+                    )
+                finally:
+                    if budget_mgr:
+                        budget_mgr.on_finish(lane_key_current, time.time())
 
                 if lane_metrics:
                     with JOBS_LOCK:
@@ -13499,6 +13761,7 @@ def smtp_send_job(
                         "next_retry_ts": 0,
                         "reason": "",
                     })
+                _lane_metrics_export_snapshot()
                 chunk_finished = True
                 break
 
@@ -13700,6 +13963,30 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "Weighted-pick multiplier for lanes in INFRA_FAIL state (when otherwise allowed)."},
     {"key": "SHIVA_SOFT_BUDGET_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Emit concise soft-budget scheduler debug logs (skips/cooldowns/bias multipliers)."},
+    {"key": "SHIVA_BUDGET_MANAGER", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Enable formal BudgetManager lane gating (provider/sender inflight caps, min-gap, cooldown, lane quarantine)."},
+    {"key": "SHIVA_BUDGET_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Emit concise BudgetManager deny/debug logs."},
+    {"key": "SHIVA_PROVIDER_MAX_INFLIGHT_DEFAULT", "type": "int", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "Default provider max inflight lanes used by BudgetManager (future concurrency-ready)."},
+    {"key": "SHIVA_PROVIDER_MAX_INFLIGHT_JSON", "type": "str", "default": "", "group": "Scheduler", "restart_required": False,
+     "desc": "Optional JSON map for per-provider max inflight (supports '*' default override)."},
+    {"key": "SHIVA_PROVIDER_MIN_GAP_S_DEFAULT", "type": "float", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Default minimum seconds gap between starts per provider."},
+    {"key": "SHIVA_PROVIDER_MIN_GAP_S_JSON", "type": "str", "default": "", "group": "Scheduler", "restart_required": False,
+     "desc": "Optional JSON map for per-provider min gap seconds (supports '*' default override)."},
+    {"key": "SHIVA_PROVIDER_COOLDOWN_S_DEFAULT", "type": "float", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Default provider cooldown seconds used by BudgetManager on severe lane signals."},
+    {"key": "SHIVA_PROVIDER_COOLDOWN_S_JSON", "type": "str", "default": "", "group": "Scheduler", "restart_required": False,
+     "desc": "Optional JSON map for per-provider cooldown seconds (supports '*' default override)."},
+    {"key": "SHIVA_SENDER_MAX_INFLIGHT", "type": "int", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "Sender max inflight lanes budget for BudgetManager (future concurrency-ready)."},
+    {"key": "SHIVA_BUDGET_APPLY_TO_RETRY", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "If enabled, BudgetManager also gates retry-ready lane picks (disabled by default to preserve legacy priority)."},
+    {"key": "SHIVA_BUDGET_APPLY_TO_PROBE", "type": "bool", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "If enabled, probe mode lane picks must pass BudgetManager gate."},
+    {"key": "SHIVA_BUDGET_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Export BudgetManager debug snapshot into job debug payload as additive field debug_budget_status."},
 
     # App (restart-only)
     {"key": "SHIVA_HOST", "type": "str", "default": "0.0.0.0", "group": "App", "restart_required": True,
