@@ -916,6 +916,8 @@ class BudgetManager:
         self.provider_cooldown_until: Dict[str, float] = {}
         self.lane_inflight: Dict[str, bool] = {}
         self.last_denied_reasons: List[dict] = []
+        self.provider_max_inflight_overrides: Dict[str, int] = {}
+        self.external_gates: Dict[str, Callable[[Tuple[int, str], float, bool, bool, Optional[int]], Tuple[bool, str]]] = {}
 
     def _lane_id(self, lane_key: Tuple[int, str]) -> str:
         return f"{int((lane_key or (0, ''))[0])}|{str((lane_key or (0, ''))[1] or '').strip().lower()}"
@@ -932,7 +934,26 @@ class BudgetManager:
         return float(mapping.get(p, mapping.get("*", default_v)))
 
     def provider_max_inflight(self, provider_domain: str) -> int:
+        p = self._provider_name(provider_domain)
+        if p in self.provider_max_inflight_overrides:
+            return max(1, min(10, int(self.provider_max_inflight_overrides.get(p) or 1)))
         return max(1, min(10, self._int_provider_value(provider_domain, self.config.provider_max_inflight_map, self.config.provider_max_inflight_default)))
+
+    def set_provider_max_inflight_override(self, provider_domain: str, value: int) -> None:
+        p = self._provider_name(provider_domain)
+        if not p:
+            return
+        self.provider_max_inflight_overrides[p] = max(1, min(10, int(value or 1)))
+
+    def register_external_gate(
+        self,
+        name: str,
+        gate_callable: Callable[[Tuple[int, str], float, bool, bool, Optional[int]], Tuple[bool, str]],
+    ) -> None:
+        gate_name = str(name or "").strip().lower()
+        if not gate_name or not callable(gate_callable):
+            return
+        self.external_gates[gate_name] = gate_callable
 
     def provider_min_gap(self, provider_domain: str) -> float:
         return max(0.0, min(3600.0, self._float_provider_value(provider_domain, self.config.provider_min_gap_s_map, self.config.provider_min_gap_s_default)))
@@ -949,7 +970,7 @@ class BudgetManager:
         if len(self.last_denied_reasons) > 10:
             self.last_denied_reasons = self.last_denied_reasons[-10:]
 
-    def can_start(self, lane_key: Tuple[int, str], now_ts: float, is_retry: bool, is_probe: bool) -> Tuple[bool, str]:
+    def can_start(self, lane_key: Tuple[int, str], now_ts: float, is_retry: bool, is_probe: bool, planned_chunk_size_hint: Optional[int] = None) -> Tuple[bool, str]:
         if not self.config.enabled:
             return True, "disabled"
         sender_idx = int((lane_key or (0, ""))[0] or 0)
@@ -981,6 +1002,15 @@ class BudgetManager:
         if int(self.inflight_by_sender.get(sender_idx) or 0) >= int(max(1, min(10, self.config.sender_max_inflight))):
             self._push_denial((sender_idx, provider_domain), "sender_inflight_cap", now_ts)
             return False, "sender_inflight_cap"
+        for gate_name, gate_fn in self.external_gates.items():
+            try:
+                allowed, reason = gate_fn((sender_idx, provider_domain), now_ts, bool(is_retry), bool(is_probe), planned_chunk_size_hint)
+            except Exception:
+                allowed, reason = True, "allow"
+            if not allowed:
+                denied_reason = str(reason or f"{gate_name}_denied")
+                self._push_denial((sender_idx, provider_domain), denied_reason, now_ts)
+                return False, denied_reason
         return True, "allow"
 
     def on_start(self, lane_key: Tuple[int, str], now_ts: float) -> None:
@@ -1026,8 +1056,141 @@ class BudgetManager:
             "inflight_by_sender": {str(k): int(v) for k, v in sorted(self.inflight_by_sender.items(), key=lambda x: x[0]) if int(v) != 0},
             "provider_last_start_ts": {k: float(v) for k, v in sorted(self.provider_last_start_ts.items())},
             "provider_cooldown_until": {k: float(v) for k, v in sorted(self.provider_cooldown_until.items()) if float(v) > 0.0},
+            "provider_max_inflight_overrides": {k: int(v) for k, v in sorted(self.provider_max_inflight_overrides.items())},
             "lane_inflight": {k: bool(v) for k, v in sorted(self.lane_inflight.items()) if bool(v)},
+            "external_gates": sorted(self.external_gates.keys()),
             "last_denied_reasons": list(self.last_denied_reasons[-10:]),
+        }
+
+
+class WaveController:
+    """Single-provider deterministic token-bucket gate (job-scoped)."""
+
+    def __init__(self, enabled: bool, provider_domain: str, burst_tokens: float, refill_per_sec: float, min_tokens_to_start_chunk: int, adaptive_config: dict, stagger_config: dict):
+        self.enabled = bool(enabled)
+        self.provider_domain = str(provider_domain or "").strip().lower()
+        self.burst_tokens = float(max(1.0, burst_tokens or 1.0))
+        self.refill_per_sec = float(max(0.01, refill_per_sec or 0.01))
+        self.min_tokens_to_start_chunk = max(1, int(min_tokens_to_start_chunk or 1))
+        self.token_cost_per_msg = max(1, int((adaptive_config or {}).get("token_cost_per_msg") or 1))
+        self.tokens_current = float(self.burst_tokens)
+        self.last_refill_ts = 0.0
+        self.job_start_ts = 0.0
+        self.sender_offsets: Dict[int, float] = {}
+        self.adaptive = dict(adaptive_config or {})
+        self.stagger = dict(stagger_config or {})
+        self.last_adjustment_reason = ""
+        self.deny_reasons: Dict[str, int] = {}
+
+    def start(self, job_start_ts: float, num_senders: int, partition_seed: str) -> None:
+        self.job_start_ts = float(job_start_ts or time.time())
+        self.last_refill_ts = self.job_start_ts
+        self.tokens_current = float(self.burst_tokens)
+        self.sender_offsets = {}
+        if not self.enabled:
+            return
+        step_s = max(0.0, float(self.stagger.get("step_s") or 0.0))
+        stagger_enabled = bool(self.stagger.get("enabled", True))
+        seed_mode = str(self.stagger.get("seed_mode") or "job").strip().lower()
+        for sender_idx in range(max(0, int(num_senders or 0))):
+            base_offset = float(sender_idx) * step_s if stagger_enabled else 0.0
+            jitter = 0.0
+            if stagger_enabled and seed_mode == "job":
+                h = hashlib.sha256(f"{str(partition_seed or '')}|{sender_idx}".encode("utf-8")).hexdigest()
+                jitter = (int(h[:6], 16) % 1000) / 1000.0
+            self.sender_offsets[sender_idx] = base_offset + jitter
+
+    def tokens_available(self, now_ts: float) -> float:
+        if not self.enabled:
+            return float("inf")
+        now = float(now_ts or time.time())
+        if self.last_refill_ts <= 0:
+            self.last_refill_ts = now
+            return self.tokens_current
+        elapsed = max(0.0, now - self.last_refill_ts)
+        if elapsed > 0:
+            self.tokens_current = min(float(self.burst_tokens), float(self.tokens_current) + (elapsed * float(self.refill_per_sec)))
+            self.last_refill_ts = now
+        return self.tokens_current
+
+    def next_allowed_ts_for_sender(self, sender_idx: int) -> float:
+        return float(self.job_start_ts) + float(self.sender_offsets.get(int(sender_idx or 0), 0.0))
+
+    def _inc_deny(self, reason: str) -> None:
+        r = str(reason or "denied")
+        self.deny_reasons[r] = int(self.deny_reasons.get(r) or 0) + 1
+
+    def can_start_lane(self, lane_key: Tuple[int, str], now_ts: float, planned_chunk_size: int) -> Tuple[bool, str]:
+        if not self.enabled:
+            return True, "disabled"
+        provider = str((lane_key or (0, ""))[1] or "").strip().lower()
+        if provider != self.provider_domain:
+            return True, "provider_mismatch"
+        sender_idx = int((lane_key or (0, ""))[0] or 0)
+        now = float(now_ts or time.time())
+        if bool(self.stagger.get("enabled", True)) and now < self.next_allowed_ts_for_sender(sender_idx):
+            self._inc_deny("stagger_wait")
+            return False, "stagger_wait"
+        planned_cost = max(1, int(planned_chunk_size or 1)) * int(self.token_cost_per_msg)
+        required = max(int(self.min_tokens_to_start_chunk), planned_cost)
+        if self.tokens_available(now) < float(required):
+            self._inc_deny("wave_tokens")
+            return False, "wave_tokens"
+        return True, "allow"
+
+    def reserve_tokens(self, lane_key: Tuple[int, str], now_ts: float, planned_cost: int) -> None:
+        if not self.enabled:
+            return
+        provider = str((lane_key or (0, ""))[1] or "").strip().lower()
+        if provider != self.provider_domain:
+            return
+        available = self.tokens_available(now_ts)
+        cost = max(0, int(planned_cost or 0))
+        self.tokens_current = max(0.0, min(float(self.burst_tokens), float(available) - float(cost)))
+
+    def release_tokens_partial(self, lane_key: Tuple[int, str], now_ts: float, unused_cost: int) -> None:
+        if not self.enabled:
+            return
+        provider = str((lane_key or (0, ""))[1] or "").strip().lower()
+        if provider != self.provider_domain:
+            return
+        self.tokens_available(now_ts)
+        self.tokens_current = min(float(self.burst_tokens), float(self.tokens_current) + float(max(0, int(unused_cost or 0))))
+
+    def on_feedback(self, now_ts: float, provider_metrics_snapshot: dict) -> None:
+        if not (self.enabled and bool(self.adaptive.get("enabled", True))):
+            return
+        d_rate = float((provider_metrics_snapshot or {}).get("deferral_rate") or 0.0)
+        h_rate = float((provider_metrics_snapshot or {}).get("hardfail_rate") or 0.0)
+        self.tokens_available(now_ts)
+        ramp_up = float(self.adaptive.get("ramp_up_factor") or 1.0)
+        ramp_down = float(self.adaptive.get("ramp_down_factor") or 1.0)
+        min_refill = float(self.adaptive.get("min_refill") or 0.5)
+        max_refill = float(self.adaptive.get("max_refill") or 10.0)
+        min_burst = float(self.adaptive.get("min_burst") or 100.0)
+        max_burst = float(self.adaptive.get("max_burst") or 1200.0)
+        if d_rate > float(self.adaptive.get("deferral_down") or 0.2) or h_rate > float(self.adaptive.get("hardfail_down") or 0.03):
+            self.refill_per_sec = max(min_refill, min(max_refill, float(self.refill_per_sec) * ramp_down))
+            self.burst_tokens = max(min_burst, min(max_burst, float(self.burst_tokens) * ramp_down))
+            self.tokens_current = min(float(self.tokens_current), float(self.burst_tokens))
+            self.last_adjustment_reason = "ramp_down"
+        elif d_rate < float(self.adaptive.get("deferral_up") or 0.1) and h_rate <= max(0.0, float(self.adaptive.get("hardfail_down") or 0.03) * 0.5):
+            self.refill_per_sec = max(min_refill, min(max_refill, float(self.refill_per_sec) * ramp_up))
+            self.burst_tokens = max(min_burst, min(max_burst, float(self.burst_tokens) * (1.0 + (ramp_up - 1.0) * 0.5)))
+            self.last_adjustment_reason = "ramp_up"
+
+    def snapshot(self) -> dict:
+        return {
+            "enabled": bool(self.enabled),
+            "provider_domain": str(self.provider_domain),
+            "tokens_current": float(self.tokens_current),
+            "burst_tokens": float(self.burst_tokens),
+            "refill_per_sec": float(self.refill_per_sec),
+            "min_tokens_to_start_chunk": int(self.min_tokens_to_start_chunk),
+            "token_cost_per_msg": int(self.token_cost_per_msg),
+            "last_adjustment_reason": str(self.last_adjustment_reason),
+            "next_allowed_ts_by_sender": {str(k): self.next_allowed_ts_for_sender(k) for k in sorted(self.sender_offsets.keys())},
+            "deny_reasons": {k: int(v) for k, v in sorted(self.deny_reasons.items())},
         }
 
 
@@ -12633,6 +12796,30 @@ def smtp_send_job(
     fallback_controller_enabled = bool(get_env_bool("SHIVA_FALLBACK_CONTROLLER", False))
     fallback_debug = bool(get_env_bool("SHIVA_FALLBACK_DEBUG", False))
     fallback_export = bool(get_env_bool("SHIVA_FALLBACK_EXPORT", False))
+    single_domain_waves_enabled = bool(get_env_bool("SHIVA_SINGLE_DOMAIN_WAVES", False))
+    single_domain_waves_debug = bool(get_env_bool("SHIVA_SINGLE_DOMAIN_WAVES_DEBUG", False))
+    single_domain_waves_export = bool(get_env_bool("SHIVA_SINGLE_DOMAIN_WAVES_EXPORT", False))
+    single_domain_only_if_providers_eq = bool(get_env_bool("SHIVA_SINGLE_DOMAIN_ONLY_IF_PROVIDERS_EQ", True))
+    wave_burst_tokens = max(1, int(get_env_int("SHIVA_WAVE_BURST_TOKENS", 400)))
+    wave_refill_per_sec = max(0.1, float(get_env_float("SHIVA_WAVE_REFILL_PER_SEC", 3.0)))
+    wave_token_cost_per_msg = max(1, int(get_env_int("SHIVA_WAVE_TOKEN_COST_PER_MSG", 1)))
+    wave_min_tokens_to_start_chunk = max(1, int(get_env_int("SHIVA_WAVE_MIN_TOKENS_TO_START_CHUNK", 50)))
+    wave_max_parallel_single_domain = max(1, min(10, int(get_env_int("SHIVA_WAVE_MAX_PARALLEL_LANES_SINGLE_DOMAIN", 1))))
+    wave_stagger_enabled = bool(get_env_bool("SHIVA_WAVE_STAGGER_ENABLED", True))
+    wave_stagger_step_s = max(0.0, float(get_env_float("SHIVA_WAVE_STAGGER_STEP_S", 25)))
+    wave_stagger_seed_mode = str(get_env("SHIVA_WAVE_STAGGER_SEED_MODE", "job") or "job").strip().lower()
+    if wave_stagger_seed_mode not in {"job", "static"}:
+        wave_stagger_seed_mode = "job"
+    wave_adaptive_enabled = bool(get_env_bool("SHIVA_WAVE_ADAPTIVE", True))
+    wave_deferral_up = max(0.0, min(1.0, float(get_env_float("SHIVA_WAVE_DEFERRAL_UP", 0.10))))
+    wave_deferral_down = max(0.0, min(1.0, float(get_env_float("SHIVA_WAVE_DEFERRAL_DOWN", 0.20))))
+    wave_hardfail_down = max(0.0, min(1.0, float(get_env_float("SHIVA_WAVE_HARDFAIL_DOWN", 0.03))))
+    wave_ramp_up_factor = max(1.0, float(get_env_float("SHIVA_WAVE_RAMP_UP_FACTOR", 1.08)))
+    wave_ramp_down_factor = min(1.0, max(0.1, float(get_env_float("SHIVA_WAVE_RAMP_DOWN_FACTOR", 0.70))))
+    wave_min_refill = max(0.1, float(get_env_float("SHIVA_WAVE_MIN_REFILL", 0.5)))
+    wave_max_refill = max(wave_min_refill, float(get_env_float("SHIVA_WAVE_MAX_REFILL", 10.0)))
+    wave_min_burst = max(1.0, float(get_env_float("SHIVA_WAVE_MIN_BURST", 100)))
+    wave_max_burst = max(wave_min_burst, float(get_env_float("SHIVA_WAVE_MAX_BURST", 1200)))
     fallback_window_s = max(60, int(get_env_int("SHIVA_FALLBACK_WINDOW_S", 300)))
     fallback_deferral_rate = min(1.0, max(0.0, float(get_env_float("SHIVA_FALLBACK_DEFERRAL_RATE", 0.35))))
     fallback_hardfail_rate = min(1.0, max(0.0, float(get_env_float("SHIVA_FALLBACK_HARDFAIL_RATE", 0.05))))
@@ -12739,6 +12926,7 @@ def smtp_send_job(
     budget_mgr = BudgetManager(budget_config, lane_registry=lane_registry, debug=budget_debug) if budget_manager_enabled else None
 
     provider_cooldown_until: Dict[str, float] = {}
+    lock_wave = threading.Lock()
 
     def _lane_key(sender_idx: int, provider_domain: str) -> Tuple[int, str]:
         return (int(sender_idx or 0), str(provider_domain or "").strip().lower())
@@ -12850,14 +13038,42 @@ def smtp_send_job(
                 return True
         return False
 
-    def _budget_can_start(lane_key: Tuple[int, str], now_ts: float, is_retry: bool, is_probe: bool) -> Tuple[bool, str]:
+    def _budget_can_start(lane_key: Tuple[int, str], now_ts: float, is_retry: bool, is_probe: bool, planned_chunk_size_hint: Optional[int] = None) -> Tuple[bool, str]:
         if not budget_mgr:
             return True, "disabled"
-        allowed, reason = budget_mgr.can_start(lane_key, now_ts, is_retry, is_probe)
-        if (not allowed) and (lane_debug_enabled or budget_debug):
+        allowed, reason = budget_mgr.can_start(lane_key, now_ts, is_retry, is_probe, planned_chunk_size_hint=planned_chunk_size_hint)
+        if (not allowed) and (lane_debug_enabled or budget_debug or single_domain_waves_debug):
             with JOBS_LOCK:
                 job.log("INFO", f"BudgetManager: denied lane {lane_key[0]}|{lane_key[1]} reason={reason}")
         return allowed, reason
+
+    def _provider_metrics_snapshot(provider_domain: str) -> dict:
+        provider = str(provider_domain or "").strip().lower()
+        totals = {
+            "attempts_total": 0,
+            "deferrals_4xx": 0,
+            "hardfails_5xx": 0,
+            "timeouts_conn": 0,
+            "deferral_rate": 0.0,
+            "hardfail_rate": 0.0,
+            "timeout_rate": 0.0,
+        }
+        if not lane_metrics or not provider:
+            return totals
+        snap = lane_metrics.snapshot()
+        lanes = (snap.get("lanes") if isinstance(snap, dict) else {}) or {}
+        for lane in lanes.values():
+            if str((lane or {}).get("provider_domain") or "").strip().lower() != provider:
+                continue
+            totals["attempts_total"] += int((lane or {}).get("attempts_total") or 0)
+            totals["deferrals_4xx"] += int((lane or {}).get("deferrals_4xx") or 0)
+            totals["hardfails_5xx"] += int((lane or {}).get("hardfails_5xx") or 0)
+            totals["timeouts_conn"] += int((lane or {}).get("timeouts_conn") or 0)
+        attempts = max(1, int(totals["attempts_total"] or 0))
+        totals["deferral_rate"] = float(totals["deferrals_4xx"] / attempts)
+        totals["hardfail_rate"] = float(totals["hardfails_5xx"] / attempts)
+        totals["timeout_rate"] = float(totals["timeouts_conn"] / attempts)
+        return totals
 
     def _lane_metrics_export_snapshot() -> None:
         if lane_metrics and lane_metrics_export:
@@ -12870,6 +13086,9 @@ def smtp_send_job(
         if budget_mgr and budget_config.export:
             with JOBS_LOCK:
                 job.debug_budget_status = budget_mgr.snapshot()
+        if wave_controller.enabled and single_domain_waves_export:
+            with JOBS_LOCK:
+                job.debug_wave_status = wave_controller.snapshot()
 
     smtp_host_ips = _resolve_ipv4(smtp_host) if smtp_host else []
 
@@ -13343,14 +13562,62 @@ def smtp_send_job(
             for d, cnt in (provider_buckets or {}).items()
             if str(d or "").strip() and int(cnt or 0) > 0
         ]
+        provider_domain_count = len(set(probe_provider_domains))
+        single_provider_domain = str(probe_provider_domains[0] or "").strip().lower() if provider_domain_count == 1 else ""
+        wave_mode_active = bool(single_domain_waves_enabled)
+        if single_domain_only_if_providers_eq:
+            wave_mode_active = bool(wave_mode_active and provider_domain_count == 1)
+        wave_controller = WaveController(
+            enabled=wave_mode_active,
+            provider_domain=single_provider_domain,
+            burst_tokens=wave_burst_tokens,
+            refill_per_sec=wave_refill_per_sec,
+            min_tokens_to_start_chunk=wave_min_tokens_to_start_chunk,
+            adaptive_config={
+                "enabled": wave_adaptive_enabled,
+                "token_cost_per_msg": wave_token_cost_per_msg,
+                "deferral_up": wave_deferral_up,
+                "deferral_down": wave_deferral_down,
+                "hardfail_down": wave_hardfail_down,
+                "ramp_up_factor": wave_ramp_up_factor,
+                "ramp_down_factor": wave_ramp_down_factor,
+                "min_refill": wave_min_refill,
+                "max_refill": wave_max_refill,
+                "min_burst": wave_min_burst,
+                "max_burst": wave_max_burst,
+            },
+            stagger_config={
+                "enabled": wave_stagger_enabled,
+                "step_s": wave_stagger_step_s,
+                "seed_mode": wave_stagger_seed_mode,
+            },
+        )
+        wave_controller.start(job_start_ts=time.time(), num_senders=len(sender_emails), partition_seed=partition_seed)
+        if wave_controller.enabled and probe_controller.is_active(time.time()):
+            probe_controller.stop()
         probe_controller.start(
             job_start_ts=time.time(),
             provider_domains=probe_provider_domains,
             num_senders=len(sender_emails),
         )
+        if wave_controller.enabled and probe_controller.is_active(time.time()):
+            probe_controller.stop()
+        if budget_mgr and wave_controller.enabled and single_provider_domain:
+            budget_mgr.set_provider_max_inflight_override(single_provider_domain, wave_max_parallel_single_domain)
+            budget_mgr.register_external_gate(
+                "single_domain_wave",
+                lambda lane_key, now_ts, _is_retry, _is_probe, planned_chunk_size_hint: wave_controller.can_start_lane(
+                    lane_key,
+                    now_ts,
+                    int(planned_chunk_size_hint or wave_min_tokens_to_start_chunk),
+                ),
+            )
         if probe_export:
             with JOBS_LOCK:
                 job.debug_probe_status = probe_controller.snapshot()
+        if single_domain_waves_export:
+            with JOBS_LOCK:
+                job.debug_wave_status = wave_controller.snapshot()
 
         scheduler_mode_runtime = str(scheduler_mode)
         lane_concurrency_runtime = bool(lane_concurrency_enabled)
@@ -13440,6 +13707,11 @@ def smtp_send_job(
                     "INFO",
                     f"Probe mode enabled: providers={len(set(probe_provider_domains))} rounds={probe_rounds} duration_s={probe_duration_s}",
                 )
+            if wave_controller.enabled:
+                job.log(
+                    "INFO",
+                    f"Single-domain wave mode enabled: provider={single_provider_domain} refill={wave_controller.refill_per_sec:.2f}/s burst={int(wave_controller.burst_tokens)} stagger_step_s={wave_stagger_step_s}",
+                )
 
         def _remaining_total() -> int:
             queued = sum(sum(len(v) for v in domains.values()) for domains in sender_bucket_by_idx.values())
@@ -13496,7 +13768,7 @@ def smtp_send_job(
                     if retry_q2 and float(retry_q2[0].get("next_retry_ts") or 0.0) <= now_ts:
                         lane_key2 = _lane_key(sender_idx2, dom2)
                         if budget_mgr and budget_config.apply_to_retry:
-                            allowed2, _reason2 = _budget_can_start(lane_key2, now_ts, True, False)
+                            allowed2, _reason2 = _budget_can_start(lane_key2, now_ts, True, False, planned_chunk_size_hint=cs)
                             if not allowed2:
                                 continue
                         sender_cursor = (sender_idx2 + 1) % n
@@ -13512,7 +13784,7 @@ def smtp_send_job(
                         continue
                     lane_key = _lane_key(sender_idx, d)
                     if budget_mgr:
-                        allowed_legacy, _reason_legacy = _budget_can_start(lane_key, now_ts, False, False)
+                        allowed_legacy, _reason_legacy = _budget_can_start(lane_key, now_ts, False, False, planned_chunk_size_hint=cs)
                         if not allowed_legacy:
                             continue
                     weighted_legacy.append((d, len(v)))
@@ -13535,7 +13807,7 @@ def smtp_send_job(
                     continue
                 lane_key = _lane_key(sender_idx, d)
                 if budget_mgr:
-                    allowed, _reason = _budget_can_start(lane_key, now_ts, False, False)
+                    allowed, _reason = _budget_can_start(lane_key, now_ts, False, False, planned_chunk_size_hint=cs)
                     if not allowed:
                         continue
                 if _is_lane_temporarily_blocked(lane_key, now_ts):
@@ -13576,7 +13848,7 @@ def smtp_send_job(
                         if retry_q2 and float(retry_q2[0].get("next_retry_ts") or 0.0) <= now_ts:
                             lane_key2 = _lane_key(sender_idx2, dom2)
                             if budget_mgr and budget_config.apply_to_retry:
-                                allowed2, _reason2 = _budget_can_start(lane_key2, now_ts, True, False)
+                                allowed2, _reason2 = _budget_can_start(lane_key2, now_ts, True, False, planned_chunk_size_hint=cs)
                                 if not allowed2:
                                     continue
                             sender_cursor = (sender_idx2 + 1) % n
@@ -14298,6 +14570,10 @@ def smtp_send_job(
                     before_recent_len = len(job.recent_results or [])
 
                 lane_key_current = _lane_key(sender_idx_fixed, target_domain)
+                wave_cost = max(1, len(chunk)) * wave_token_cost_per_msg
+                if wave_controller.enabled:
+                    with lock_wave:
+                        wave_controller.reserve_tokens(lane_key_current, time.time(), wave_cost)
                 if budget_mgr:
                     budget_mgr.on_start(lane_key_current, time.time())
                 try:
@@ -14338,6 +14614,9 @@ def smtp_send_job(
                             "sleep_chunks": sleep2,
                         },
                     )
+                    if wave_controller.enabled:
+                        with lock_wave:
+                            wave_controller.on_feedback(time.time(), _provider_metrics_snapshot(target_domain))
                     _lane_metrics_export_snapshot()
                 db_log_email_attempt(
                     job_id=job_id,
@@ -14657,6 +14936,50 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "If enabled, probe mode lane picks must pass BudgetManager gate."},
     {"key": "SHIVA_BUDGET_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Export BudgetManager debug snapshot into job debug payload as additive field debug_budget_status."},
+    {"key": "SHIVA_SINGLE_DOMAIN_WAVES", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Enable single-provider-domain wave pacing mode (provider-wide token bucket + deterministic stagger)."},
+    {"key": "SHIVA_SINGLE_DOMAIN_WAVES_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Emit concise wave-controller debug logs for single-domain pacing mode."},
+    {"key": "SHIVA_SINGLE_DOMAIN_WAVES_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Export wave-controller job snapshot into debug_wave_status."},
+    {"key": "SHIVA_SINGLE_DOMAIN_ONLY_IF_PROVIDERS_EQ", "type": "bool", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "Only activate wave mode when exactly one recipient provider-domain exists in this job."},
+    {"key": "SHIVA_WAVE_BURST_TOKENS", "type": "int", "default": "400", "group": "Scheduler", "restart_required": False,
+     "desc": "Single-domain wave token-bucket capacity (wave size ceiling)."},
+    {"key": "SHIVA_WAVE_REFILL_PER_SEC", "type": "float", "default": "3.0", "group": "Scheduler", "restart_required": False,
+     "desc": "Token refill rate per second for single-domain wave mode."},
+    {"key": "SHIVA_WAVE_TOKEN_COST_PER_MSG", "type": "int", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "Token cost per message when reserving a chunk in wave mode."},
+    {"key": "SHIVA_WAVE_MIN_TOKENS_TO_START_CHUNK", "type": "int", "default": "50", "group": "Scheduler", "restart_required": False,
+     "desc": "Minimum tokens required before any chunk may start in wave mode."},
+    {"key": "SHIVA_WAVE_MAX_PARALLEL_LANES_SINGLE_DOMAIN", "type": "int", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "Job-local provider inflight cap override applied when single-domain wave mode is active."},
+    {"key": "SHIVA_WAVE_STAGGER_ENABLED", "type": "bool", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "Enable deterministic sender stagger offsets in single-domain wave mode."},
+    {"key": "SHIVA_WAVE_STAGGER_STEP_S", "type": "float", "default": "25", "group": "Scheduler", "restart_required": False,
+     "desc": "Base stagger step seconds; sender_i starts after i * step."},
+    {"key": "SHIVA_WAVE_STAGGER_SEED_MODE", "type": "str", "default": "job", "group": "Scheduler", "restart_required": False,
+     "desc": "Stagger seed mode: job | static. job adds deterministic per-job jitter."},
+    {"key": "SHIVA_WAVE_ADAPTIVE", "type": "bool", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "Enable adaptive wave refill/burst tuning from lane metrics feedback."},
+    {"key": "SHIVA_WAVE_DEFERRAL_UP", "type": "float", "default": "0.10", "group": "Scheduler", "restart_required": False,
+     "desc": "Adaptive ramp-up guard: requires deferral_rate below this threshold."},
+    {"key": "SHIVA_WAVE_DEFERRAL_DOWN", "type": "float", "default": "0.20", "group": "Scheduler", "restart_required": False,
+     "desc": "Adaptive ramp-down threshold for provider deferral_rate."},
+    {"key": "SHIVA_WAVE_HARDFAIL_DOWN", "type": "float", "default": "0.03", "group": "Scheduler", "restart_required": False,
+     "desc": "Adaptive ramp-down threshold for provider hardfail_rate."},
+    {"key": "SHIVA_WAVE_RAMP_UP_FACTOR", "type": "float", "default": "1.08", "group": "Scheduler", "restart_required": False,
+     "desc": "Slow adaptive ramp-up multiplier for wave refill/burst."},
+    {"key": "SHIVA_WAVE_RAMP_DOWN_FACTOR", "type": "float", "default": "0.70", "group": "Scheduler", "restart_required": False,
+     "desc": "Fast adaptive ramp-down multiplier for wave refill/burst."},
+    {"key": "SHIVA_WAVE_MIN_REFILL", "type": "float", "default": "0.5", "group": "Scheduler", "restart_required": False,
+     "desc": "Lower clamp for adaptive refill_per_sec."},
+    {"key": "SHIVA_WAVE_MAX_REFILL", "type": "float", "default": "10.0", "group": "Scheduler", "restart_required": False,
+     "desc": "Upper clamp for adaptive refill_per_sec."},
+    {"key": "SHIVA_WAVE_MIN_BURST", "type": "float", "default": "100", "group": "Scheduler", "restart_required": False,
+     "desc": "Lower clamp for adaptive burst_tokens."},
+    {"key": "SHIVA_WAVE_MAX_BURST", "type": "float", "default": "1200", "group": "Scheduler", "restart_required": False,
+     "desc": "Upper clamp for adaptive burst_tokens."},
 
     # App (restart-only)
     {"key": "SHIVA_HOST", "type": "str", "default": "0.0.0.0", "group": "App", "restart_required": True,
