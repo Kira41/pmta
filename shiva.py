@@ -2031,23 +2031,35 @@ def resolve_caps_for_attempt(
 class LaneExecutor:
     """Concurrent lane-task runner (job-scoped)."""
 
-    def __init__(self, max_parallel_lanes: int, lane_picker_v2: Optional[LanePickerV2], budget_mgr: Optional[BudgetManager], locks: dict, debug: bool = False):
+    def __init__(self, max_parallel_lanes: int, lane_picker_v2: Optional[LanePickerV2], budget_mgr: Optional[BudgetManager], locks: dict, debug: bool = False, governor: Optional['GlobalResourceGovernor'] = None):
         self.max_parallel_lanes = max(1, int(max_parallel_lanes or 1))
         self.lane_picker_v2 = lane_picker_v2
         self.budget_mgr = budget_mgr
+        self.governor = governor
         self.debug = bool(debug)
         self._locks = dict(locks or {})
         self._executor = ThreadPoolExecutor(max_workers=self.max_parallel_lanes)
         self._inflight: Dict[Tuple[int, str], dict] = {}
         self._recent: deque = deque(maxlen=10)
+        self._accept_new = True
+        self._lock_inflight = threading.Lock()
 
     def submit_ready_tasks(self, now_ts: float, job_context: dict) -> int:
+        if not self._accept_new:
+            return 0
         submitted = 0
         picker = job_context.get("pick_lane")
         task_fn = job_context.get("task_fn")
+        resolve_caps = job_context.get("resolve_caps")
+        pmta_pressure_level = int((job_context.get("pmta_pressure_level")() if callable(job_context.get("pmta_pressure_level")) else (job_context.get("pmta_pressure_level") or 0)) or 0)
+        should_stop = job_context.get("should_stop")
+        wait_if_paused = job_context.get("wait_if_paused")
         max_scan_attempts = max(1, int(job_context.get("max_scan_attempts") or (self.max_parallel_lanes * 3)))
         attempts = 0
         while len(self._inflight) < self.max_parallel_lanes and attempts < max_scan_attempts:
+            if callable(should_stop) and bool(should_stop()):
+                self._accept_new = False
+                break
             attempts += 1
             lane_key, meta = picker(float(now_ts or time.time()))
             if not lane_key:
@@ -2056,15 +2068,69 @@ class LaneExecutor:
                 continue
             is_retry = str((meta or {}).get("pick_type") or "") == "retry"
             is_probe = bool((meta or {}).get("probe_active"))
+            effective_caps = {}
+            caps_meta = {}
+            if callable(resolve_caps):
+                try:
+                    effective_caps, caps_meta = resolve_caps(lane_key, float(now_ts or time.time()), bool(is_probe), dict(meta or {}))
+                except Exception:
+                    effective_caps, caps_meta = {}, {}
+            workers_needed = max(1, int((effective_caps or {}).get("thread_workers") or (effective_caps or {}).get("workers") or (meta or {}).get("thread_workers") or (job_context.get("thread_workers_default") or 1)))
             if self.budget_mgr:
                 allowed, reason = self.budget_mgr.can_start(lane_key, now_ts, is_retry, is_probe)
                 if not allowed:
                     if self.debug:
                         job_context.get("debug_log", lambda *_: None)(f"LaneExecutor deny {lane_key[0]}|{lane_key[1]} reason={reason}")
                     continue
+            if self.governor:
+                allowed, reason = self.governor.can_reserve(workers_needed, now_ts, pmta_pressure_level)
+                if not allowed:
+                    if self.debug:
+                        job_context.get("debug_log", lambda *_: None)(f"LaneExecutor governor deny {lane_key[0]}|{lane_key[1]} reason={reason}")
+                    continue
+            release_state = {"released": False}
+            if self.governor:
+                self.governor.reserve(workers_needed, lane_key, now_ts)
+            if self.budget_mgr:
                 self.budget_mgr.on_start(lane_key, now_ts)
-            fut = self._executor.submit(task_fn, lane_key, now_ts, bool(is_probe), meta or {})
-            self._inflight[lane_key] = {"future": fut, "started_ts": float(now_ts or time.time()), "meta": dict(meta or {})}
+
+            def _task_wrapper() -> dict:
+                try:
+                    if callable(should_stop) and bool(should_stop()):
+                        return {"status": "stopped", "lane": f"{lane_key[0]}|{lane_key[1]}", "reason": "stop_requested"}
+                    if callable(wait_if_paused) and not bool(wait_if_paused()):
+                        return {"status": "stopped", "lane": f"{lane_key[0]}|{lane_key[1]}", "reason": "stop_requested"}
+                    if callable(should_stop) and bool(should_stop()):
+                        return {"status": "stopped", "lane": f"{lane_key[0]}|{lane_key[1]}", "reason": "stop_requested"}
+                    try:
+                        return task_fn(
+                            lane_key,
+                            now_ts,
+                            bool(is_probe),
+                            meta or {},
+                            reserved_workers=workers_needed,
+                            effective_caps=(effective_caps or {}),
+                            caps_meta=(caps_meta or {}),
+                        )
+                    except TypeError:
+                        return task_fn(lane_key, now_ts, bool(is_probe), meta or {})
+                finally:
+                    if not release_state["released"]:
+                        release_state["released"] = True
+                        if self.budget_mgr:
+                            self.budget_mgr.on_finish(lane_key, time.time())
+                        if self.governor:
+                            self.governor.release(workers_needed, lane_key, time.time())
+
+            fut = self._executor.submit(_task_wrapper)
+            self._inflight[lane_key] = {
+                "future": fut,
+                "started_ts": float(now_ts or time.time()),
+                "meta": {**dict(meta or {}), "effective_caps": dict(effective_caps or {}), "caps_meta": dict(caps_meta or {})},
+                "reserved_workers": int(workers_needed),
+                "release_state": release_state,
+                "managed_cleanup": True,
+            }
             submitted += 1
         return submitted
 
@@ -2082,20 +2148,24 @@ class LaneExecutor:
                     self._recent.append({"lane": f"{lane_key[0]}|{lane_key[1]}", "status": "exception", "error": str(e), "ts": now_ts})
                     on_error(lane_key, e)
                 finally:
-                    if self.budget_mgr:
-                        self.budget_mgr.on_finish(lane_key, time.time())
                     self._inflight.pop(lane_key, None)
                 continue
             if started_ts > 0 and timeout_s > 0 and (now_ts - started_ts) > timeout_s:
+                canceled = False
                 try:
                     if isinstance(fut, Future):
-                        fut.cancel()
+                        canceled = bool(fut.cancel())
                 except Exception:
                     pass
                 self._recent.append({"lane": f"{lane_key[0]}|{lane_key[1]}", "status": "timeout", "ts": now_ts})
                 on_error(lane_key, TimeoutError(f"lane task timeout > {int(timeout_s)}s"))
-                if self.budget_mgr:
-                    self.budget_mgr.on_finish(lane_key, time.time())
+                release_state = info.get("release_state") if isinstance(info.get("release_state"), dict) else None
+                if canceled and release_state is not None and not bool(release_state.get("released")):
+                    release_state["released"] = True
+                    if self.budget_mgr:
+                        self.budget_mgr.on_finish(lane_key, time.time())
+                    if self.governor:
+                        self.governor.release(int(info.get("reserved_workers") or 0), lane_key, time.time())
                 self._inflight.pop(lane_key, None)
 
     def snapshot(self) -> dict:
@@ -2107,10 +2177,91 @@ class LaneExecutor:
             ],
             "recent_completions": list(self._recent),
             "budget": self.budget_mgr.snapshot() if self.budget_mgr else {},
+            "resource_governor": self.governor.snapshot() if self.governor else {},
         }
 
-    def stop_gracefully(self) -> None:
-        self._executor.shutdown(wait=True, cancel_futures=False)
+    def stop_gracefully(self, grace_s: float = 30.0, force_disable: bool = True, on_force_disable: Optional[Callable[[], None]] = None) -> bool:
+        self._accept_new = False
+        deadline = time.time() + max(0.0, float(grace_s or 0.0))
+        while time.time() < deadline:
+            if not self._inflight:
+                self._executor.shutdown(wait=False, cancel_futures=False)
+                return True
+            self.poll_completed_tasks(0.0, lambda *_: None, lambda *_: None)
+            time.sleep(0.05)
+        drained = not bool(self._inflight)
+        if (not drained) and force_disable and callable(on_force_disable):
+            try:
+                on_force_disable()
+            except Exception:
+                pass
+        self._executor.shutdown(wait=False, cancel_futures=False)
+        return drained
+
+
+class GlobalResourceGovernor:
+    """Job-scoped workers/session reservation governor for concurrent lane scheduling."""
+
+    def __init__(self, max_total_workers: int, debug: bool = False, pmta_scale_config: Optional[dict] = None):
+        self.max_total_workers = max(1, int(max_total_workers or 1))
+        self.debug = bool(debug)
+        self.pmta_scale_config = dict(pmta_scale_config or {})
+        self.total_workers_inflight = 0
+        self.inflight_by_lane: Dict[str, int] = {}
+        self.last_denials: deque = deque(maxlen=20)
+        self.lock_governor = threading.Lock()
+
+    def _lane_id(self, lane_key: Tuple[int, str]) -> str:
+        return f"{int((lane_key or (0, ''))[0] or 0)}|{str((lane_key or (0, ''))[1] or '').strip().lower()}"
+
+    def effective_max_total_workers(self, pmta_pressure_level: Optional[int] = None) -> int:
+        level = int(pmta_pressure_level or 0)
+        if not bool(self.pmta_scale_config.get("enabled", True)):
+            return int(self.max_total_workers)
+        factor = 1.0
+        if level >= 3:
+            factor = float(self.pmta_scale_config.get("level3_factor") or 0.50)
+        elif level >= 2:
+            factor = float(self.pmta_scale_config.get("level2_factor") or 0.75)
+        return max(1, int(math.floor(float(self.max_total_workers) * max(0.05, factor))))
+
+    def can_reserve(self, workers_needed: int, now_ts: float, pmta_pressure_level: Optional[int] = None) -> Tuple[bool, str]:
+        needed = max(1, int(workers_needed or 1))
+        with self.lock_governor:
+            effective_max = self.effective_max_total_workers(pmta_pressure_level)
+            projected = int(self.total_workers_inflight) + needed
+            if projected > effective_max:
+                reason = f"workers_budget projected={projected} max={effective_max}"
+                self.last_denials.append({"ts": float(now_ts or time.time()), "reason": reason, "needed": needed, "inflight": int(self.total_workers_inflight), "max": int(effective_max)})
+                return False, reason
+            return True, "ok"
+
+    def reserve(self, workers_needed: int, lane_key: Tuple[int, str], now_ts: float) -> None:
+        needed = max(1, int(workers_needed or 1))
+        lid = self._lane_id(lane_key)
+        with self.lock_governor:
+            self.total_workers_inflight += needed
+            self.inflight_by_lane[lid] = int(self.inflight_by_lane.get(lid) or 0) + needed
+
+    def release(self, workers_needed: int, lane_key: Tuple[int, str], now_ts: float) -> None:
+        needed = max(0, int(workers_needed or 0))
+        lid = self._lane_id(lane_key)
+        with self.lock_governor:
+            self.total_workers_inflight = max(0, int(self.total_workers_inflight) - needed)
+            left = max(0, int(self.inflight_by_lane.get(lid) or 0) - needed)
+            if left <= 0:
+                self.inflight_by_lane.pop(lid, None)
+            else:
+                self.inflight_by_lane[lid] = left
+
+    def snapshot(self) -> dict:
+        with self.lock_governor:
+            return {
+                "max_total_workers": int(self.max_total_workers),
+                "total_workers_inflight": int(self.total_workers_inflight),
+                "inflight_by_lane": dict(sorted(self.inflight_by_lane.items())),
+                "last_denials": list(self.last_denials),
+            }
 
 
 class FallbackController:
@@ -2506,6 +2657,7 @@ class SendJob:
     debug_probe_status: dict = field(default_factory=dict)
     debug_budget_status: dict = field(default_factory=dict)
     debug_lane_executor: dict = field(default_factory=dict)
+    debug_resource_governor: dict = field(default_factory=dict)
     debug_fallback: dict = field(default_factory=dict)
     debug_provider_canon: dict = field(default_factory=dict)
     debug_backoff_jitter: List[dict] = field(default_factory=list)
@@ -3425,6 +3577,7 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "debug_probe_status": job.debug_probe_status or {},
         "debug_budget_status": job.debug_budget_status or {},
         "debug_lane_executor": job.debug_lane_executor or {},
+        "debug_resource_governor": job.debug_resource_governor or {},
         "debug_fallback": job.debug_fallback or {},
         "debug_provider_canon": job.debug_provider_canon or {},
         "debug_backoff_jitter": (job.debug_backoff_jitter or [])[-50:],
@@ -4186,6 +4339,7 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job.debug_probe_status = (s.get("debug_probe_status") if isinstance(s.get("debug_probe_status"), dict) else {}) or {}
         job.debug_budget_status = (s.get("debug_budget_status") if isinstance(s.get("debug_budget_status"), dict) else {}) or {}
         job.debug_lane_executor = (s.get("debug_lane_executor") if isinstance(s.get("debug_lane_executor"), dict) else {}) or {}
+        job.debug_resource_governor = (s.get("debug_resource_governor") if isinstance(s.get("debug_resource_governor"), dict) else {}) or {}
         job.debug_fallback = (s.get("debug_fallback") if isinstance(s.get("debug_fallback"), dict) else {}) or {}
         job.debug_provider_canon = (s.get("debug_provider_canon") if isinstance(s.get("debug_provider_canon"), dict) else {}) or {}
         job.debug_backoff_jitter = list(s.get("debug_backoff_jitter") or [])
@@ -13627,6 +13781,20 @@ def smtp_send_job(
     lane_task_timeout_s = max(30, int(get_env_int("SHIVA_LANE_TASK_TIMEOUT_S", 900)))
     lane_concurrency_debug = bool(get_env_bool("SHIVA_LANE_CONCURRENCY_DEBUG", False))
     lane_concurrency_export = bool(get_env_bool("SHIVA_LANE_CONCURRENCY_EXPORT", False))
+    resource_governor_enabled = bool(get_env_bool("SHIVA_RESOURCE_GOVERNOR", False))
+    resource_governor_debug = bool(get_env_bool("SHIVA_RESOURCE_GOVERNOR_DEBUG", False))
+    resource_governor_export = bool(get_env_bool("SHIVA_RESOURCE_GOVERNOR_EXPORT", False))
+    max_total_workers = max(1, int(get_env_int("SHIVA_MAX_TOTAL_WORKERS", 40)))
+    max_total_lanes = max(1, int(get_env_int("SHIVA_MAX_TOTAL_LANES", 5)))
+    worker_reserve_mode = (get_env("SHIVA_WORKER_RESERVE_MODE", "workers") or "workers").strip().lower() or "workers"
+    if worker_reserve_mode not in {"workers", "sessions"}:
+        worker_reserve_mode = "workers"
+    governor_apply_in_sequential = bool(get_env_bool("SHIVA_GOVERNOR_APPLY_IN_SEQUENTIAL", False))
+    governor_pmta_scale = bool(get_env_bool("SHIVA_GOVERNOR_PMTA_SCALE", True))
+    governor_pmta_level2_factor = max(0.05, min(1.0, float(get_env_float("SHIVA_GOVERNOR_PMTA_LEVEL2_FACTOR", 0.75))))
+    governor_pmta_level3_factor = max(0.05, min(1.0, float(get_env_float("SHIVA_GOVERNOR_PMTA_LEVEL3_FACTOR", 0.50))))
+    concurrency_stop_grace_s = max(1, int(get_env_int("SHIVA_CONCURRENCY_STOP_GRACE_S", 30)))
+    concurrency_stop_force_disable = bool(get_env_bool("SHIVA_CONCURRENCY_STOP_FORCE_DISABLE", True))
     fallback_controller_enabled = bool(get_env_bool("SHIVA_FALLBACK_CONTROLLER", False))
     fallback_debug = bool(get_env_bool("SHIVA_FALLBACK_DEBUG", False))
     fallback_export = bool(get_env_bool("SHIVA_FALLBACK_EXPORT", False))
@@ -13739,6 +13907,9 @@ def smtp_send_job(
     if lane_concurrency_export:
         with JOBS_LOCK:
             job.debug_lane_executor = {}
+    if resource_governor_export:
+        with JOBS_LOCK:
+            job.debug_resource_governor = {}
     if fallback_export:
         with JOBS_LOCK:
             job.debug_fallback = {}
@@ -14484,6 +14655,16 @@ def smtp_send_job(
         ) if (lane_v2_rollout_enabled or shadow_mode_active or scheduler_mode == "lane_v2") else None
         shadow_recorder = ShadowRecorder(shadow_max_events) if shadow_mode_active else None
         lane_concurrency_runtime = bool(lane_concurrency_enabled and lane_v2_rollout_enabled and not force_disable_concurrency)
+        lane_parallel_limit_runtime = min(int(lane_max_parallel), int(max_total_lanes)) if resource_governor_enabled else int(lane_max_parallel)
+        resource_governor = GlobalResourceGovernor(
+            max_total_workers=max_total_workers,
+            debug=resource_governor_debug,
+            pmta_scale_config={
+                "enabled": bool(governor_pmta_scale),
+                "level2_factor": float(governor_pmta_level2_factor),
+                "level3_factor": float(governor_pmta_level3_factor),
+            },
+        ) if resource_governor_enabled else None
         if lane_concurrency_enabled and not lane_v2_rollout_enabled:
             with JOBS_LOCK:
                 job.log("INFO", "Lane concurrency disabled for this job (rollout not in v2 mode).")
@@ -14631,6 +14812,7 @@ def smtp_send_job(
             nonlocal lane_concurrency_runtime
             if lane_concurrency_runtime:
                 lane_concurrency_runtime = False
+                lane_parallel_limit_runtime = 1
                 with JOBS_LOCK:
                     job.log("WARN", "Fallback controller: lane concurrency disabled for this job")
 
@@ -15776,6 +15958,9 @@ def smtp_send_job(
                     _stop_job("stop requested")
                     return
 
+        if lane_concurrency_runtime and resource_governor and resource_governor_export:
+            with JOBS_LOCK:
+                job.debug_resource_governor = resource_governor.snapshot()
         with JOBS_LOCK:
             job.status = "done"
             job.current_chunk = -1
@@ -15963,6 +16148,30 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "Emit concise lane concurrency executor logs."},
     {"key": "SHIVA_LANE_CONCURRENCY_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Export lane executor snapshot into job debug payload as debug_lane_executor."},
+    {"key": "SHIVA_RESOURCE_GOVERNOR", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Enable job-scoped global worker/session governor for concurrent lane submissions."},
+    {"key": "SHIVA_RESOURCE_GOVERNOR_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Emit concise global resource governor denial/debug logs."},
+    {"key": "SHIVA_RESOURCE_GOVERNOR_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Export global resource governor snapshot into job debug payload as debug_resource_governor."},
+    {"key": "SHIVA_MAX_TOTAL_WORKERS", "type": "int", "default": "40", "group": "Scheduler", "restart_required": False,
+     "desc": "Global maximum concurrent workers/sessions reserved across in-flight lanes."},
+    {"key": "SHIVA_MAX_TOTAL_LANES", "type": "int", "default": "5", "group": "Scheduler", "restart_required": False,
+     "desc": "Hard cap on concurrent lane tasks when resource governor is enabled."},
+    {"key": "SHIVA_WORKER_RESERVE_MODE", "type": "str", "default": "workers", "group": "Scheduler", "restart_required": False,
+     "desc": "Reservation unit for governor: workers | sessions (currently equivalent)."},
+    {"key": "SHIVA_GOVERNOR_APPLY_IN_SEQUENTIAL", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "If enabled, apply governor reservation checks on sequential path too."},
+    {"key": "SHIVA_GOVERNOR_PMTA_SCALE", "type": "bool", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "Scale down effective total-worker budget when PMTA pressure is elevated."},
+    {"key": "SHIVA_GOVERNOR_PMTA_LEVEL2_FACTOR", "type": "float", "default": "0.75", "group": "Scheduler", "restart_required": False,
+     "desc": "Multiplier for total-worker budget when PMTA pressure level >= 2."},
+    {"key": "SHIVA_GOVERNOR_PMTA_LEVEL3_FACTOR", "type": "float", "default": "0.50", "group": "Scheduler", "restart_required": False,
+     "desc": "Multiplier for total-worker budget when PMTA pressure level >= 3."},
+    {"key": "SHIVA_CONCURRENCY_STOP_GRACE_S", "type": "int", "default": "30", "group": "Scheduler", "restart_required": False,
+     "desc": "Grace period in seconds for stopping lane submissions and draining in-flight tasks."},
+    {"key": "SHIVA_CONCURRENCY_STOP_FORCE_DISABLE", "type": "bool", "default": "1", "group": "Scheduler", "restart_required": False,
+     "desc": "After stop grace timeout, force-disable concurrency and continue sequentially when possible."},
     {"key": "SHIVA_FALLBACK_CONTROLLER", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Enable job-scoped fallback controller that can disable new scheduler layers and force legacy mode on risk spikes."},
     {"key": "SHIVA_FALLBACK_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
