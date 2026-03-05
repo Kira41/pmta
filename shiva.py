@@ -582,6 +582,10 @@ class LaneMetrics:
         lane["chunks_selected"] = int(lane.get("chunks_selected") or 0) + 1
         lane["selected_messages"] = int(lane.get("selected_messages") or 0) + max(0, int(chunk_size or 0))
 
+    def on_probe_sample(self, lane_key: Tuple[int, str], *, sender_email: str = "", sender_domain: str = "") -> None:
+        lane = self.ensure_lane(lane_key, sender_email=sender_email, sender_domain=sender_domain)
+        lane["probe_samples"] = int(lane.get("probe_samples") or 0) + 1
+
     def on_blocked(self, lane_key: Tuple[int, str], reason: str, *, sender_email: str = "", sender_domain: str = "") -> None:
         lane = self.ensure_lane(lane_key, sender_email=sender_email, sender_domain=sender_domain)
         self._push_window(
@@ -650,6 +654,7 @@ class LaneMetrics:
                 "window_samples": int(len(lane.get("window") or [])),
                 "chunks_selected": int(lane.get("chunks_selected") or 0),
                 "selected_messages": int(lane.get("selected_messages") or 0),
+                "probe_samples": int(lane.get("probe_samples") or 0),
                 "attempts_total": int(sums.get("attempts_total") or 0),
                 "sent_attempts": int(sums.get("sent_attempts") or 0),
                 "accepted_2xx": int(sums.get("accepted_2xx") or 0),
@@ -882,6 +887,141 @@ class LaneRegistry:
         }
 
 
+class ProbeController:
+    """Job-scoped probe mode controller to sample early lane signals conservatively."""
+
+    def __init__(self, enabled: bool, duration_s: int, rounds: int, probe_caps: dict, min_providers: int):
+        self.enabled = bool(enabled)
+        self.duration_s = max(1, int(duration_s or 1))
+        self.max_rounds = max(1, int(rounds or 1))
+        self.probe_caps = dict(probe_caps or {})
+        self.min_providers = max(1, int(min_providers or 1))
+        self.probe_start_ts = 0.0
+        self.rounds_completed = 0
+        self.round_target = 0
+        self.per_round_used_providers: Set[str] = set()
+        self.per_round_used_senders: Set[int] = set()
+        self.total_probed_by_provider: Dict[str, int] = {}
+        self.total_probed_by_sender: Dict[int, int] = {}
+        self.probe_active = False
+
+    def start(self, job_start_ts: float, provider_domains: List[str], num_senders: int) -> None:
+        providers = sorted({str(d or "").strip().lower() for d in (provider_domains or []) if str(d or "").strip()})
+        self.round_target = max(1, min(max(1, int(num_senders or 1)), len(providers)))
+        self.probe_start_ts = float(job_start_ts or time.time())
+        self.rounds_completed = 0
+        self.per_round_used_providers = set()
+        self.per_round_used_senders = set()
+        self.total_probed_by_provider = {}
+        self.total_probed_by_sender = {}
+        self.probe_active = self.should_probe(provider_domains)
+
+    def should_probe(self, provider_domains: List[str]) -> bool:
+        providers = {str(d or "").strip().lower() for d in (provider_domains or []) if str(d or "").strip()}
+        return bool(self.enabled and len(providers) >= self.min_providers)
+
+    def stop(self) -> None:
+        self.probe_active = False
+
+    def is_active(self, now_ts: float) -> bool:
+        if not self.probe_active:
+            return False
+        if self.rounds_completed >= self.max_rounds:
+            self.probe_active = False
+            return False
+        if (float(now_ts or 0.0) - float(self.probe_start_ts or 0.0)) >= float(self.duration_s):
+            self.probe_active = False
+            return False
+        return True
+
+    def _advance_round_if_needed(self) -> None:
+        if len(self.per_round_used_providers) < max(1, self.round_target):
+            return
+        self.rounds_completed += 1
+        self.per_round_used_providers = set()
+        self.per_round_used_senders = set()
+        if self.rounds_completed >= self.max_rounds:
+            self.probe_active = False
+
+    def pick_probe_lane(
+        self,
+        now_ts: float,
+        sender_buckets: Dict[int, Dict[str, List[str]]],
+        lane_registry: Optional[LaneRegistry],
+        soft_budgets: Optional[dict],
+        sender_cursor: int,
+    ) -> Optional[Tuple[int, str]]:
+        if not self.is_active(now_ts):
+            return None
+        n = max(0, len(sender_buckets or {}))
+        if n <= 0:
+            return None
+        blocked_fn = (soft_budgets or {}).get("is_lane_temporarily_blocked") if isinstance(soft_budgets, dict) else None
+        for strict_diversity in (True, False):
+            for step in range(n):
+                sender_idx = (int(sender_cursor or 0) + step) % n
+                domains = sender_buckets.get(sender_idx) or {}
+                if strict_diversity and sender_idx in self.per_round_used_senders:
+                    continue
+                for provider_domain in sorted(domains.keys()):
+                    bucket = domains.get(provider_domain) or []
+                    if not bucket:
+                        continue
+                    provider = str(provider_domain or "").strip().lower()
+                    if strict_diversity and provider in self.per_round_used_providers:
+                        continue
+                    lane_key = (int(sender_idx), provider)
+                    if callable(blocked_fn) and blocked_fn(lane_key, now_ts):
+                        continue
+                    if lane_registry:
+                        lane_info = lane_registry.get_lane_info(lane_key)
+                        if float(lane_info.get("next_allowed_ts") or 0.0) > float(now_ts or 0.0):
+                            continue
+                    return lane_key
+            if strict_diversity and self.per_round_used_providers:
+                self.rounds_completed += 1
+                self.per_round_used_providers = set()
+                self.per_round_used_senders = set()
+                if self.rounds_completed >= self.max_rounds:
+                    self.probe_active = False
+                    return None
+        return None
+
+    def mark_probed(self, lane_key: Tuple[int, str]) -> None:
+        provider = str((lane_key or (0, ""))[1] or "").strip().lower()
+        sender_idx = int((lane_key or (0, ""))[0] or 0)
+        self.per_round_used_providers.add(provider)
+        self.per_round_used_senders.add(sender_idx)
+        self.total_probed_by_provider[provider] = int(self.total_probed_by_provider.get(provider) or 0) + 1
+        self.total_probed_by_sender[sender_idx] = int(self.total_probed_by_sender.get(sender_idx) or 0) + 1
+        self._advance_round_if_needed()
+
+    def apply_probe_caps(self, caps: dict) -> dict:
+        out = dict(caps or {})
+        out["chunk_size"] = max(1, min(int(out.get("chunk_size") or 1), int(self.probe_caps.get("chunk_size") or 1)))
+        out["workers"] = max(1, min(int(out.get("workers") or 1), int(self.probe_caps.get("workers") or 1)))
+        out["delay_s"] = max(float(out.get("delay_s") or 0.0), float(self.probe_caps.get("delay_floor_s") or 0.0))
+        out["sleep_chunks"] = max(float(out.get("sleep_chunks") or 0.0), float(self.probe_caps.get("sleep_floor_s") or 0.0))
+        return out
+
+    def snapshot(self) -> dict:
+        return {
+            "enabled": bool(self.enabled),
+            "active": bool(self.probe_active),
+            "probe_start_ts": float(self.probe_start_ts or 0.0),
+            "duration_s": int(self.duration_s),
+            "max_rounds": int(self.max_rounds),
+            "rounds_completed": int(self.rounds_completed),
+            "round_target": int(self.round_target),
+            "per_round_used_providers": sorted(self.per_round_used_providers),
+            "per_round_used_senders": sorted(self.per_round_used_senders),
+            "total_probed_by_provider": {k: int(v) for k, v in sorted(self.total_probed_by_provider.items())},
+            "total_probed_by_sender": {str(k): int(v) for k, v in sorted(self.total_probed_by_sender.items(), key=lambda x: x[0])},
+            "probe_caps": dict(self.probe_caps),
+            "min_providers": int(self.min_providers),
+        }
+
+
 def map_provider_domains_to_sender_indexes(provider_domains: List[str], sender_emails: List[str]) -> Dict[str, int]:
     """Distribute provider domains evenly across sender emails.
 
@@ -961,6 +1101,7 @@ class SendJob:
     debug_baseline_report: dict = field(default_factory=dict)
     debug_lane_metrics_snapshot: dict = field(default_factory=dict)
     debug_lane_states_snapshot: dict = field(default_factory=dict)
+    debug_probe_status: dict = field(default_factory=dict)
 
     # PMTA diagnostics snapshot (optional; helps classify failures quickly)
     pmta_diag: dict = field(default_factory=dict)
@@ -1868,6 +2009,7 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "debug_baseline_report": job.debug_baseline_report or {},
         "lane_metrics": job.debug_lane_metrics_snapshot or {},
         "lane_states": job.debug_lane_states_snapshot or {},
+        "debug_probe_status": job.debug_probe_status or {},
         "pmta_diag": job.pmta_diag or {},
         "pmta_diag_ts": job.pmta_diag_ts or "",
         "created_at": job.created_at,
@@ -2608,6 +2750,7 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job.debug_baseline_report = (s.get("debug_baseline_report") if isinstance(s.get("debug_baseline_report"), dict) else {}) or {}
         job.debug_lane_metrics_snapshot = (s.get("lane_metrics") if isinstance(s.get("lane_metrics"), dict) else {}) or {}
         job.debug_lane_states_snapshot = (s.get("lane_states") if isinstance(s.get("lane_states"), dict) else {}) or {}
+        job.debug_probe_status = (s.get("debug_probe_status") if isinstance(s.get("debug_probe_status"), dict) else {}) or {}
         job.pmta_diag = (s.get("pmta_diag") if isinstance(s.get("pmta_diag"), dict) else {}) or {}
         job.pmta_diag_ts = str(s.get("pmta_diag_ts") or "")
         job.updated_at = str(s.get("updated_at") or "")
@@ -11847,6 +11990,15 @@ def smtp_send_job(
     provider_bias_throttled = float(get_env_float("SHIVA_PROVIDER_BIAS_THROTTLED", 0.35))
     provider_bias_quarantined = float(get_env_float("SHIVA_PROVIDER_BIAS_QUAR", 0.05))
     provider_bias_infra = float(get_env_float("SHIVA_PROVIDER_BIAS_INFRA", 0.05))
+    probe_mode_enabled = bool(get_env_bool("SHIVA_PROBE_MODE", False))
+    probe_duration_s = max(1, int(get_env_int("SHIVA_PROBE_DURATION_S", 300)))
+    probe_rounds = max(1, int(get_env_int("SHIVA_PROBE_ROUNDS", 2)))
+    probe_chunk_size = max(1, int(get_env_int("SHIVA_PROBE_CHUNK_SIZE", 80)))
+    probe_workers = max(1, int(get_env_int("SHIVA_PROBE_WORKERS", 2)))
+    probe_delay_floor_s = max(0.0, float(get_env_float("SHIVA_PROBE_DELAY_FLOOR_S", 0.8)))
+    probe_sleep_floor_s = max(0.0, float(get_env_float("SHIVA_PROBE_SLEEP_FLOOR_S", 2)))
+    probe_min_providers = max(1, int(get_env_int("SHIVA_PROBE_MIN_PROVIDERS", 3)))
+    probe_export = bool(get_env_bool("SHIVA_PROBE_EXPORT", False))
     lane_thresholds_raw = str(get_env("SHIVA_LANE_THRESHOLDS_JSON", "") or "").strip()
     lane_quarantine_base_s = max(1, int(get_env_int("SHIVA_LANE_QUARANTINE_BASE_S", 120)))
     lane_quarantine_max_s = max(lane_quarantine_base_s, int(get_env_int("SHIVA_LANE_QUARANTINE_MAX_S", 1800)))
@@ -11875,6 +12027,9 @@ def smtp_send_job(
     if lane_state_export:
         with JOBS_LOCK:
             job.debug_lane_states_snapshot = {}
+    if probe_export:
+        with JOBS_LOCK:
+            job.debug_probe_status = {}
 
     provider_cooldown_until: Dict[str, float] = {}
 
@@ -12433,6 +12588,31 @@ def smtp_send_job(
             for bucket in (domains or {}).values()
             for rcpt in (bucket or [])
         ])[0]
+        probe_controller = ProbeController(
+            enabled=probe_mode_enabled,
+            duration_s=probe_duration_s,
+            rounds=probe_rounds,
+            probe_caps={
+                "chunk_size": probe_chunk_size,
+                "workers": probe_workers,
+                "delay_floor_s": probe_delay_floor_s,
+                "sleep_floor_s": probe_sleep_floor_s,
+            },
+            min_providers=probe_min_providers,
+        )
+        probe_provider_domains = [
+            d
+            for d, cnt in (provider_buckets or {}).items()
+            if str(d or "").strip() and int(cnt or 0) > 0
+        ]
+        probe_controller.start(
+            job_start_ts=time.time(),
+            provider_domains=probe_provider_domains,
+            num_senders=len(sender_emails),
+        )
+        if probe_export:
+            with JOBS_LOCK:
+                job.debug_probe_status = probe_controller.snapshot()
 
         with JOBS_LOCK:
             if scheduler_mode != "legacy":
@@ -12446,6 +12626,11 @@ def smtp_send_job(
             )
             job.log("INFO", f"Per-sender totals: {partition_stats.get('sender_totals', {})}")
             job.log("INFO", f"Per-sender per-domain counts: {partition_stats.get('sender_domain_counts', {})}")
+            if probe_controller.probe_active:
+                job.log(
+                    "INFO",
+                    f"Probe mode enabled: providers={len(set(probe_provider_domains))} rounds={probe_rounds} duration_s={probe_duration_s}",
+                )
 
         def _remaining_total() -> int:
             queued = sum(sum(len(v) for v in domains.values()) for domains in sender_bucket_by_idx.values())
@@ -12487,6 +12672,22 @@ def smtp_send_job(
                 next_ts = float(retries[0].get("next_retry_ts") or 0.0)
                 waits.append(max(0.0, next_ts - now_ts))
             return min(waits) if waits else None
+
+        def _pick_retry_ready_sender_domain(now_ts: float) -> Optional[Tuple[int, str]]:
+            nonlocal sender_cursor
+            n = len(sender_emails)
+            if n <= 0:
+                return None
+            for step in range(n):
+                sender_idx2 = (sender_cursor + step) % n
+                if not _sender_has_pending_work(sender_idx2):
+                    continue
+                for dom2 in (sender_bucket_by_idx.get(sender_idx2) or {}).keys():
+                    retry_q2 = provider_retry_chunks.get(_sd_key(sender_idx2, dom2)) or []
+                    if retry_q2 and float(retry_q2[0].get("next_retry_ts") or 0.0) <= now_ts:
+                        sender_cursor = (sender_idx2 + 1) % n
+                        return sender_idx2, dom2
+            return None
 
         def _pick_weighted_domain(sender_idx: int, now_ts: float) -> Optional[str]:
             domains = sender_bucket_by_idx.get(sender_idx) or {}
@@ -12696,12 +12897,29 @@ def smtp_send_job(
                                 last_pressure_level = lvl
                                 with JOBS_LOCK:
                                     job.log("WARN" if lvl >= 2 else "INFO", f"PMTA pressure level {lvl}: {pmta_pressure_applied.get('reason','')}")
+                            if lvl >= 3 and probe_controller.is_active(time.time()):
+                                probe_controller.stop()
+                                with JOBS_LOCK:
+                                    job.log("WARN", "Probe mode disabled early due to PMTA pressure level >= 3")
 
                 except Exception:
                     pmta_pressure_applied = {}
 
             now_ts = time.time()
-            sender_domain_pick = _next_sender_domain(now_ts)
+            probe_selected_this_iteration = False
+            sender_domain_pick = _pick_retry_ready_sender_domain(now_ts)
+            if not sender_domain_pick and probe_controller.is_active(now_ts):
+                sender_domain_pick = probe_controller.pick_probe_lane(
+                    now_ts,
+                    sender_bucket_by_idx,
+                    lane_registry,
+                    {"is_lane_temporarily_blocked": _is_lane_temporarily_blocked},
+                    sender_cursor,
+                )
+                if sender_domain_pick:
+                    probe_selected_this_iteration = True
+            if not sender_domain_pick:
+                sender_domain_pick = _next_sender_domain(now_ts)
             if not sender_domain_pick:
                 wait_retry = _next_retry_wait(now_ts)
                 if wait_retry is None:
@@ -12717,6 +12935,21 @@ def smtp_send_job(
                 continue
 
             sender_idx_fixed, target_domain = sender_domain_pick
+            if probe_selected_this_iteration and len(sender_emails) > 0:
+                sender_cursor = (int(sender_idx_fixed) + 1) % len(sender_emails)
+            if probe_selected_this_iteration:
+                clamped_caps = probe_controller.apply_probe_caps(
+                    {
+                        "chunk_size": cs,
+                        "workers": workers2,
+                        "delay_s": delay2,
+                        "sleep_chunks": sleep2,
+                    }
+                )
+                cs = int(clamped_caps.get("chunk_size") or cs)
+                workers2 = int(clamped_caps.get("workers") or workers2)
+                delay2 = float(clamped_caps.get("delay_s") if clamped_caps.get("delay_s") is not None else delay2)
+                sleep2 = float(clamped_caps.get("sleep_chunks") if clamped_caps.get("sleep_chunks") is not None else sleep2)
             target_key = _sd_key(sender_idx_fixed, target_domain)
 
             retry_q = provider_retry_chunks.get(target_key) or []
@@ -12752,6 +12985,12 @@ def smtp_send_job(
                     sender_email=sender_email_for_lane,
                     sender_domain=sender_domain_for_lane,
                 )
+                if probe_selected_this_iteration:
+                    lane_metrics.on_probe_sample(
+                        _lane_key(sender_idx_fixed, target_domain),
+                        sender_email=sender_email_for_lane,
+                        sender_domain=sender_domain_for_lane,
+                    )
                 _lane_registry_update(
                     time.time(),
                     _lane_key(sender_idx_fixed, target_domain),
@@ -12762,6 +13001,12 @@ def smtp_send_job(
                         "sleep_chunks": sleep2,
                     },
                 )
+
+            if probe_selected_this_iteration:
+                probe_controller.mark_probed(_lane_key(sender_idx_fixed, target_domain))
+            if probe_export and probe_controller.is_active(time.time()):
+                with JOBS_LOCK:
+                    job.debug_probe_status = probe_controller.snapshot()
 
             chunk_url = _cyclic_pick(urls2, chunk_idx_local)
             chunk_src = _cyclic_pick(src2, chunk_idx_local)
