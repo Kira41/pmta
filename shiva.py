@@ -5608,7 +5608,7 @@ def ai_rewrite_subjects_and_body(
 
     Notes:
     - This is for readability/professional tone.
-    - Preserves placeholders: [URL], [SRC], [EMAIL], [MAIL] exactly.
+    - Preserves placeholders: [URL], [SRC], [EMAIL], [MAIL], [NAME] exactly.
     - Keeps meaning, does not add new claims.
     """
     if not token:
@@ -5620,7 +5620,7 @@ def ai_rewrite_subjects_and_body(
     sys = (
         "You rewrite email subject lines and body for clarity and professionalism, "
         "keeping the same meaning. Do NOT add new claims, promotions, or calls to action. "
-        "Preserve these placeholders exactly (do not remove/rename them): [URL], [SRC], [EMAIL], [MAIL]. "
+        "Preserve these placeholders exactly (do not remove/rename them): [URL], [SRC], [EMAIL], [MAIL], [NAME]. "
         "Keep the output language the same as input. "
         "Return ONLY valid JSON with keys: subjects (array of strings), body (string)."
     )
@@ -5630,7 +5630,7 @@ def ai_rewrite_subjects_and_body(
         "body_format": body_format,
         "body": body_in,
         "constraints": {
-            "preserve_placeholders": ["[URL]", "[SRC]", "[EMAIL]", "[MAIL]"],
+            "preserve_placeholders": ["[URL]", "[SRC]", "[EMAIL]", "[MAIL]", "[NAME]"],
             "no_new_claims": True,
             "json_only": True,
         },
@@ -6170,7 +6170,7 @@ https://example.com/b" style="min-height:90px"></textarea>
           <label>SRC list (one per line)</label>
           <textarea name="src_list" placeholder="https://cdn.example.com/img1.png
 https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
-          <div class="mini">Use <code>[SRC]</code> in subject/body. Replaced per chunk in line order (cycles back to first line after the last). Use <code>[MAIL]</code> or <code>[EMAIL]</code> for recipient email.</div>
+          <div class="mini">Use <code>[SRC]</code> in subject/body. Replaced per chunk in line order (cycles back to first line after the last). Use <code>[MAIL]</code> or <code>[EMAIL]</code> for recipient email, and <code>[NAME]</code> for the part before @.</div>
         </div>
       </div>
 
@@ -15631,9 +15631,11 @@ def smtp_send_job(
 
     def _render_with_placeholders(base_text: str, *, url_value: str, src_value: str, rcpt: str) -> str:
         rendered = str(base_text or "")
+        name_value = str(rcpt or "").split("@", 1)[0].strip()
         rendered = re.sub(r"\[(?:URL)\]", str(url_value or ""), rendered, flags=re.IGNORECASE)
         rendered = re.sub(r"\[(?:SRC)\]", str(src_value or ""), rendered, flags=re.IGNORECASE)
         rendered = re.sub(r"\[(?:MAIL|EMAIL)\]", str(rcpt or ""), rendered, flags=re.IGNORECASE)
+        rendered = re.sub(r"\[(?:NAME)\]", name_value, rendered, flags=re.IGNORECASE)
         return rendered
 
     def _send_chunk(
