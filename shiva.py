@@ -3687,6 +3687,48 @@ def _db_upsert_job_payload(conn: sqlite3.Connection, payload: Dict[str, Any]) ->
     )
 
 
+def _db_drop_pending_job_snapshot_writes(job_id: str) -> int:
+    """Remove queued/retry snapshot writes for one job id.
+
+    This prevents stale queued snapshots from re-inserting a deleted job after
+    `db_delete_job` removed it from the DB.
+    """
+    jid = (job_id or "").strip()
+    if not jid:
+        return 0
+
+    removed = 0
+
+    def _is_target_snapshot(item: Any) -> bool:
+        if not isinstance(item, dict):
+            return False
+        if str(item.get("kind") or "") != "job_snapshot":
+            return False
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        return str(payload.get("id") or "").strip() == jid
+
+    with _DB_WRITE_LOCK:
+        if _DB_WRITE_RETRY:
+            keep_retry = [it for it in _DB_WRITE_RETRY if not _is_target_snapshot(it)]
+            removed += len(_DB_WRITE_RETRY) - len(keep_retry)
+            _DB_WRITE_RETRY[:] = keep_retry
+
+        q = _DB_WRITE_QUEUE
+        if hasattr(q, "mutex") and hasattr(q, "queue"):
+            with q.mutex:
+                original = len(q.queue)
+                q.queue = deque(it for it in q.queue if not _is_target_snapshot(it))
+                removed_q = original - len(q.queue)
+                removed += removed_q
+                if removed_q:
+                    q.unfinished_tasks = max(0, int(q.unfinished_tasks or 0) - removed_q)
+                    q.not_full.notify_all()
+                    if q.unfinished_tasks == 0:
+                        q.all_tasks_done.notify_all()
+
+    return removed
+
+
 def _db_set_outcome_payload(conn: sqlite3.Connection, payload: Dict[str, Any]) -> None:
     _exec_upsert_compat(
         conn,
@@ -4295,10 +4337,20 @@ def db_delete_job(job_id: str) -> None:
     jid = (job_id or "").strip()
     if not jid:
         return
+
+    # Drop in-flight queued snapshots first so delete cannot be undone by a
+    # delayed async writer flush.
+    _db_drop_pending_job_snapshot_writes(jid)
+
     with DB_LOCK:
         conn = _db_conn()
         try:
             conn.execute("DELETE FROM jobs WHERE id=?", (jid,))
+            conn.execute("DELETE FROM job_outcomes WHERE job_id=?", (jid,))
+            conn.execute("DELETE FROM job_recipients WHERE job_id=?", (jid,))
+            conn.execute("DELETE FROM accounting_events WHERE job_id=?", (jid,))
+            conn.execute("DELETE FROM email_attempt_logs WHERE job_id=?", (jid,))
+            conn.execute("DELETE FROM email_attempt_learning WHERE job_id=?", (jid,))
             conn.commit()
         finally:
             conn.close()
