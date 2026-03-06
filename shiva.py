@@ -3341,7 +3341,27 @@ class SendJob:
         self.maybe_persist()
     def push_chunk_state(self, item: dict):
         self.updated_at = now_iso()
-        self.chunk_states.append(item)
+        status = str(item.get("status") or "").strip().lower()
+        if status in {"done", "done_after_backoff"}:
+            chunk_id = item.get("chunk")
+            target_domain = str(item.get("target_domain") or "")
+            attempt = int(item.get("attempt") or 0)
+            for idx in range(len(self.chunk_states) - 1, -1, -1):
+                prev = self.chunk_states[idx] or {}
+                if int(prev.get("chunk") or -1) != int(chunk_id or -1):
+                    continue
+                if str(prev.get("target_domain") or "") != target_domain:
+                    continue
+                if int(prev.get("attempt") or 0) != attempt:
+                    continue
+                prev_status = str(prev.get("status") or "").strip().lower()
+                if prev_status == "running":
+                    self.chunk_states[idx] = {**prev, **item}
+                    break
+            else:
+                self.chunk_states.append(item)
+        else:
+            self.chunk_states.append(item)
         if len(self.chunk_states) > 600:
             self.chunk_states = self.chunk_states[-400:]
         self.maybe_persist()
