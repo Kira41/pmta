@@ -7652,7 +7652,7 @@ PAGE_JOBS = r"""
             </div>
 
             <div class="panel">
-              <h4 class="sopHeader">🧭 System / Provider / Integrity</h4>
+              <h4 class="sopHeader">📌 System / Provider / Integrity</h4>
 
               <div class="sopBlock">
               <div class="sopLabel system">🖥️ System / Internal</div>
@@ -7675,7 +7675,7 @@ PAGE_JOBS = r"""
               </div>
 
               <div class="sopBlock">
-              <div class="sopLabel integrity">🧩 Data Integrity / Mapping</div>
+              <div class="sopLabel integrity">🗂️ Data Integrity / Mapping</div>
               <div class="sopLine" data-k="integritySummary">—</div>
               <details class="errorFold">
                 <summary>View details</summary>
@@ -7684,12 +7684,12 @@ PAGE_JOBS = r"""
               </div>
 
               <div class="legacyDiagnosticsBox">
-                <div class="legacyDiagnosticsTitle">🧾 Legacy quality + errors (unchanged data)</div>
+                <div class="legacyDiagnosticsTitle">📄 Legacy quality + errors (unchanged data)</div>
                 <div class="legacySectionLabel">📊 Quality counters</div>
                 <div class="mini legacyDataLine" data-k="counters">—</div>
                 <div class="legacySectionLabel">🚨 Error type</div>
                 <div class="mini legacyDataLine" data-k="errorTypes">—</div>
-                <div class="legacySectionLabel">🧩 Error summary</div>
+                <div class="legacySectionLabel">⚠️ Error summary</div>
                 <div class="mini legacyDataLine" data-k="lastErrors">—</div>
                 <div class="mini legacyDataLine" data-k="lastErrors2">—</div>
                 <div class="mini legacyDataLine" data-k="internalErrors">—</div>
@@ -8548,7 +8548,7 @@ This will remove it from Jobs history.`);
     const dbwf = asNum(j.db_write_failures) || 0;
     const integ = qk(card,'integritySummary');
     if(integ){
-      integ.innerHTML = `🧹 duplicates_dropped: <b>${dup}</b> · 🔎 job_not_found: <b>${jnf}</b> · 🧾 missing_fields: <b>${miss}</b> · 💽 db_write_failures: <b>${dbwf}</b>`;
+      integ.innerHTML = `♻️ duplicates_dropped: <b>${dup}</b> · 🔎 job_not_found: <b>${jnf}</b> · 🧾 missing_fields: <b>${miss}</b> · 💽 db_write_failures: <b>${dbwf}</b>`;
     }
 
     const integDet = qk(card,'integrityDetails');
