@@ -7821,11 +7821,9 @@ PAGE_JOBS = r"""
       <div class="mini">No jobs match the selected filters.</div>
     </div>
 
-    {% if jobs|length == 0 %}
-      <div class="job">
-        <div class="mini">No jobs yet.</div>
-      </div>
-    {% endif %}
+    <div class="job" id="jobsListEmpty" style="display:{% if jobs|length == 0 %}block{% else %}none{% endif %}">
+      <div class="mini">No jobs yet.</div>
+    </div>
 
   </div>
 
@@ -9462,6 +9460,9 @@ This will remove it from Jobs history.`);
 
     const empty = document.getElementById('jobsFilteredEmpty');
     if(empty) empty.style.display = (cards.length > 0 && visible.length === 0) ? '' : 'none';
+
+    const listEmpty = document.getElementById('jobsListEmpty');
+    if(listEmpty) listEmpty.style.display = cards.length === 0 ? '' : 'none';
 
     const meta = document.getElementById('filterMeta');
     if(meta){
