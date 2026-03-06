@@ -7198,6 +7198,47 @@ PAGE_JOBS = r"""
     .sopLabel.provider{color:#c8f5b1;}
     .sopLabel.integrity{color:#ffd9a8;}
     .sopLine{font-size:13px; line-height:1.5; color:rgba(255,255,255,.88);}
+    .legacyDiagnosticsBox{
+      margin-top:14px;
+      padding:12px;
+      border:1px solid rgba(255,255,255,.14);
+      border-radius:12px;
+      background:linear-gradient(180deg, rgba(122,167,255,.12), rgba(122,167,255,.03));
+    }
+    .legacyDiagnosticsTitle{
+      margin:0;
+      font-size:13px;
+      font-weight:900;
+      color:#d5e4ff;
+      display:flex;
+      align-items:center;
+      gap:8px;
+    }
+    .legacySectionLabel{
+      margin-top:10px;
+      font-size:11px;
+      text-transform:uppercase;
+      letter-spacing:.3px;
+      color:rgba(213,228,255,.84);
+      font-weight:800;
+    }
+    .legacyDataLine{
+      margin-top:6px;
+      padding:8px 10px;
+      border:1px solid rgba(255,255,255,.12);
+      border-radius:10px;
+      background:rgba(0,0,0,.16);
+      color:rgba(255,255,255,.9);
+      overflow-wrap:anywhere;
+    }
+    .bridgeSnapshotBox{
+      margin-top:12px;
+      padding:10px 12px;
+      border:1px solid rgba(64,225,173,.35);
+      border-radius:10px;
+      background:rgba(13,67,51,.26);
+      color:#c8ffed;
+    }
 
     /* PMTA Live Panel (Jobs) — clearer layout */
     .pmtaLive{ margin-top:10px; }
@@ -7642,15 +7683,21 @@ PAGE_JOBS = r"""
               </details>
               </div>
 
-              <div class="mini" style="margin-top:12px"><b>Legacy quality + errors (unchanged data)</b></div>
-              <div class="mini" style="margin-top:8px" data-k="counters">—</div>
-              <div class="mini" style="margin-top:8px"><b>Error type</b></div>
-              <div class="mini" data-k="errorTypes">—</div>
-              <div class="mini" style="margin-top:8px"><b>Error summary</b></div>
-              <div class="mini" data-k="lastErrors">—</div>
-              <div class="mini" style="margin-top:8px" data-k="lastErrors2">—</div>
-              <div class="mini" style="margin-top:8px" data-k="internalErrors">—</div>
-              <div class="mini" style="margin-top:8px" data-k="bridgeReceiver">—</div>
+              <div class="legacyDiagnosticsBox">
+                <div class="legacyDiagnosticsTitle">🧾 Legacy quality + errors (unchanged data)</div>
+                <div class="legacySectionLabel">📊 Quality counters</div>
+                <div class="mini legacyDataLine" data-k="counters">—</div>
+                <div class="legacySectionLabel">🚨 Error type</div>
+                <div class="mini legacyDataLine" data-k="errorTypes">—</div>
+                <div class="legacySectionLabel">🧩 Error summary</div>
+                <div class="mini legacyDataLine" data-k="lastErrors">—</div>
+                <div class="mini legacyDataLine" data-k="lastErrors2">—</div>
+                <div class="mini legacyDataLine" data-k="internalErrors">—</div>
+              </div>
+              <div class="bridgeSnapshotBox">
+                <div class="legacySectionLabel" style="margin-top:0">🌉 Data source: Bridge snapshot</div>
+                <div class="mini legacyDataLine" style="margin-top:8px" data-k="bridgeReceiver">—</div>
+              </div>
             </div>
 
           </div>
