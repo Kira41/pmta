@@ -908,3 +908,10 @@ OPENROUTER_TIMEOUT_S=40
   - `PRAGMA journal_mode=WAL`
   - `PRAGMA busy_timeout` غير صفري لتقليل lock errors
   - راقب `db_write_failures` من endpoint في حال ضغط عالي.
+
+
+## تقرير تكميلي جديد
+
+تم إضافة تقرير عربي شامل وموسع يتضمن Deep Search داخل `shiva.py` مع جداول grouped وسيناريوهات if/else مفصلة:
+
+- `docs/REPORT_SHIVA_ENV_VARIABLES_COMPLETE_AR.md`
