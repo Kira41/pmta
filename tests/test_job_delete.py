@@ -108,3 +108,56 @@ def test_db_delete_job_removes_job_and_related_rows_and_pending_snapshots(tmp_pa
             if isinstance(item, dict) and str(item.get("kind") or "") == "job_snapshot"
         }
     assert jid not in queue_ids
+
+
+def test_db_load_jobs_skips_and_purges_deleted_tombstoned_ids(tmp_path):
+    _init_test_db(tmp_path)
+    jid = "job-deleted-before-restart"
+
+    # Simulate stale DB state where both jobs row and tombstone exist.
+    with shiva.DB_LOCK:
+        conn = shiva._db_conn()
+        try:
+            snapshot = '{"id":"job-deleted-before-restart","created_at":"2026-01-01T00:00:00Z"}'
+            conn.execute(
+                "INSERT INTO jobs(id, campaign_id, created_at, updated_at, status, snapshot) VALUES(?,?,?,?,?,?)",
+                (jid, "camp-1", shiva.now_iso(), shiva.now_iso(), "done", snapshot),
+            )
+            conn.execute(
+                "INSERT INTO deleted_jobs(job_id, deleted_at) VALUES(?, ?)",
+                (jid, shiva.now_iso()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    with shiva.JOBS_LOCK:
+        shiva.JOBS.pop(jid, None)
+
+    shiva.db_load_jobs_into_memory()
+
+    with shiva.JOBS_LOCK:
+        assert jid not in shiva.JOBS
+
+    with shiva.DB_LOCK:
+        conn = shiva._db_conn()
+        try:
+            assert conn.execute("SELECT COUNT(*) FROM jobs WHERE id=?", (jid,)).fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM deleted_jobs WHERE job_id=?", (jid,)).fetchone()[0] == 1
+        finally:
+            conn.close()
+
+
+def test_api_job_delete_returns_500_when_db_delete_fails(tmp_path, monkeypatch):
+    _init_test_db(tmp_path)
+    client = shiva.app.test_client()
+
+    def _boom(_jid):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(shiva, "db_delete_job", _boom)
+    resp = client.post("/api/job/job-api-delete-error/delete")
+
+    assert resp.status_code == 500
+    data = resp.get_json() or {}
+    assert data.get("ok") is False
