@@ -8150,9 +8150,16 @@ PAGE_JOBS = r"""
     if(!bridgeEl) return;
     const connected = !!(bridgeState && bridgeState.connected === true);
     const label = connected ? 'Bridge↔Shiva connected' : 'Bridge↔Shiva disconnected';
+    const endpoint = (
+      (bridgeState && (bridgeState.last_req_url || bridgeState.pull_url_masked || bridgeState.bridge_base_url)) || ''
+    ).toString().trim();
+    const endpointTip = endpoint
+      ? ` Current endpoint: ${endpoint}`
+      : ' Current endpoint is not available yet.';
+    const tip = `Real-time bridge transport status between PMTA accounting bridge and Shiva receiver.${endpointTip}`;
     bridgeEl.className = `triageBadge bridgeConnBadge ${connected ? 'good' : 'bad'}`;
-    bridgeEl.innerHTML = `<span class="statusDot ${connected ? 'good' : 'bad'}" aria-hidden="true"></span><span>${esc(label)}</span><span class="tip" data-tip="Real-time bridge transport status between PMTA accounting bridge and Shiva receiver.">ⓘ</span>`;
-    bridgeEl.title = label;
+    bridgeEl.innerHTML = `<span class="statusDot ${connected ? 'good' : 'bad'}" aria-hidden="true"></span><span>${esc(label)}</span><span class="tip" data-tip="${esc(tip)}">ⓘ</span>`;
+    bridgeEl.title = endpoint ? `${label} · ${endpoint}` : label;
   }
 
   function statusPillClass(st){
