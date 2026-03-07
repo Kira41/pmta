@@ -16550,8 +16550,9 @@ def smtp_send_job(
         shadow_recorder = ShadowRecorder(shadow_max_events) if shadow_mode_active else None
         lane_parallel_limit_runtime = min(int(lane_max_parallel), int(max_total_lanes)) if resource_governor_enabled else int(lane_max_parallel)
         if scheduler_mode_runtime == "v2":
-            # v2 bypass: keep sender-parallel fanout from collapsing into sequential-by-cap.
-            lane_parallel_limit_runtime = max(2, int(lane_parallel_limit_runtime), min(int(max_total_lanes), max(2, len(sender_emails))))
+            # v2 sender-parallel guarantee: keep runtime lane fanout aligned with sender pool.
+            # This avoids showing a single active chunk when multiple sender emails are selected.
+            lane_parallel_limit_runtime = max(1, int(lane_parallel_limit_runtime), int(len(sender_emails) or 0))
         if lane_concurrency_runtime and budget_mgr:
             # Parallel mode can run multiple provider lanes for the same sender.
             # Keep sender inflight cap aligned with lane fanout unless operator
@@ -16663,7 +16664,7 @@ def smtp_send_job(
             "provider_domain_count": int(provider_domain_count),
             "target_lane_count": int(max(provider_domain_count, len(sender_emails), 1)),
             "allow_single_provider": True,
-            "effective_parallel_lanes": int(max(1, min(lane_parallel_limit_runtime, max(1, len(sender_emails)))) if effective_parallel else 1),
+            "effective_parallel_lanes": int(max(1, len(sender_emails)) if effective_parallel else 1),
             "fallback_to_sequential": not bool(effective_parallel),
             "legacy_flags": {
                 "SHIVA_MULTI_PROVIDER_PARALLEL_SENDERS": bool(multi_provider_parallel_senders_flag_legacy),
@@ -17369,7 +17370,9 @@ def smtp_send_job(
 
             max_sender_lanes = int(len(sender_lane_work))
             configured_lane_cap = max(1, int(lane_parallel_limit_runtime or 1))
-            lane_workers = max(1, min(max_sender_lanes, configured_lane_cap)) if max_sender_lanes > 0 else 1
+            # v2 sender-parallel guarantee: execute one lane worker per sender lane with queued work.
+            # configured_lane_cap remains telemetry/compat metadata, but must not downshift v2 into sequential.
+            lane_workers = max(1, int(max_sender_lanes)) if max_sender_lanes > 0 else 1
 
             try:
                 _acceptance_self_check_v2(
