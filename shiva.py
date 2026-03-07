@@ -18104,22 +18104,21 @@ def smtp_send_job(
                     "body_format": body_format2,
                     "reply_to": reply_to2,
                 }
-                if sender_parallel_hard_mode:
-                    lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
-                    job.upsert_active_chunk(lane_id, {
-                        "lane": lane_id,
-                        "chunk_id": int(chunk_idx_local),
-                        "sender_idx": int(sender_idx_fixed),
-                        "sender_mail": str(from_emails2[sender_idx_fixed % len(from_emails2)] if from_emails2 else ""),
-                        "receiver_domain": str(target_domain or ""),
-                        "size": int(len(chunk)),
-                        "status": "running",
-                        "attempt": int(attempt or 0),
-                        "next_retry": 0,
-                        "reason": "",
-                        "spam_score": None,
-                        "blacklist": "",
-                    })
+                lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
+                job.upsert_active_chunk(lane_id, {
+                    "lane": lane_id,
+                    "chunk_id": int(chunk_idx_local),
+                    "sender_idx": int(sender_idx_fixed),
+                    "sender_mail": str(from_emails2[sender_idx_fixed % len(from_emails2)] if from_emails2 else ""),
+                    "receiver_domain": str(target_domain or ""),
+                    "size": int(len(chunk)),
+                    "status": "running",
+                    "attempt": int(attempt or 0),
+                    "next_retry": 0,
+                    "reason": "",
+                    "spam_score": None,
+                    "blacklist": "",
+                })
 
             # keep chunks_total roughly correct
             remaining = max(0, _remaining_total())
@@ -18187,9 +18186,8 @@ def smtp_send_job(
                         job.chunks_done += 1
                         job.current_chunk = -1
                         job.current_chunk_info = {}
-                        if sender_parallel_hard_mode:
-                            lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
-                            job.remove_active_chunk(lane_id)
+                        lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
+                        job.remove_active_chunk(lane_id)
                         job.current_chunk_domains = {}
                         job.push_chunk_state({
                             "chunk": chunk_idx_local,
@@ -18334,22 +18332,21 @@ def smtp_send_job(
                         "target_domain": target_domain,
                         "learning": recommendation,
                     })
-                    if sender_parallel_hard_mode:
-                        lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
-                        job.upsert_active_chunk(lane_id, {
-                            "chunk_id": int(chunk_idx_local),
-                            "sender_idx": int(sender_idx_fixed),
-                            "sender_mail": str(fe or ""),
-                            "receiver_domain": str(target_domain or ""),
-                            "size": int(len(chunk)),
-                            "status": "running",
-                            "attempt": int(attempt or 0),
-                            "next_retry": 0,
-                            "reason": "",
-                            "spam_score": (float(sc) if sc is not None else None),
-                            "blacklist": str(bl_detail or ""),
-                            "pmta_reason": str(pmta_reason or ""),
-                        })
+                    lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
+                    job.upsert_active_chunk(lane_id, {
+                        "chunk_id": int(chunk_idx_local),
+                        "sender_idx": int(sender_idx_fixed),
+                        "sender_mail": str(fe or ""),
+                        "receiver_domain": str(target_domain or ""),
+                        "size": int(len(chunk)),
+                        "status": "running",
+                        "attempt": int(attempt or 0),
+                        "next_retry": 0,
+                        "reason": "",
+                        "spam_score": (float(sc) if sc is not None else None),
+                        "blacklist": str(bl_detail or ""),
+                        "pmta_reason": str(pmta_reason or ""),
+                    })
 
                 if blocked:
                     attempt += 1
@@ -18372,9 +18369,8 @@ def smtp_send_job(
                             job.chunks_done += 1
                             job.current_chunk = -1
                             job.current_chunk_info = {}
-                            if sender_parallel_hard_mode:
-                                lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
-                                job.remove_active_chunk(lane_id)
+                            lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
+                            job.remove_active_chunk(lane_id)
                             job.current_chunk_domains = {}
                             job.push_chunk_state({
                                 "chunk": chunk_idx_local,
@@ -18447,22 +18443,21 @@ def smtp_send_job(
                         job.chunks_backoff += 1
                         job.push_backoff(entry)
                         job.push_chunk_state({**entry, "status": "backoff", "target_domain": target_domain})
-                        if sender_parallel_hard_mode:
-                            lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
-                            job.upsert_active_chunk(lane_id, {
-                                "chunk_id": int(chunk_idx_local),
-                                "sender_idx": int(sender_idx_fixed),
-                                "sender_mail": str(fe or ""),
-                                "receiver_domain": str(target_domain or ""),
-                                "size": int(len(chunk)),
-                                "status": "backoff",
-                                "attempt": int(attempt or 0),
-                                "next_retry": float(next_ts or 0),
-                                "reason": str(rtxt or ""),
-                                "spam_score": (float(sc) if sc is not None else None),
-                                "blacklist": str(bl_detail or ""),
-                                "pmta_reason": str(pmta_reason or ""),
-                            })
+                        lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
+                        job.upsert_active_chunk(lane_id, {
+                            "chunk_id": int(chunk_idx_local),
+                            "sender_idx": int(sender_idx_fixed),
+                            "sender_mail": str(fe or ""),
+                            "receiver_domain": str(target_domain or ""),
+                            "size": int(len(chunk)),
+                            "status": "backoff",
+                            "attempt": int(attempt or 0),
+                            "next_retry": float(next_ts or 0),
+                            "reason": str(rtxt or ""),
+                            "spam_score": (float(sc) if sc is not None else None),
+                            "blacklist": str(bl_detail or ""),
+                            "pmta_reason": str(pmta_reason or ""),
+                        })
                     msg = (
                         f"Chunk {chunk_idx_local+1} [{target_domain}]: BACKOFF retry#{attempt} "
                         f"wait={int(wait_s)}s type={failure_type} ({rtxt}) trend={recommendation.get('provider_trend','unknown')}"
@@ -18623,9 +18618,8 @@ def smtp_send_job(
                     job.chunks_done += 1
                     job.current_chunk = -1
                     job.current_chunk_info = {}
-                    if sender_parallel_hard_mode:
-                        lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
-                        job.remove_active_chunk(lane_id)
+                    lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
+                    job.remove_active_chunk(lane_id)
                     job.current_chunk_domains = {}
                     job.push_chunk_state({
                         "chunk": chunk_idx_local,
