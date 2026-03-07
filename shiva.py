@@ -3031,6 +3031,7 @@ def _should_enable_multi_provider_parallel(
     allow_single_provider: bool,
     force_disable_concurrency: bool,
     fallback_disable_concurrency: bool = False,
+    sender_parallel_hard_mode: bool = False,
 ) -> dict:
     """Decide whether sender-parallel inter-lane mode should be active for this job."""
     sender_count = max(0, int(sender_count or 0))
@@ -3043,7 +3044,12 @@ def _should_enable_multi_provider_parallel(
 
     reason = "enabled"
     enabled = True
-    if not bool(flag_enabled):
+    if bool(sender_parallel_hard_mode):
+        enabled = sender_count > 0
+        reason = "forced_by_SHIVA_MULTI_PROVIDER_PARALLEL_SENDERS" if enabled else "insufficient_senders"
+        allow_single_provider = True
+        effective_parallel_lanes = max(1, sender_count)
+    elif not bool(flag_enabled):
         enabled = False
         reason = "feature_flag_off"
     elif bool(force_disable_concurrency):
@@ -3320,6 +3326,7 @@ class SendJob:
     chunks_abandoned: int = 0
     current_chunk: int = -1
     current_chunk_info: dict = field(default_factory=dict)
+    active_chunks_info: List[dict] = field(default_factory=list)
     current_chunk_domains: Dict[str, int] = field(default_factory=dict)
     chunk_states: List[dict] = field(default_factory=list)   # bounded
     backoff_items: List[dict] = field(default_factory=list)  # bounded
@@ -4361,6 +4368,7 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "chunks_abandoned": int(job.chunks_abandoned or 0),
         "current_chunk": int(job.current_chunk or -1),
         "current_chunk_info": job.current_chunk_info or {},
+        "active_chunks_info": list(job.active_chunks_info or []),
         "current_chunk_domains": job.current_chunk_domains or {},
         "chunk_states": (job.chunk_states or [])[-200:],
         "backoff_items": (job.backoff_items or [])[-200:],
@@ -5401,6 +5409,7 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job.chunks_abandoned = int(s.get("chunks_abandoned") or 0)
         job.current_chunk = int(s.get("current_chunk") or -1)
         job.current_chunk_info = s.get("current_chunk_info") or {}
+        job.active_chunks_info = list(s.get("active_chunks_info") or [])
         job.current_chunk_domains = s.get("current_chunk_domains") or {}
         job.chunk_states = list(s.get("chunk_states") or [])
         job.backoff_items = list(s.get("backoff_items") or [])
@@ -8773,6 +8782,28 @@ This will remove it from Jobs history.`);
   function renderChunkLive(card, j){
     const tb = qk(card,'chunkLive');
     if(!tb) return;
+    const active = Array.isArray(j.active_chunks_info) ? j.active_chunks_info.filter(x => x && Number(x.size || 0) > 0) : [];
+    if(active.length){
+      tb.innerHTML = active.slice(0,12).map(ci => {
+        const sender = (ci.sender_mail || ci.sender || '').toString();
+        const senderShort = sender.length > 30 ? (sender.slice(0,30) + '…') : sender;
+        const receiverDomain = (ci.receiver_domain || ci.target_domain || '').toString();
+        const spam = (ci.spam_score === null || ci.spam_score === undefined) ? '—' : Number(ci.spam_score).toFixed(2);
+        const bl = (ci.blacklist || '').toString();
+        const blShort = bl.length > 30 ? (bl.slice(0,30) + '…') : bl;
+        const status = (ci.status || (((j.status || '').toString().toLowerCase() === 'backoff') ? 'backoff' : 'running'));
+        return `<tr>`+
+          `<td>${Number(ci.chunk_id ?? ci.chunk)+1}</td>`+
+          `<td>${esc(status)}</td>`+
+          `<td>${Number(ci.size||0)}</td>`+
+          `<td title="${esc(sender)}">${esc(senderShort || '—')}</td>`+
+          `<td>${esc(receiverDomain || '—')}</td>`+
+          `<td>${esc(spam)}</td>`+
+          `<td title="${esc(bl)}">${esc(blShort || '—')}</td>`+
+        `</tr>`;
+      }).join('');
+      return;
+    }
     const ci = j.current_chunk_info || {};
     const hasChunk = (ci && ci.chunk !== undefined && ci.chunk !== null && Number(ci.size || 0) > 0);
     if(!hasChunk){
@@ -15466,6 +15497,7 @@ def smtp_send_job(
     if lane_concurrency_export:
         with JOBS_LOCK:
             job.debug_lane_executor = {}
+            job.active_chunks_info = []
     if resource_governor_export:
         with JOBS_LOCK:
             job.debug_resource_governor = {}
@@ -16486,6 +16518,7 @@ def smtp_send_job(
             if str(d or "").strip() and int(cnt or 0) > 0
         ]
         provider_domain_count = len(set(probe_provider_domains))
+        sender_parallel_hard_mode = bool(multi_provider_parallel_senders_flag)
         multi_provider_parallel_runtime = _should_enable_multi_provider_parallel(
             flag_enabled=multi_provider_parallel_senders_flag,
             sender_count=len(sender_emails),
@@ -16494,7 +16527,25 @@ def smtp_send_job(
             allow_single_provider=multi_provider_parallel_allow_single_provider,
             force_disable_concurrency=force_disable_concurrency,
             fallback_disable_concurrency=False,
+            sender_parallel_hard_mode=sender_parallel_hard_mode,
         )
+        if bool(sender_parallel_hard_mode):
+            lane_concurrency_runtime = True
+            lane_parallel_limit_runtime = max(1, int(len(sender_emails) or 1))
+            multi_provider_parallel_runtime["allow_single_provider"] = True
+            multi_provider_parallel_runtime["effective_parallel_lanes"] = int(lane_parallel_limit_runtime)
+            multi_provider_parallel_runtime["bypassed_features"] = [
+                "single_provider_restriction",
+                "provider_domain_count_gate",
+                "probe_mode",
+                "single_domain_waves",
+                "budget_manager_enforcement",
+                "fallback_disable_concurrency",
+            ]
+            probe_mode_enabled = False
+            single_domain_waves_enabled = False
+            budget_mgr = None
+            fallback_controller_runtime = False
         if multi_provider_parallel_runtime.get("enabled"):
             lane_concurrency_runtime = True
             lane_parallel_limit_runtime = int(multi_provider_parallel_runtime.get("effective_parallel_lanes") or 1)
@@ -16576,6 +16627,8 @@ def smtp_send_job(
 
         fallback_exception_count = 0
         fallback_controller_runtime = bool(fallback_controller_enabled)
+        if sender_parallel_hard_mode:
+            fallback_controller_runtime = False
         fallback_thresholds = {
             "deferral_rate": fallback_deferral_rate,
             "hardfail_rate": fallback_hardfail_rate,
@@ -16833,6 +16886,39 @@ def smtp_send_job(
                     return dom2
             return weighted[-1][0]
 
+        def build_parallel_sender_lane_batch(now_ts: float, max_lanes: int) -> List[Tuple[int, str]]:
+            if max_lanes <= 0:
+                return []
+            picks: List[Tuple[int, str]] = []
+            seen_senders: set = set()
+            n = len(sender_emails)
+            if n <= 0:
+                return picks
+            for step in range(n):
+                if len(picks) >= max_lanes:
+                    break
+                sender_idx2 = (sender_cursor + step) % n
+                if sender_idx2 in seen_senders:
+                    continue
+                if not _sender_has_pending_work(sender_idx2):
+                    continue
+                if not _sender_has_ready_work(sender_idx2, now_ts):
+                    continue
+                selected_dom = ""
+                for dom2 in (sender_bucket_by_idx.get(sender_idx2) or {}).keys():
+                    if not _domain_has_ready_work(sender_idx2, dom2, now_ts):
+                        continue
+                    retry_q2 = provider_retry_chunks.get(_sd_key(sender_idx2, dom2)) or []
+                    if retry_q2 and float(retry_q2[0].get("next_retry_ts") or 0.0) <= now_ts:
+                        selected_dom = dom2
+                        break
+                if not selected_dom:
+                    selected_dom = _pick_weighted_domain(sender_idx2, now_ts) or ""
+                if selected_dom:
+                    picks.append((int(sender_idx2), str(selected_dom).strip().lower()))
+                    seen_senders.add(sender_idx2)
+            return picks
+
         def _next_sender_domain(now_ts: float) -> Optional[Tuple[int, str]]:
             nonlocal sender_cursor
             n = len(sender_emails)
@@ -16896,6 +16982,7 @@ def smtp_send_job(
                 job.log("INFO", f"Lane baseline report: {json.dumps(baseline_report, ensure_ascii=False, sort_keys=True)}")
 
         used_legacy_selector = False
+        hard_mode_lane_batch: deque = deque()
         if lane_debug_enabled:
             try:
                 lane_debug_self_check(baseline_report)
@@ -17067,7 +17154,17 @@ def smtp_send_job(
                     job.debug_shadow_events = shadow_recorder.snapshot()
 
             probe_selected_this_iteration = False
-            sender_domain_pick = _pick_retry_ready_sender_domain(now_ts)
+            sender_domain_pick = None
+            if sender_parallel_hard_mode:
+                if hard_mode_lane_batch:
+                    sender_domain_pick = hard_mode_lane_batch.popleft()
+                else:
+                    batch_now = build_parallel_sender_lane_batch(now_ts, int(lane_parallel_limit_runtime or len(sender_emails) or 1))
+                    hard_mode_lane_batch = deque(batch_now)
+                    if hard_mode_lane_batch:
+                        sender_domain_pick = hard_mode_lane_batch.popleft()
+            if not sender_domain_pick:
+                sender_domain_pick = _pick_retry_ready_sender_domain(now_ts)
             if not sender_domain_pick and probe_controller.is_active(now_ts):
                 sender_domain_pick = probe_controller.pick_probe_lane(
                     now_ts,
@@ -17324,6 +17421,21 @@ def smtp_send_job(
                     "body_format": body_format2,
                     "reply_to": reply_to2,
                 }
+                if sender_parallel_hard_mode:
+                    lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
+                    job.active_chunks_info = [x for x in (job.active_chunks_info or []) if str(x.get("lane") or "") != lane_id]
+                    job.active_chunks_info.append({
+                        "lane": lane_id,
+                        "chunk_id": int(chunk_idx_local),
+                        "sender_idx": int(sender_idx_fixed),
+                        "sender_mail": str(from_emails2[sender_idx_fixed % len(from_emails2)] if from_emails2 else ""),
+                        "receiver_domain": str(target_domain or ""),
+                        "size": int(len(chunk)),
+                        "status": "running",
+                        "attempt": int(attempt or 0),
+                        "next_retry": 0,
+                        "reason": "",
+                    })
 
             # keep chunks_total roughly correct
             remaining = max(0, _remaining_total())
@@ -17391,6 +17503,9 @@ def smtp_send_job(
                         job.chunks_done += 1
                         job.current_chunk = -1
                         job.current_chunk_info = {}
+                        if sender_parallel_hard_mode:
+                            lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
+                            job.active_chunks_info = [x for x in (job.active_chunks_info or []) if str(x.get("lane") or "") != lane_id]
                         job.current_chunk_domains = {}
                         job.push_chunk_state({
                             "chunk": chunk_idx_local,
@@ -17557,6 +17672,9 @@ def smtp_send_job(
                             job.chunks_done += 1
                             job.current_chunk = -1
                             job.current_chunk_info = {}
+                            if sender_parallel_hard_mode:
+                                lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
+                                job.active_chunks_info = [x for x in (job.active_chunks_info or []) if str(x.get("lane") or "") != lane_id]
                             job.current_chunk_domains = {}
                             job.push_chunk_state({
                                 "chunk": chunk_idx_local,
@@ -17789,6 +17907,9 @@ def smtp_send_job(
                     job.chunks_done += 1
                     job.current_chunk = -1
                     job.current_chunk_info = {}
+                    if sender_parallel_hard_mode:
+                        lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
+                        job.active_chunks_info = [x for x in (job.active_chunks_info or []) if str(x.get("lane") or "") != lane_id]
                     job.current_chunk_domains = {}
                     job.push_chunk_state({
                         "chunk": chunk_idx_local,
