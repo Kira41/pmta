@@ -3434,14 +3434,30 @@ class SendJob:
         if len(self.backoff_items) > 600:
             self.backoff_items = self.backoff_items[-400:]
         self.maybe_persist()
+    def _active_chunk_key(self, lane: str, item: dict) -> str:
+        """Stable key for one live chunk entry.
+
+        Keep the lane namespace but allow multiple active chunks in the same lane
+        (for overlapping retries / parallel workers) by pinning the chunk id.
+        """
+        lane_key = str(lane or "")
+        chunk_raw = (item or {}).get("chunk_id")
+        if chunk_raw is None:
+            chunk_raw = (item or {}).get("chunk")
+        try:
+            chunk_id = int(chunk_raw)
+        except Exception:
+            chunk_id = -1
+        return f"{lane_key}#{chunk_id}"
     def upsert_active_chunk(self, lane: str, item: dict):
-        """Upsert live chunk state per lane for parallel jobs monitor."""
+        """Upsert live chunk state for jobs monitor (supports many active chunks)."""
         self.updated_at = now_iso()
         lane_key = str(lane or "")
-        next_item = {**(item or {}), "lane": lane_key}
+        row_key = self._active_chunk_key(lane_key, item or {})
+        next_item = {**(item or {}), "lane": lane_key, "active_key": row_key}
         replaced = False
         for idx, prev in enumerate(self.active_chunks_info or []):
-            if str((prev or {}).get("lane") or "") == lane_key:
+            if str((prev or {}).get("active_key") or "") == row_key:
                 self.active_chunks_info[idx] = {**(prev or {}), **next_item}
                 replaced = True
                 break
@@ -3450,10 +3466,23 @@ class SendJob:
         if len(self.active_chunks_info) > 120:
             self.active_chunks_info = self.active_chunks_info[-80:]
         self.maybe_persist()
-    def remove_active_chunk(self, lane: str):
+    def remove_active_chunk(self, lane: str, chunk_id: Optional[int] = None):
         self.updated_at = now_iso()
         lane_key = str(lane or "")
-        self.active_chunks_info = [x for x in (self.active_chunks_info or []) if str((x or {}).get("lane") or "") != lane_key]
+        if chunk_id is None:
+            self.active_chunks_info = [x for x in (self.active_chunks_info or []) if str((x or {}).get("lane") or "") != lane_key]
+        else:
+            try:
+                chunk_id_int = int(chunk_id)
+            except Exception:
+                chunk_id_int = -1
+            self.active_chunks_info = [
+                x for x in (self.active_chunks_info or [])
+                if not (
+                    str((x or {}).get("lane") or "") == lane_key
+                    and int((x or {}).get("chunk_id") if (x or {}).get("chunk_id") is not None else (x or {}).get("chunk") or -1) == chunk_id_int
+                )
+            ]
         self.maybe_persist()
     def record_error(self, err: str):
         """Increment a simple error histogram for Jobs UI."""
@@ -8776,7 +8805,8 @@ This will remove it from Jobs history.`);
   function renderChunkHist(card, j){
     const tb = qk(card,'chunkHist');
     if(!tb) return;
-    const cs = (j.chunk_states || []).slice().reverse().slice(0,12);
+    const finalized = new Set(['done', 'done_after_backoff', 'abandoned']);
+    const cs = (j.chunk_states || []).filter(x => finalized.has((x?.status || '').toString().toLowerCase())).slice().reverse().slice(0,12);
     if(!cs.length){
       tb.innerHTML = `<tr><td colspan="10" class="mini">No chunk states yet.</td></tr>`;
       return;
@@ -8838,6 +8868,21 @@ This will remove it from Jobs history.`);
   function getLiveChunks(j){
     const active = Array.isArray(j.active_chunks_info) ? j.active_chunks_info.filter(x => x && Number(x.size || 0) > 0) : [];
     if(active.length) return active;
+    const running = Array.isArray(j.chunk_states)
+      ? j.chunk_states
+          .filter(x => ['running', 'backoff'].includes((x?.status || '').toString().toLowerCase()))
+          .slice(-12)
+          .map(x => ({
+            chunk_id: x.chunk,
+            status: x.status,
+            size: x.size,
+            sender_mail: x.sender,
+            receiver_domain: x.target_domain || x.provider_domain || '',
+            spam_score: x.spam_score,
+            blacklist: x.blacklist,
+          }))
+      : [];
+    if(running.length) return running;
     const ci = j.current_chunk_info || {};
     const hasChunk = ci && ((ci.chunk !== undefined && ci.chunk !== null) || (ci.chunk_id !== undefined && ci.chunk_id !== null)) && Number(ci.size || 0) > 0;
     return hasChunk ? [ci] : [];
@@ -18187,7 +18232,7 @@ def smtp_send_job(
                         job.current_chunk = -1
                         job.current_chunk_info = {}
                         lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
-                        job.remove_active_chunk(lane_id)
+                        job.remove_active_chunk(lane_id, chunk_idx_local)
                         job.current_chunk_domains = {}
                         job.push_chunk_state({
                             "chunk": chunk_idx_local,
@@ -18370,7 +18415,7 @@ def smtp_send_job(
                             job.current_chunk = -1
                             job.current_chunk_info = {}
                             lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
-                            job.remove_active_chunk(lane_id)
+                            job.remove_active_chunk(lane_id, chunk_idx_local)
                             job.current_chunk_domains = {}
                             job.push_chunk_state({
                                 "chunk": chunk_idx_local,
@@ -18619,7 +18664,7 @@ def smtp_send_job(
                     job.current_chunk = -1
                     job.current_chunk_info = {}
                     lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
-                    job.remove_active_chunk(lane_id)
+                    job.remove_active_chunk(lane_id, chunk_idx_local)
                     job.current_chunk_domains = {}
                     job.push_chunk_state({
                         "chunk": chunk_idx_local,
