@@ -92,6 +92,9 @@ def test_job_api_v2_chunk_payload_is_normalized_and_additive_fields_present():
     assert 'spam_score' in live_row
     assert 'blacklist' in live_row
 
+    assert body['active_chunks_count'] == 1
+    assert body['active_backoff_chunks_count'] == 0
+
     current = body['current_chunk_info']
     assert current['chunk'] == current['chunk_id'] == 12
     assert current['lane_id'] == '1|gmail.com'
@@ -125,3 +128,28 @@ def test_job_api_legacy_chunk_payload_keeps_legacy_fields_without_v2_additions()
     assert body['current_chunk_info']['chunk_id'] == 9
     assert body['current_chunk_info']['sender_mail'] == 'legacy@example.com'
     assert body['current_chunk_info']['target_domain'] == 'example.net'
+
+
+def test_job_api_v2_active_backoff_count_tracks_multiple_live_rows():
+    client = shiva.app.test_client()
+    job = shiva.SendJob(id='job-v2-api-2', created_at=shiva.now_iso(), campaign_id='camp-v2-2')
+    job.debug_parallel_lanes_snapshot = {'mode': 'v2', 'updated_at': shiva.now_iso()}
+    job.current_chunk = 99
+    job.current_chunk_info = {'chunk': 99, 'status': 'running'}
+    job.active_chunks_info = [
+        {'chunk': '21', 'lane': '0|gmail.com', 'status': 'backoff', 'sender': 'a@example.com', 'receiver_domain': 'gmail.com', 'attempt': '2', 'size': '20'},
+        {'chunk': '22', 'lane': '1|yahoo.com', 'status': 'running', 'sender': 'b@example.com', 'receiver_domain': 'yahoo.com', 'attempt': '1', 'size': '20'},
+        {'chunk': '23', 'lane': '2|outlook.com', 'status': 'backoff', 'sender': 'c@example.com', 'receiver_domain': 'outlook.com', 'attempt': '3', 'size': '20'},
+    ]
+
+    with shiva.JOBS_LOCK:
+        shiva.JOBS[job.id] = job
+
+    resp = client.get(f'/api/job/{job.id}')
+    assert resp.status_code == 200
+    body = resp.get_json()
+
+    assert body['active_chunks_count'] == 3
+    assert body['active_backoff_chunks_count'] == 2
+    assert body['current_chunk'] == 99
+    assert body['current_chunk_info']['chunk_id'] == 99
