@@ -10000,6 +10000,10 @@ PAGE_CONFIG = r"""
     .toast.good{ border-color: rgba(53,228,154,.35); }
     .toast.bad{ border-color: rgba(255,94,115,.35); }
     .toast.warn{ border-color: rgba(255,193,77,.35); }
+
+    .modeBox{display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:10px}
+    .modeSelect{min-width:260px; max-width:360px}
+    .modeHint{margin-top:8px; color:var(--warn)}
   </style>
 </head>
 <body>
@@ -10038,6 +10042,20 @@ PAGE_CONFIG = r"""
         <span class="pill warn">env</span> OS environment ·
         <span class="pill">default</span> script default
       </div>
+    </div>
+
+    <div class="card">
+      <div><b>Config Mode Presets</b></div>
+      <div class="mini" style="margin-top:6px">
+        Select a mode then click <b>Use Mode</b> to apply multiple environment keys at once.
+      </div>
+      <div class="modeBox">
+        <select id="modePreset" class="modeSelect" title="Config preset mode">
+          <option value="">Select mode...</option>
+        </select>
+        <button class="btn" type="button" id="btnUseMode">⚙️ Use Mode</button>
+      </div>
+      <div class="mini modeHint" id="modeHint"></div>
     </div>
 
     <div class="card" style="overflow-x:auto; overflow-y:visible">
@@ -10080,6 +10098,35 @@ PAGE_CONFIG = r"""
 
   let ITEMS = [];
   const CHANGED = new Map();
+  const MODE_PRESETS = {
+    "Safe": {"SHIVA_DISABLE_BACKOFF":"0","PMTA_QUEUE_BACKOFF":"1","PMTA_PRESSURE_CONTROL":"1","PMTA_HEALTH_REQUIRED":"1","RECIPIENT_FILTER_ENABLE_ROUTE_CHECK":"1","SHIVA_DISABLE_BLACKLIST":"0","PMTA_MONITOR_TIMEOUT_S":"3","SPAMCHECK_BACKEND":"spamd","BACKOFF_MAX_RETRIES":"4","BACKOFF_BASE_S":"90","BACKOFF_MAX_S":"3600"},
+    "Medium": {"SHIVA_DISABLE_BACKOFF":"0","PMTA_QUEUE_BACKOFF":"1","PMTA_PRESSURE_CONTROL":"1","PMTA_HEALTH_REQUIRED":"1","RECIPIENT_FILTER_ENABLE_ROUTE_CHECK":"1","SHIVA_DISABLE_BLACKLIST":"0","PMTA_SLOW_DELAY_S":"0.22","PMTA_SLOW_WORKERS_MAX":"4","BACKOFF_MAX_RETRIES":"3","BACKOFF_BASE_S":"60","BACKOFF_MAX_S":"1800"},
+    "Slow": {"SHIVA_DISABLE_BACKOFF":"0","PMTA_QUEUE_BACKOFF":"1","PMTA_PRESSURE_CONTROL":"1","PMTA_HEALTH_REQUIRED":"1","RECIPIENT_FILTER_ENABLE_ROUTE_CHECK":"1","SHIVA_DISABLE_BLACKLIST":"0","PMTA_SLOW_DELAY_S":"0.45","PMTA_SLOW_WORKERS_MAX":"2","BACKOFF_MAX_RETRIES":"5","BACKOFF_BASE_S":"120","BACKOFF_MAX_S":"3600"},
+    "Fast": {"SHIVA_DISABLE_BACKOFF":"0","PMTA_QUEUE_BACKOFF":"1","PMTA_PRESSURE_CONTROL":"1","PMTA_HEALTH_REQUIRED":"0","RECIPIENT_FILTER_ENABLE_ROUTE_CHECK":"1","SHIVA_DISABLE_BLACKLIST":"0","PMTA_SLOW_DELAY_S":"0.12","PMTA_SLOW_WORKERS_MAX":"6","BACKOFF_MAX_RETRIES":"2","BACKOFF_BASE_S":"30","BACKOFF_MAX_S":"600"},
+    "Very Fast": {"SHIVA_DISABLE_BACKOFF":"1","PMTA_QUEUE_BACKOFF":"0","PMTA_PRESSURE_CONTROL":"0","PMTA_HEALTH_REQUIRED":"0","RECIPIENT_FILTER_ENABLE_ROUTE_CHECK":"0","SHIVA_DISABLE_BLACKLIST":"1","PMTA_SLOW_DELAY_S":"0.03","PMTA_SLOW_WORKERS_MAX":"10","BACKOFF_MAX_RETRIES":"1","BACKOFF_BASE_S":"8","BACKOFF_MAX_S":"90"},
+    "Extra Fast": {"SHIVA_DISABLE_BACKOFF":"1","PMTA_QUEUE_BACKOFF":"0","PMTA_PRESSURE_CONTROL":"0","PMTA_HEALTH_REQUIRED":"0","RECIPIENT_FILTER_ENABLE_ROUTE_CHECK":"0","SHIVA_DISABLE_BLACKLIST":"1","SPAMCHECK_BACKEND":"off","PMTA_SLOW_DELAY_S":"0.01","PMTA_SLOW_WORKERS_MAX":"12","BACKOFF_MAX_RETRIES":"0","BACKOFF_BASE_S":"2","BACKOFF_MAX_S":"15"},
+    "No Monitoring": {"PMTA_HEALTH_REQUIRED":"0","PMTA_MONITOR_TIMEOUT_S":"1","PMTA_DIAG_ON_ERROR":"0","PMTA_PRESSURE_CONTROL":"0","PMTA_DOMAIN_STATS":"0"},
+    "No Check Blacklist": {"SHIVA_DISABLE_BLACKLIST":"1","RBL_ZONES":"","DBL_ZONES":""},
+    "No Recipient Route Check": {"RECIPIENT_FILTER_ENABLE_ROUTE_CHECK":"0"},
+    "No Backoff": {"SHIVA_DISABLE_BACKOFF":"1","PMTA_QUEUE_BACKOFF":"0","BACKOFF_MAX_RETRIES":"0","BACKOFF_BASE_S":"1","BACKOFF_MAX_S":"1"},
+    "Aggressive Queue": {"PMTA_QUEUE_BACKOFF":"0","PMTA_DOMAIN_DEFERRALS_BACKOFF":"500","PMTA_DOMAIN_ERRORS_BACKOFF":"30","PMTA_DOMAIN_DEFERRALS_SLOW":"250","PMTA_DOMAIN_ERRORS_SLOW":"15","PMTA_SLOW_DELAY_S":"0.05","PMTA_SLOW_WORKERS_MAX":"8"},
+    "Strict Reputation": {"SHIVA_DISABLE_BLACKLIST":"0","RBL_ZONES":"zen.spamhaus.org,bl.spamcop.net,cbl.abuseat.org","DBL_ZONES":"dbl.spamhaus.org","PMTA_HEALTH_REQUIRED":"1","SHIVA_DISABLE_BACKOFF":"0","BACKOFF_MAX_RETRIES":"5","BACKOFF_BASE_S":"120","BACKOFF_MAX_S":"3600"},
+    "Strict PMTA Health": {"PMTA_HEALTH_REQUIRED":"1","PMTA_MAX_SPOOL_RECIPIENTS":"100000","PMTA_MAX_SPOOL_MESSAGES":"25000","PMTA_MAX_QUEUED_RECIPIENTS":"120000","PMTA_MAX_QUEUED_MESSAGES":"30000","PMTA_PRESSURE_CONTROL":"1"},
+    "Debug Diagnostics": {"PMTA_DIAG_ON_ERROR":"1","PMTA_DIAG_RATE_S":"0.25","SHIVA_BACKOFF_JITTER_DEBUG":"1","SHIVA_BACKOFF_JITTER_EXPORT":"1","SHIVA_LANE_V2_DEBUG":"1","SHIVA_RESOURCE_GOVERNOR_DEBUG":"1"},
+    "Low Resource": {"PMTA_LIVE_POLL_S":"8","PMTA_DOMAINS_POLL_S":"10","PMTA_MONITOR_TIMEOUT_S":"2","PMTA_DOMAIN_STATS":"0","PMTA_PRESSURE_CONTROL":"0","PMTA_DIAG_ON_ERROR":"0"},
+    "Balanced Monitoring": {"PMTA_DIAG_ON_ERROR":"1","PMTA_DIAG_RATE_S":"1.5","PMTA_DOMAIN_STATS":"1","PMTA_DOMAINS_POLL_S":"4","PMTA_PRESSURE_CONTROL":"1","PMTA_PRESSURE_POLL_S":"3"},
+    "Bulk Throughput": {"SHIVA_LANE_CONCURRENCY":"1","SHIVA_MAX_PARALLEL_LANES":"8","SHIVA_LANE_V2_MAX_SCAN":"120","PMTA_SLOW_WORKERS_MAX":"8","PMTA_SLOW_DELAY_S":"0.08","PMTA_DOMAIN_CHECK_TOP_N":"1"},
+    "Single Domain Safe": {"SHIVA_SINGLE_DOMAIN_WAVES":"1","SHIVA_SINGLE_DOMAIN_ONLY_IF_PROVIDERS_EQ":"1","SHIVA_WAVE_BURST_TOKENS":"250","SHIVA_WAVE_REFILL_PER_SEC":"2.0","PMTA_QUEUE_BACKOFF":"1","SHIVA_DISABLE_BACKOFF":"0"},
+    "Learning Enforced": {"SHIVA_LEARNING_CAPS":"1","SHIVA_LEARNING_CAPS_ENFORCE":"1","SHIVA_POLICY_PACKS":"1","SHIVA_POLICY_PACKS_ENFORCE":"1","SHIVA_PROVIDER_CANON":"1","SHIVA_PROVIDER_CANON_ENFORCE":"1"},
+    "Legacy Compatibility": {"SHIVA_SCHEDULER_MODE":"legacy","SHIVA_LANE_CONCURRENCY":"0","SHIVA_RESOURCE_GOVERNOR":"0","SHIVA_POLICY_PACKS":"0","SHIVA_SINGLE_DOMAIN_WAVES":"0","SHIVA_LEARNING_CAPS":"0"}
+  };
+
+  const MODE_HINTS = {
+    "Extra Fast": "⚠️ كلما زادت سرعة الإرسال قلّ أمان الـ IP والدومين وزاد خطر الـ blacklist والرفض من الـ providers.",
+    "Very Fast": "⚠️ هذا المود عالي السرعة ويقلل عوامل الحماية والـ checks.",
+    "No Check Blacklist": "⚠️ تم تعطيل فحص الـ blacklist بالكامل (RBL/DBL).",
+    "No Monitoring": "⚠️ تم تعطيل/تقليل المراقبة؛ قد لا ترى المشاكل مبكرًا."
+  };
 
   function pill(source){
     if(source === 'ui') return '<span class="pill good">ui</span>';
@@ -10353,11 +10400,52 @@ This removes the UI override and falls back to ENV/default.`);
     }catch(e){ toast('Save All failed', e?.toString?.() || 'Unknown', 'bad'); }
   }
 
+  function syncModeHint(){
+    const mode = (document.getElementById('modePreset')?.value || '').trim();
+    const hint = MODE_HINTS[mode] || '';
+    const hintEl = document.getElementById('modeHint');
+    if(hintEl) hintEl.textContent = hint;
+  }
+
+  async function useMode(){
+    const mode = (document.getElementById('modePreset')?.value || '').trim();
+    if(!mode){ toast('Mode', 'Please select a mode first', 'warn'); return; }
+    const items = MODE_PRESETS[mode] || null;
+    if(!items){ toast('Mode', 'Selected mode is invalid', 'bad'); return; }
+    const ok = confirm(`Apply mode: ${mode}?\nThis will override ${Object.keys(items).length} config keys.`);
+    if(!ok) return;
+    try{
+      const r = await fetch('/api/config/set', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({items})
+      });
+      const j = await r.json().catch(()=>({}));
+      if(r.ok && j && j.ok){
+        toast('Mode Applied', `${mode} applied (${j.saved || Object.keys(items).length} keys)`, 'good');
+        await load();
+      } else {
+        toast('Mode failed', (j && (j.error||j.detail)) ? (j.error||j.detail) : ('HTTP '+r.status), 'bad');
+      }
+    }catch(e){ toast('Mode failed', e?.toString?.() || 'Unknown', 'bad'); }
+  }
+
+  function initModes(){
+    const sel = document.getElementById('modePreset');
+    if(!sel) return;
+    const names = Object.keys(MODE_PRESETS).sort((a,b)=>a.localeCompare(b));
+    sel.innerHTML = '<option value="">Select mode...</option>' + names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+    syncModeHint();
+  }
+
   document.getElementById('btnReload')?.addEventListener('click', load);
   document.getElementById('btnSaveAll')?.addEventListener('click', saveAll);
+  document.getElementById('btnUseMode')?.addEventListener('click', useMode);
+  document.getElementById('modePreset')?.addEventListener('change', syncModeHint);
   document.getElementById('q')?.addEventListener('input', render);
   document.getElementById('groupFilter')?.addEventListener('change', render);
 
+  initModes();
   load();
 </script>
 </body>
