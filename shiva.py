@@ -18307,6 +18307,61 @@ def get_env_rt(key: str, default: str = "") -> str:
 
 def config_items() -> List[dict]:
     """Return schema + current effective values for the UI."""
+    def _config_parsing_hint(typ: str) -> str:
+        t = str(typ or "str").strip().lower()
+        if t == "bool":
+            return "Parsing: truthy values are 1/true/yes/on; anything else is treated as false."
+        if t == "int":
+            return "Parsing: integer only; invalid values fall back to the built-in default."
+        if t == "float":
+            return "Parsing: numeric float; invalid values fall back to the built-in default."
+        return "Parsing: text value; leading/trailing spaces are ignored in most runtime paths."
+
+    def _config_scope_hint(k: str) -> str:
+        key = str(k or "").strip().upper()
+        if key.startswith("PMTA_"):
+            return "Scope: PMTA health/monitoring/backoff behavior and queue pressure decisions."
+        if key.startswith("RECIPIENT_FILTER_"):
+            return "Scope: recipient pre-check pipeline (syntax/route/probe), quality vs speed trade-offs."
+        if key.startswith("SHIVA_LANE_") or key.startswith("SHIVA_WAVE_"):
+            return "Scope: scheduler lane orchestration, pacing, and concurrency behavior."
+        if key.startswith("SHIVA_GUARD") or key.startswith("SHIVA_RESOURCE_GOVERNOR"):
+            return "Scope: safety guardrails and global resource caps to prevent overload."
+        if key.startswith("SHIVA_PROVIDER_") or key.startswith("SHIVA_BUDGET_"):
+            return "Scope: provider-aware fairness/budget rules (inflight limits, cooldowns, min-gap)."
+        if key.startswith("OPENROUTER_"):
+            return "Scope: AI advisory endpoint/model/timeout used by optimization/recommendation features."
+        if key.startswith("SPAM") or key.startswith("SPAMD_") or key in {"RBL_ZONES", "DBL_ZONES", "SHIVA_DISABLE_BLACKLIST"}:
+            return "Scope: spam/reputation checks used before or during send admission decisions."
+        if key.startswith("BRIDGE_") or key.startswith("PMTA_BRIDGE_") or key in {"OUTCOMES_SYNC"}:
+            return "Scope: PMTA accounting bridge polling/sync flow and outcomes ingestion behavior."
+        if key in {"SHIVA_DB_PATH", "SMTP_SENDER_DB_PATH", "DB_CLEAR_ON_START", "SHIVA_DB_WRITE_BATCH_SIZE", "SHIVA_DB_WRITE_QUEUE_MAX"}:
+            return "Scope: local SQLite persistence path/throughput/retention behavior."
+        return "Scope: runtime behavior control for this feature group."
+
+    def _compose_desc(it: dict, eff_value: str, src2: str, typ: str) -> str:
+        base_desc = str(it.get("desc") or "").strip()
+        key = str(it.get("key") or "").strip()
+        default_value = str(it.get("default", ""))
+        choices = _cfg_extract_choices(it)
+        restart_required = bool(it.get("restart_required") or False)
+
+        lines = []
+        if base_desc:
+            lines.append(base_desc)
+        lines.append(f"Default: {default_value}")
+        lines.append(f"Effective now: {eff_value} (source: {src2})")
+        lines.append("Precedence: UI override → ENV → default")
+        lines.append(_config_parsing_hint(typ))
+        lines.append(_config_scope_hint(key))
+        if choices:
+            lines.append("Allowed values: " + ", ".join([str(x) for x in choices]))
+        if restart_required:
+            lines.append("Apply mode: restart required for full effect.")
+        else:
+            lines.append("Apply mode: live reload supported.")
+        return "\n".join(lines)
+
     items: List[dict] = []
     for it in APP_CONFIG_SCHEMA:
         k = str(it.get("key") or "").strip()
@@ -18322,11 +18377,13 @@ def config_items() -> List[dict]:
             eff = str(raw)
             src2 = src
 
+        rich_desc = _compose_desc(it, eff, src2, typ)
+
         items.append({
             "key": k,
             "type": typ,
             "group": str(it.get("group") or "Other"),
-            "desc": str(it.get("desc") or ""),
+            "desc": rich_desc,
             "choices": _cfg_extract_choices(it),
             "secret": bool(it.get("secret") or False),
             "restart_required": bool(it.get("restart_required") or False),
