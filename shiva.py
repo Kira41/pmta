@@ -3028,6 +3028,7 @@ def _should_enable_multi_provider_parallel(
     sender_count: int,
     provider_domain_count: int,
     lane_parallel_limit: int,
+    allow_single_provider: bool,
     force_disable_concurrency: bool,
     fallback_disable_concurrency: bool = False,
 ) -> dict:
@@ -3051,7 +3052,7 @@ def _should_enable_multi_provider_parallel(
     elif sender_count <= 1:
         enabled = False
         reason = "insufficient_senders"
-    elif provider_domain_count <= 1:
+    elif provider_domain_count <= 1 and not bool(allow_single_provider):
         enabled = False
         reason = "single_provider"
 
@@ -3060,6 +3061,7 @@ def _should_enable_multi_provider_parallel(
         "reason": str(reason),
         "sender_count": int(sender_count),
         "provider_domain_count": int(provider_domain_count),
+        "allow_single_provider": bool(allow_single_provider),
         "effective_parallel_lanes": int(effective_parallel_lanes),
         "fallback_to_sequential": not bool(enabled),
     }
@@ -15328,6 +15330,7 @@ def smtp_send_job(
     lane_v2_max_scan = max(1, int(get_env_int("SHIVA_LANE_V2_MAX_SCAN", 50)))
     lane_concurrency_enabled = bool(get_env_bool("SHIVA_LANE_CONCURRENCY", False))
     multi_provider_parallel_senders_flag = bool(get_env_bool("SHIVA_MULTI_PROVIDER_PARALLEL_SENDERS", False))
+    multi_provider_parallel_allow_single_provider = bool(get_env_bool("SHIVA_MULTI_PROVIDER_PARALLEL_ALLOW_SINGLE_PROVIDER", False))
     lane_max_parallel = max(1, int(get_env_int("SHIVA_MAX_PARALLEL_LANES", 5)))
     lane_task_timeout_s = max(30, int(get_env_int("SHIVA_LANE_TASK_TIMEOUT_S", 900)))
     lane_concurrency_debug = bool(get_env_bool("SHIVA_LANE_CONCURRENCY_DEBUG", False))
@@ -16480,6 +16483,7 @@ def smtp_send_job(
             sender_count=len(sender_emails),
             provider_domain_count=provider_domain_count,
             lane_parallel_limit=lane_parallel_limit_runtime,
+            allow_single_provider=multi_provider_parallel_allow_single_provider,
             force_disable_concurrency=force_disable_concurrency,
             fallback_disable_concurrency=False,
         )
@@ -18039,6 +18043,8 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "Enable concurrent lane executor for inter-lane chunk scheduling (requires lane_v2 mode)."},
     {"key": "SHIVA_MULTI_PROVIDER_PARALLEL_SENDERS", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Enable sender-parallel inter-lane execution only when multiple recipient domains/providers are present."},
+    {"key": "SHIVA_MULTI_PROVIDER_PARALLEL_ALLOW_SINGLE_PROVIDER", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "If enabled with SHIVA_MULTI_PROVIDER_PARALLEL_SENDERS=1, allow sender-parallel lanes even when recipients are from a single provider/domain."},
     {"key": "SHIVA_MAX_PARALLEL_LANES", "type": "int", "default": "5", "group": "Scheduler", "restart_required": False,
      "desc": "Maximum in-flight lane tasks allowed by concurrent lane executor."},
     {"key": "SHIVA_LANE_TASK_TIMEOUT_S", "type": "int", "default": "900", "group": "Scheduler", "restart_required": False,
