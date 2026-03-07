@@ -2291,7 +2291,8 @@ def resolve_caps_for_attempt(
 
     lane_state_enforce = bool(get_env_bool("SHIVA_LANE_STATE_CAPS_ENFORCE", False))
     lane_only_v2 = bool(get_env_bool("SHIVA_LANE_STATE_CAPS_ONLY_IN_LANE_V2", True))
-    scheduler_mode_runtime = str(rt.get("__scheduler_mode_runtime") or "legacy").strip().lower() or "legacy"
+    scheduler_mode_runtime_raw = str(rt.get("__scheduler_mode_runtime") or "v2").strip().lower() or "v2"
+    scheduler_mode_runtime = "v2" if scheduler_mode_runtime_raw in {"v2", "lane_v2"} else "legacy"
     if lane_state_enforce and (not lane_only_v2 or scheduler_mode_runtime == "v2") and lane_registry:
         lane_info = lane_registry.get_lane_info(lane)
         lane_rec = dict(lane_info.get("recommended_caps") or {}) if isinstance(lane_info, dict) else {}
@@ -2815,8 +2816,8 @@ class RolloutDecider:
 
 @dataclass
 class EffectivePlan:
-    scheduler_mode: str = "legacy"
-    concurrency_enabled: bool = False
+    scheduler_mode: str = "v2"
+    concurrency_enabled: bool = True
     probe_enabled: bool = False
     waves_enabled: bool = False
     provider_canon_enabled: bool = False
@@ -2933,20 +2934,11 @@ class ModeOrchestrator:
 
     def decide_effective_features(self, job: Any, config: dict, rollout_decision: dict) -> EffectivePlan:
         cfg = dict(config or {})
-        rd = dict(rollout_decision or {})
-        effective_mode = str(rd.get("effective_mode") or "legacy").strip().lower() or "legacy"
-        force_legacy = bool(cfg.get("force_legacy"))
-
-        requested_scheduler_mode = str(cfg.get("requested_scheduler_mode") or "legacy").strip().lower() or "legacy"
-
-        scheduler_mode = "legacy"
-        if requested_scheduler_mode == "v2":
-            scheduler_mode = "v2"
-        elif not force_legacy and effective_mode in {"v2"}:
-            scheduler_mode = "v2"
-
-        # v2 bypass: decision layer is parallel-first and ignores legacy force-disable concurrency flags.
-        concurrency_enabled = bool(scheduler_mode == "v2")
+        # Shiva is now parallel-first by design: v2 is always the execution model.
+        # Legacy scheduling inputs remain tolerated in config for compatibility,
+        # but they no longer alter runtime behavior.
+        scheduler_mode = "v2"
+        concurrency_enabled = True
 
         provider_canon_enabled = bool(cfg.get("provider_canon_enabled"))
         provider_canon_enforced = bool(provider_canon_enabled and cfg.get("provider_canon_enforce"))
@@ -2972,9 +2964,7 @@ class ModeOrchestrator:
         if backoff_jitter_mode not in {"off", "deterministic", "random"}:
             backoff_jitter_mode = "off"
 
-        fallback_controller_enabled = bool(cfg.get("fallback_controller_enabled"))
-        if concurrency_enabled or effective_mode in {"v2"}:
-            fallback_controller_enabled = True
+        fallback_controller_enabled = True
 
         resource_governor_enabled = bool(cfg.get("resource_governor_enabled"))
         if concurrency_enabled and not bool(cfg.get("resource_governor_enabled_explicit")):
