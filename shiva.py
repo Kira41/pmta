@@ -3036,7 +3036,8 @@ def _should_enable_multi_provider_parallel(
     sender_count = max(0, int(sender_count or 0))
     provider_domain_count = max(0, int(provider_domain_count or 0))
     safe_parallel_cap = max(1, int(lane_parallel_limit or 1))
-    effective_parallel_lanes = max(1, min(sender_count if sender_count > 0 else 1, safe_parallel_cap))
+    target_lane_count = provider_domain_count if provider_domain_count > 0 else (sender_count if sender_count > 0 else 1)
+    effective_parallel_lanes = max(1, min(int(target_lane_count), safe_parallel_cap))
 
     reason = "enabled"
     enabled = True
@@ -3049,7 +3050,7 @@ def _should_enable_multi_provider_parallel(
     elif bool(fallback_disable_concurrency):
         enabled = False
         reason = "fallback_disable_concurrency"
-    elif sender_count <= 1:
+    elif sender_count <= 0:
         enabled = False
         reason = "insufficient_senders"
     elif provider_domain_count <= 1 and not bool(allow_single_provider):
@@ -3061,6 +3062,7 @@ def _should_enable_multi_provider_parallel(
         "reason": str(reason),
         "sender_count": int(sender_count),
         "provider_domain_count": int(provider_domain_count),
+        "target_lane_count": int(target_lane_count),
         "allow_single_provider": bool(allow_single_provider),
         "effective_parallel_lanes": int(effective_parallel_lanes),
         "fallback_to_sequential": not bool(enabled),
@@ -15501,6 +15503,10 @@ def smtp_send_job(
         with JOBS_LOCK:
             job.log("WARN", "SHIVA_PROVIDER_SUFFIX_JSON ignored: expected JSON object with suffix->group pairs")
 
+    runtime_sender_max_inflight = int(max(1, budget_sender_max_inflight))
+    if multi_provider_parallel_senders_flag:
+        runtime_sender_max_inflight = max(runtime_sender_max_inflight, max(1, len(sender_emails)))
+
     budget_config = BudgetConfig(
         enabled=budget_manager_enabled,
         debug=budget_debug,
@@ -15510,7 +15516,7 @@ def smtp_send_job(
         provider_min_gap_s_map=_parse_budget_json_map(budget_provider_min_gap_json, value_type="float", min_v=0, max_v=3600),
         provider_cooldown_s_default=budget_provider_cooldown_default,
         provider_cooldown_s_map=_parse_budget_json_map(budget_provider_cooldown_json, value_type="float", min_v=0, max_v=3600),
-        sender_max_inflight=budget_sender_max_inflight,
+        sender_max_inflight=runtime_sender_max_inflight,
         apply_to_retry=budget_apply_to_retry,
         apply_to_probe=budget_apply_to_probe,
         export=budget_export,
