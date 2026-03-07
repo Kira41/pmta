@@ -9270,6 +9270,12 @@ This will remove it from Jobs history.`);
     const liveChunks = getLiveChunks(j);
     const ci = liveChunks[0] || (j.current_chunk_info || {});
     const cDom = j.current_chunk_domains || {};
+    const activeDomainsMap = {};
+    for(const row of liveChunks){
+      const d = ((row?.target_domain || row?.receiver_domain || '') + '').trim().toLowerCase();
+      if(!d) continue;
+      activeDomainsMap[d] = Number(activeDomainsMap[d] || 0) + 1;
+    }
 
     let chunkLine = '<div class="mini">—</div>';
     if(ci && ((ci.chunk !== undefined && ci.chunk !== null) || (ci.chunk_id !== undefined && ci.chunk_id !== null)) && Number(ci.size||0) > 0){
@@ -9317,7 +9323,8 @@ This will remove it from Jobs history.`);
       const hasBl = !!(blShort && blShort.trim());
       const blTone = hasBl ? 'warn' : 'good';
 
-      const cdEntriesInline = Object.entries(cDom).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0)).slice(0,6);
+      const cdEntriesInlineSource = Object.keys(activeDomainsMap).length ? activeDomainsMap : cDom;
+      const cdEntriesInline = Object.entries(cdEntriesInlineSource).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0)).slice(0,6);
       const activeDomainsTxt = cdEntriesInline.length
         ? cdEntriesInline.map(([d,c]) => `${esc(d)}(${Number(c||0)})`).join(' · ')
         : '—';
@@ -9347,22 +9354,40 @@ This will remove it from Jobs history.`);
     qk(card,'chunkLine').innerHTML = chunkLine;
 
     // active domains for current chunk
-    const cdEntries = Object.entries(cDom).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0)).slice(0,6);
+    const cdEntriesSource = Object.keys(activeDomainsMap).length ? activeDomainsMap : cDom;
+    const cdEntries = Object.entries(cdEntriesSource).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0)).slice(0,6);
     qk(card,'chunkDomains').innerHTML = cdEntries.length
       ? ('<div class="mini chunkNote chunkNoteDomains">🔥 Top active domains: ' + cdEntries.map(([d,c]) => `${esc(d)}(${Number(c||0)})`).join(' · ') + '</div>')
       : '<div class="mini chunkNote chunkNoteDomains">🔥 Top active domains: —</div>';
 
-    // Backoff info (latest)
+    // Backoff info (parallel-aware)
+    const liveBackoffs = liveChunks
+      .filter(x => normalizeLiveChunkStatus(x?.status, st) === 'backoff')
+      .slice(0,5);
     const cs = (j.chunk_states || []).slice().reverse();
-    const lastBack = cs.find(x => (x.status || '') === 'backoff');
     let backLine = '—';
-    if(lastBack){
-      const next = lastBack.next_retry_ts ? new Date(Number(lastBack.next_retry_ts)*1000).toLocaleTimeString() : '';
-      const rs = (lastBack.reason || '').toString();
-      const rshort = rs.length > 120 ? (rs.slice(0,120) + '…') : rs;
-      backLine = `Chunk #${Number(lastBack.chunk||0)+1} retry=${Number(lastBack.attempt||0)} · next=${next || '—'} · ${rshort}`;
-    } else if((st||'').toLowerCase() === 'backoff'){
-      backLine = 'Backoff active (waiting for retry)…';
+    if(liveBackoffs.length){
+      const parts = liveBackoffs.map(x => {
+        const next = x.next_retry_ts ? new Date(Number(x.next_retry_ts)*1000).toLocaleTimeString() : '—';
+        const dom = (x.target_domain || x.receiver_domain || '').toString();
+        const reason = (x.reason || '').toString();
+        const reasonShort = reason.length > 64 ? (reason.slice(0,64) + '…') : reason;
+        const label = `#${Number((x.chunk_id ?? x.chunk) || 0) + 1}`;
+        const meta = `${dom ? (dom + ' · ') : ''}retry=${Number(x.attempt||0)} · next=${next}`;
+        return `${label} (${meta}${reasonShort ? (' · ' + reasonShort) : ''})`;
+      });
+      const suffix = (liveBackoffs.length < (liveChunks.filter(x => normalizeLiveChunkStatus(x?.status, st) === 'backoff').length || 0)) ? ' …' : '';
+      backLine = `Active backoff lanes: ${parts.join(' | ')}${suffix}`;
+    }else{
+      const lastBack = cs.find(x => (x.status || '') === 'backoff');
+      if(lastBack){
+        const next = lastBack.next_retry_ts ? new Date(Number(lastBack.next_retry_ts)*1000).toLocaleTimeString() : '';
+        const rs = (lastBack.reason || '').toString();
+        const rshort = rs.length > 120 ? (rs.slice(0,120) + '…') : rs;
+        backLine = `Latest backoff: chunk #${Number(lastBack.chunk||0)+1} retry=${Number(lastBack.attempt||0)} · next=${next || '—'} · ${rshort}`;
+      } else if((st||'').toLowerCase() === 'backoff'){
+        backLine = 'Backoff active across one or more lanes (waiting for retry telemetry)…';
+      }
     }
     qk(card,'backoffLine').textContent = backLine;
     // PMTA Live Panel (optional) — richer UI
@@ -9705,10 +9730,10 @@ This will remove it from Jobs history.`);
     // Adaptive pressure toasts (health/accounting-driven)
     try{
       const liveRef = getLiveChunks(j);
-      const liveHead = liveRef[0] || (j.current_chunk_info || {});
-      const ah = (liveHead && liveHead.adaptive_health) ? liveHead.adaptive_health : null;
+      const adaptiveRef = liveRef.find(x => x && x.adaptive_health && x.adaptive_health.ok) || liveRef[0] || (j.current_chunk_info || {});
+      const ah = (adaptiveRef && adaptiveRef.adaptive_health) ? adaptiveRef.adaptive_health : null;
       if(ah && ah.ok){
-        const targetDomain = ((liveHead && (liveHead.target_domain || liveHead.receiver_domain)) || '').toString();
+        const targetDomain = ((adaptiveRef && (adaptiveRef.target_domain || adaptiveRef.receiver_domain)) || '').toString();
         const signature = [
           Number(ah.level || 0),
           !!ah.reduced,
@@ -9735,11 +9760,15 @@ This will remove it from Jobs history.`);
 
     // Route/IP/domain switch toast per provider domain
     try{
-      const ci2 = (getLiveChunks(j)[0] || j.current_chunk_info || {});
-      const pDom = (ci2.target_domain || ci2.receiver_domain || '').toString();
-      const senderNow = (ci2.sender || ci2.sender_mail || '').toString();
-      if(pDom && senderNow){
+      const routeRows = getLiveChunks(j);
+      const seenRouteKeys = new Set();
+      for(const ci2 of routeRows){
+        const pDom = (ci2.target_domain || ci2.receiver_domain || '').toString();
+        const senderNow = (ci2.sender || ci2.sender_mail || '').toString();
+        if(!pDom || !senderNow) continue;
         const key = `${jobId}:${pDom}`;
+        if(seenRouteKeys.has(key)) continue;
+        seenRouteKeys.add(key);
         const prevSender = (state.lastRoute[key] || '').toString();
         if(prevSender && prevSender !== senderNow){
           toast('Route switched', `Provider ${pDom}: switched sender/IP from ${prevSender} to ${senderNow}.`, 'warn');
@@ -11473,7 +11502,9 @@ PAGE_JOB = r"""
     // Chunk state
     const chunkMeta = document.getElementById('chunkMeta');
     if(chunkMeta){
-      chunkMeta.textContent = `chunks_done=${j.chunks_done || 0} · chunks_total≈${j.chunks_total || 0} · backoff_events=${j.chunks_backoff || 0} · current_chunk=${(j.current_chunk ?? -1)}`;
+      const activeCount = Number(j.active_chunks_count || ((Array.isArray(j.active_chunks_info) ? j.active_chunks_info.length : 0)) || 0);
+      const activeBackoffCount = Number(j.active_backoff_chunks_count || 0);
+      chunkMeta.textContent = `chunks_done=${j.chunks_done || 0} · chunks_total≈${j.chunks_total || 0} · backoff_events=${j.chunks_backoff || 0} · active_chunks=${activeCount} · active_backoff=${activeBackoffCount} · current_chunk(supplemental)=${(j.current_chunk ?? -1)}`;
     }
 
     const chunkTbl = document.getElementById('chunkTbl');
@@ -20365,6 +20396,7 @@ def _chunk_telemetry_payload(job: 'SendJob') -> dict:
 
     unique_seen = set()
     unique_done = set()
+    live_backoff_count = 0
     for row in chunk_states:
         unique_key = (int(row.get("chunk_id") or -1), str(row.get("target_domain") or ""))
         if unique_key[0] >= 0:
@@ -20375,6 +20407,8 @@ def _chunk_telemetry_payload(job: 'SendJob') -> dict:
         unique_key = (int(row.get("chunk_id") or -1), str(row.get("target_domain") or ""))
         if unique_key[0] >= 0:
             unique_seen.add(unique_key)
+        if str(row.get("status") or "").strip().lower() == "backoff":
+            live_backoff_count += 1
     if int(current_row.get("chunk_id") or -1) >= 0:
         unique_seen.add((int(current_row.get("chunk_id") or -1), str(current_row.get("target_domain") or "")))
 
@@ -20390,6 +20424,8 @@ def _chunk_telemetry_payload(job: 'SendJob') -> dict:
         "current_chunk": _safe_int(getattr(job, "current_chunk", -1), -1),
         "current_chunk_info": current_row,
         "active_chunks_info": active_rows,
+        "active_chunks_count": len(active_rows),
+        "active_backoff_chunks_count": live_backoff_count,
         "chunk_states": chunk_states,
         "backoff_items": backoff_items,
         "debug_parallel_lanes_snapshot": runtime,
@@ -20497,6 +20533,8 @@ def job_api(job_id: str):
                 "eta_s": job.eta_seconds(),
                 "current_chunk_info": chunk_payload["current_chunk_info"],
                 "active_chunks_info": chunk_payload["active_chunks_info"],
+                "active_chunks_count": chunk_payload.get("active_chunks_count", 0),
+                "active_backoff_chunks_count": chunk_payload.get("active_backoff_chunks_count", 0),
                 "current_chunk_domains": job.current_chunk_domains,
                 "error_counts": job.error_counts,
                 "current_chunk": chunk_payload["current_chunk"],
@@ -20861,6 +20899,7 @@ def api_campaign_active_job(campaign_id: str):
         resp = jsonify({"ok": False, "error": "no active job"})
         return attach_browser_cookie(resp, bid, is_new)
 
+    chunk_payload = _chunk_telemetry_payload(job)
     resp = jsonify(
         {
             "ok": True,
@@ -20875,7 +20914,11 @@ def api_campaign_active_job(campaign_id: str):
                 "invalid": job.invalid,
                 "chunks_total": job.chunks_total,
                 "chunks_done": job.chunks_done,
-                "current_chunk": job.current_chunk,
+                "current_chunk": chunk_payload["current_chunk"],
+                "current_chunk_info": chunk_payload["current_chunk_info"],
+                "active_chunks_info": chunk_payload["active_chunks_info"],
+                "active_chunks_count": chunk_payload.get("active_chunks_count", 0),
+                "active_backoff_chunks_count": chunk_payload.get("active_backoff_chunks_count", 0),
                 "domain_plan": job.domain_plan,
                 "domain_sent": job.domain_sent,
                 "domain_failed": job.domain_failed,
