@@ -9238,6 +9238,13 @@ This will remove it from Jobs history.`);
     return js === 'backoff' ? 'backoff' : 'running';
   }
 
+  function isV2ChunkTelemetry(j){
+    const source = (j?.telemetry_source || '').toString().toLowerCase();
+    if(source === 'v2') return true;
+    const runtimeMode = (j?.debug_parallel_lanes_snapshot?.mode || '').toString().toLowerCase();
+    return runtimeMode === 'v2' || !!j?.v2_parallel_enabled;
+  }
+
   function hasLiveIdentity(ci){
     if(!ci || typeof ci !== 'object') return false;
     const hasChunk = ci.chunk_id !== undefined && ci.chunk_id !== null && ci.chunk_id !== '';
@@ -9261,6 +9268,7 @@ This will remove it from Jobs history.`);
   }
 
   function getLiveChunks(j){
+    const isV2 = isV2ChunkTelemetry(j);
     const active = Array.isArray(j.active_chunks_info)
       ? j.active_chunks_info
           .filter(x => hasLiveIdentity(x))
@@ -9295,7 +9303,14 @@ This will remove it from Jobs history.`);
     if(running.length) return running;
 
     const ci = j.current_chunk_info || {};
-    return hasLiveIdentity(ci)
+    const ciStatus = (ci?.status || '').toString().toLowerCase();
+    const hasChunkId = ci.chunk_id !== undefined && ci.chunk_id !== null && ci.chunk_id !== '';
+    const hasChunkAlt = ci.chunk !== undefined && ci.chunk !== null && ci.chunk !== '';
+    const hasLane = !!((ci?.lane_id ?? ci?.lane ?? '').toString());
+    const canUseCurrentAsLive = isV2
+      ? ((hasChunkId || hasChunkAlt) && hasLane && ['running','backoff'].includes(ciStatus))
+      : hasLiveIdentity(ci);
+    return canUseCurrentAsLive
       ? [{ ...ci, status: normalizeLiveChunkStatus(ci?.status, j?.status), lane_id: ci?.lane_id ?? ci?.lane }]
       : [];
   }
