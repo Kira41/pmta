@@ -443,6 +443,70 @@ curl -s "${BRIDGE_BASE_URL}/api/v1/job/count?job_id=${PMTA_JOB_ID}" | jq
 
 ## Lane Scheduler v2 Operations
 
+## Preset: إرسال متوازي آمن لحملات تحتوي رابط/محتوى فيديو
+
+إذا كانت الحملة فيها فيديو (خصوصًا مع Gmail/Yahoo) فالأفضل البدء بـ **parallel محافظ** بدل السرعة القصوى، ثم الرفع تدريجيًا بعد أول 1–2 wave ناجحة.
+
+### 1) Runtime Flags (Shiva)
+
+```bash
+SHIVA_ROLLOUT_MODE=on
+SHIVA_LANE_CONCURRENCY=1
+SHIVA_MAX_PARALLEL_LANES=3
+SHIVA_RESOURCE_GOVERNOR=1
+SHIVA_RESOURCE_GOVERNOR_MAX_WORKERS=24
+SHIVA_PROVIDER_MAX_INFLIGHT_DEFAULT=2
+SHIVA_PROVIDER_MIN_GAP_S_DEFAULT=1.5
+SHIVA_PROVIDER_COOLDOWN_S_DEFAULT=45
+
+# Pressure / backoff مهم مع الفيديو لأن التفاعل مع الفلاتر أعلى عادة
+PMTA_PRESSURE_CONTROL=1
+PMTA_QUEUE_BACKOFF=1
+ENABLE_BACKOFF=1
+BACKOFF_MAX_RETRIES=3
+BACKOFF_BASE_S=90
+BACKOFF_MAX_S=2400
+```
+
+### 2) Job Form values (تتماشى مع الكود الحالي)
+
+هذه القيم هي الأكثر أمانًا كبداية عند تشغيل multi-provider parallel:
+
+- `thread_workers=4`
+- `chunk_size=120`
+- `delay_s=0.20`
+- `sleep_chunks=1.5`
+
+> لماذا هذه القيم؟ لأنها تُبقي الضغط موزعًا على lanes متعددة بدون spike كبير لكل domain، وتسمح للـ adaptive policy أن يرفع/يخفض السرعة تدريجيًا بدل الدخول في deferrals حادة.
+
+### 3) شرط “فيديو سليم” قبل الإرسال
+
+- استخدم **رابط HTTPS ثابت** للفيديو بدل attachment كبير كلما أمكن.
+- تأكد أن الصفحة/الملف يرجع `200 OK` وبـ `Content-Type` صحيح (مثل `video/mp4`).
+- إذا استخدمت redirect، اجعل السلسلة قصيرة (< 2 redirects).
+- تجنب روابط tracking طويلة جدًا داخل نفس الرسالة (خصوصًا مع subject aggressive).
+
+### 4) خطة الرفع التدريجي (بعد الاستقرار)
+
+1. بعد 30–60 دقيقة بدون ارتفاع قوي في `deferred/complained`: ارفع `SHIVA_MAX_PARALLEL_LANES` من 3 إلى 4.
+2. ثم ارفع `thread_workers` من 4 إلى 5 (وليس الاثنان معًا في نفس الدفعة).
+3. إذا ظهر ضغط PMTA أو deferrals عالية: ارجع خطوة واحدة فورًا.
+
+### 5) علامات إن الإعداد الحالي “سريع أكثر من اللازم”
+
+- ارتفاع متكرر في `provider_backoff` أو `PMTA block/slow mode`.
+- زيادة `timeouts` داخل lane runtime.
+- هبوط واضح في delivered ratio مع ثبات حجم الإدخال.
+
+عند ظهور أي علامة من هذه، نفّذ rollback سريع:
+
+```bash
+SHIVA_MAX_PARALLEL_LANES=2
+thread_workers=3
+delay_s=0.35
+sleep_chunks=2
+```
+
 ### 1) Recommended deployment path
 
 1. `shadow` لمدة 24 ساعة (legacy execution + shadow events only).
