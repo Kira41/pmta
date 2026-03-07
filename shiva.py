@@ -15296,6 +15296,12 @@ def smtp_send_job(
 ):
     """Send job in chunks.
 
+    Scheduler architecture (final):
+    - legacy path: sequential execution (single active sender/domain lane at a time).
+    - v2 path: sender-parallel execution (one worker lane per sender, each lane processes its sender-assigned provider queues).
+    - dashboard telemetry path: lane/runtime snapshots are exported through debug payloads
+      (debug_parallel_lanes_snapshot/debug_rollout/debug_effective_plan) for UI observability.
+
     Key behaviors:
     - Per-CHUNK preflight (Spam score + DNSBL/DBL blacklist checks)
     - Global backoff (option 2): if a chunk is blocked, the whole job pauses and retries that chunk.
@@ -15313,6 +15319,7 @@ def smtp_send_job(
     thread_workers = _coerce_scalar_number(thread_workers, as_type="int", default=5)
     sleep_chunks = _coerce_scalar_number(sleep_chunks, as_type="float", default=0.0)
 
+    job_started_wall_ts = time.time()
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if not job:
@@ -15358,7 +15365,7 @@ def smtp_send_job(
     # Scheduler modes are intentionally binary:
     # - legacy => sequential pipeline
     # - v2     => parallel sender-driven pipeline
-    # Backward compatibility: accept old `lane_v2` and map it to `v2`.
+    # Backward compatibility alias: historical `lane_v2` now maps to `v2`.
     scheduler_mode = "v2" if scheduler_mode_raw in {"v2", "lane_v2"} else "legacy"
     effective_parallel = bool(scheduler_mode == "v2")
     rollout_mode = (get_env("SHIVA_ROLLOUT_MODE", "off") or "off").strip().lower() or "off"
@@ -15371,6 +15378,9 @@ def smtp_send_job(
     shadow_export_enabled = bool(get_env_bool("SHIVA_SHADOW_EXPORT", False))
     shadow_max_events = max(1, int(get_env_int("SHIVA_SHADOW_MAX_EVENTS", 50)))
     force_legacy = bool(get_env_bool("SHIVA_FORCE_LEGACY", False))
+    # Compatibility alias only: historically used to force sequential fallback.
+    # In final v2 architecture this is ignored when mode=v2 (parallel-first),
+    # and only influences legacy mode behavior.
     force_disable_concurrency = bool(get_env_bool("SHIVA_FORCE_DISABLE_CONCURRENCY", False))
     lane_debug_enabled = bool(get_env_bool("SHIVA_LANE_DEBUG", False))
     lane_baseline_enabled = bool(get_env_bool("SHIVA_LANE_BASELINE_REPORT", False))
@@ -15458,6 +15468,7 @@ def smtp_send_job(
     lane_v2_use_budgets = bool(get_env_bool("SHIVA_LANE_V2_USE_BUDGETS", True))
     lane_v2_use_soft_bias = bool(get_env_bool("SHIVA_LANE_V2_USE_SOFT_BIAS", True))
     lane_v2_max_scan = max(1, int(get_env_int("SHIVA_LANE_V2_MAX_SCAN", 50)))
+    # Compatibility alias only: SHIVA_LANE_CONCURRENCY no longer decides scheduler mode.
     lane_concurrency_flag_legacy = bool(get_env_bool("SHIVA_LANE_CONCURRENCY", False))
     multi_provider_parallel_senders_flag_legacy = bool(get_env_bool("SHIVA_MULTI_PROVIDER_PARALLEL_SENDERS", False))
     multi_provider_parallel_allow_single_provider = bool(get_env_bool("SHIVA_MULTI_PROVIDER_PARALLEL_ALLOW_SINGLE_PROVIDER", False))
@@ -16872,6 +16883,17 @@ def smtp_send_job(
                 f"max_parallel_lanes={int(lane_parallel_limit_runtime)} "
                 f"sender_count={int(len(sender_emails) or 0)}",
             )
+            created_lanes_hint = int(sum(1 for _domains in (sender_bucket_by_idx or {}).values() if any((len(v or []) > 0) for v in (_domains or {}).values()))) if scheduler_mode_runtime == "v2" else 0
+            job.log(
+                "INFO",
+                "Job start summary: "
+                f"mode={scheduler_mode_runtime} "
+                f"sender_count={int(len(sender_emails) or 0)} "
+                f"created_lanes={created_lanes_hint} "
+                f"parallel_cap={int(max(1, lane_parallel_limit_runtime or 1))} "
+                f"recipients_total={int(partition_stats.get('valid_total') or 0)} "
+                f"provider_domains={sorted(list(provider_counts.keys()))}",
+            )
             if scheduler_mode_runtime != "legacy":
                 job.log("INFO", f"Scheduler mode={scheduler_mode_runtime} (legacy=sequential pipeline, v2=parallel sender-driven pipeline)")
             job.log(
@@ -17259,6 +17281,71 @@ def smtp_send_job(
             snap = _parallel_lanes_snapshot(mode_label, configured_max_lanes, sender_count)
             job.debug_parallel_lanes_snapshot = snap
 
+        def _lane_runtime_totals() -> dict:
+            with lane_runtime_lock:
+                items = [dict(x) for x in lane_runtime_state.values()]
+            return {
+                "processed": int(sum(max(0, int(x.get("processed_count") or 0)) for x in items)),
+                "success": int(sum(max(0, int(x.get("success_count") or 0)) for x in items)),
+                "temp_fail": int(sum(max(0, int(x.get("temp_fail_count") or 0)) for x in items)),
+                "hard_fail": int(sum(max(0, int(x.get("hard_fail_count") or 0)) for x in items)),
+                "lanes_completed": int(sum(1 for x in items if str(x.get("status") or "").strip().lower() == "done")),
+                "lanes_failed": int(sum(1 for x in items if str(x.get("status") or "").strip().lower() == "failed")),
+                "lane_entries": int(len(items)),
+            }
+
+        def _acceptance_self_check_v2(*, sender_lane_work: Dict[int, Dict[str, List[str]]], created_lanes: int, lane_workers_now: int, phase: str) -> None:
+            sender_count_local = int(len(sender_emails) or 0)
+            if created_lanes > sender_count_local:
+                raise ValueError(f"acceptance[{phase}] created_lanes exceeds sender_count: lanes={created_lanes} sender_count={sender_count_local}")
+            if int(lane_workers_now or 0) > int(max(0, created_lanes)):
+                raise ValueError(f"acceptance[{phase}] lane_workers exceeds created_lanes: workers={lane_workers_now} lanes={created_lanes}")
+
+            # Each sender can own at most one active worker-lane in v2 sender-parallel path.
+            sender_keys = sorted(int(k) for k in (sender_lane_work or {}).keys())
+            if len(sender_keys) != len(set(sender_keys)):
+                raise ValueError(f"acceptance[{phase}] duplicate sender lanes detected")
+
+            for sidx, domains in (sender_lane_work or {}).items():
+                if not isinstance(domains, dict):
+                    raise ValueError(f"acceptance[{phase}] sender lane domains must be dict sender={sidx}")
+                for dom in domains.keys():
+                    d = str(dom or "").strip().lower()
+                    if not d:
+                        raise ValueError(f"acceptance[{phase}] empty provider domain in sender lane sender={sidx}")
+
+            assigned_recipients: Set[str] = set()
+            for domains in (sender_lane_work or {}).values():
+                for rcpts in (domains or {}).values():
+                    for r in (rcpts or []):
+                        rr = str(r or "").strip().lower()
+                        if rr:
+                            assigned_recipients.add(rr)
+
+            expected_recipients_total = int(partition_stats.get("valid_total") or 0)
+            if len(assigned_recipients) != expected_recipients_total:
+                raise ValueError(
+                    f"acceptance[{phase}] recipients coverage mismatch assigned={len(assigned_recipients)} expected={expected_recipients_total}"
+                )
+
+            # Runtime checks once lane state exists.
+            lane_snap = _parallel_lanes_snapshot(scheduler_mode_runtime, int(max(1, lane_parallel_limit_runtime or 1)), sender_count_local)
+            lanes = list(lane_snap.get("lanes") or [])
+            for lane in lanes:
+                lane_id = str(lane.get("lane_id") or "")
+                sender_idx_lane = int(lane.get("sender_idx") or 0)
+                expected_prefix = f"{sender_idx_lane}|"
+                if lane_id and not lane_id.startswith(expected_prefix):
+                    raise ValueError(f"acceptance[{phase}] lane->sender binding mismatch lane_id={lane_id} sender_idx={sender_idx_lane}")
+
+            if phase == "end":
+                totals = _lane_runtime_totals()
+                progress_actual = int(job.sent or 0) + int(job.failed or 0) + int(job.skipped or 0)
+                if int(totals.get("processed") or 0) != progress_actual:
+                    raise ValueError(
+                        f"acceptance[{phase}] lane processed mismatch lanes_processed={totals.get('processed')} progress_actual={progress_actual}"
+                    )
+
         if scheduler_mode_runtime == "v2":
             sender_lane_work: Dict[int, Dict[str, List[str]]] = {}
             for _sender_idx, _domains in (sender_bucket_by_idx or {}).items():
@@ -17273,6 +17360,20 @@ def smtp_send_job(
             max_sender_lanes = int(len(sender_lane_work))
             configured_lane_cap = max(1, int(lane_parallel_limit_runtime or 1))
             lane_workers = max(1, min(max_sender_lanes, configured_lane_cap)) if max_sender_lanes > 0 else 1
+
+            try:
+                _acceptance_self_check_v2(
+                    sender_lane_work=sender_lane_work,
+                    created_lanes=max_sender_lanes,
+                    lane_workers_now=lane_workers,
+                    phase="start",
+                )
+                with JOBS_LOCK:
+                    job.log("INFO", "Acceptance self-check (v2/start) passed.")
+            except Exception as _acc_exc:
+                with JOBS_LOCK:
+                    job.log("ERROR", f"Acceptance self-check (v2/start) failed: {_acc_exc}")
+                raise
 
             lane_seq_lock = threading.Lock()
             lane_chunk_idx = int(chunk_idx)
@@ -17513,9 +17614,37 @@ def smtp_send_job(
                     for fut in futures:
                         _ = fut.result()
 
+            v2_totals = _lane_runtime_totals()
+            v2_duration_s = max(0.0, float(time.time() - float(job_started_wall_ts or time.time())))
+            try:
+                _acceptance_self_check_v2(
+                    sender_lane_work=sender_lane_work,
+                    created_lanes=max_sender_lanes,
+                    lane_workers_now=lane_workers,
+                    phase="end",
+                )
+                acceptance_line = "Acceptance self-check (v2/end) passed."
+            except Exception as _acc_exc:
+                acceptance_line = f"Acceptance self-check (v2/end) failed: {_acc_exc}"
+
             with JOBS_LOCK:
                 _export_parallel_lanes_snapshot(scheduler_mode_runtime, configured_lane_cap, len(sender_emails))
-                job.status = "done"
+                job.log(
+                    "INFO",
+                    "Job end summary: "
+                    f"lanes_completed={int(v2_totals.get('lanes_completed') or 0)} "
+                    f"lanes_failed={int(v2_totals.get('lanes_failed') or 0)} "
+                    f"total_sent={int(job.sent or 0)} "
+                    f"total_temp_fails={int(v2_totals.get('temp_fail') or 0)} "
+                    f"total_hard_fails={int(v2_totals.get('hard_fail') or 0)} "
+                    f"total_duration_s={v2_duration_s:.2f}",
+                )
+                job.log("INFO" if "passed" in acceptance_line else "ERROR", acceptance_line)
+                if "failed" in acceptance_line:
+                    job.status = "error"
+                    job.last_error = acceptance_line
+                else:
+                    job.status = "done"
                 job.current_chunk = -1
                 if isinstance(job.debug_rollout, dict):
                     job.debug_rollout["used_legacy_selector"] = False
@@ -18480,7 +18609,19 @@ def smtp_send_job(
         if lane_concurrency_runtime and resource_governor and resource_governor_export:
             with JOBS_LOCK:
                 job.debug_resource_governor = resource_governor.snapshot()
+        final_totals = _lane_runtime_totals()
+        final_duration_s = max(0.0, float(time.time() - float(job_started_wall_ts or time.time())))
         with JOBS_LOCK:
+            job.log(
+                "INFO",
+                "Job end summary: "
+                f"lanes_completed={int(final_totals.get('lanes_completed') or 0)} "
+                f"lanes_failed={int(final_totals.get('lanes_failed') or 0)} "
+                f"total_sent={int(job.sent or 0)} "
+                f"total_temp_fails={int(final_totals.get('temp_fail') or 0)} "
+                f"total_hard_fails={int(final_totals.get('hard_fail') or 0)} "
+                f"total_duration_s={final_duration_s:.2f}",
+            )
             job.status = "done"
             job.current_chunk = -1
             if isinstance(job.debug_rollout, dict):
