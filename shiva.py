@@ -3676,12 +3676,22 @@ def _db_writer_enqueue(item: Dict[str, Any]) -> bool:
 
 
 def _db_upsert_job_payload(conn: sqlite3.Connection, payload: Dict[str, Any]) -> None:
+    job_id = str(payload.get("id") or "").strip()
+    if not job_id:
+        return
+
+    tomb = conn.execute("SELECT 1 FROM deleted_jobs WHERE job_id=? LIMIT 1", (job_id,)).fetchone()
+    if tomb:
+        # Hard-delete should win permanently for this job id.
+        conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+        return
+
     _exec_upsert_compat(
         conn,
         "INSERT INTO jobs(id, campaign_id, created_at, updated_at, status, snapshot) VALUES(?,?,?,?,?,?) "
         "ON CONFLICT(id) DO UPDATE SET campaign_id=excluded.campaign_id, updated_at=excluded.updated_at, status=excluded.status, snapshot=excluded.snapshot",
         (
-            str(payload.get("id") or ""),
+            job_id,
             str(payload.get("campaign_id") or ""),
             str(payload.get("created_at") or now_iso()),
             str(payload.get("updated_at") or now_iso()),
@@ -3694,11 +3704,11 @@ def _db_upsert_job_payload(conn: sqlite3.Connection, payload: Dict[str, Any]) ->
             str(payload.get("updated_at") or now_iso()),
             str(payload.get("status") or ""),
             str(payload.get("snapshot") or ""),
-            str(payload.get("id") or ""),
+            job_id,
         ),
         "INSERT INTO jobs(id, campaign_id, created_at, updated_at, status, snapshot) VALUES(?,?,?,?,?,?)",
         (
-            str(payload.get("id") or ""),
+            job_id,
             str(payload.get("campaign_id") or ""),
             str(payload.get("created_at") or now_iso()),
             str(payload.get("updated_at") or now_iso()),
@@ -3923,6 +3933,14 @@ def db_init() -> None:
                    )"""
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_campaign ON jobs(campaign_id)")
+
+            # Job tombstones: ensure deleted jobs are never re-inserted by stale async snapshots.
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS deleted_jobs(
+                       job_id TEXT PRIMARY KEY,
+                       deleted_at TEXT NOT NULL
+                   )"""
+            )
 
             # Per-recipient outcomes (from PMTA accounting)
             conn.execute(
@@ -4367,6 +4385,11 @@ def db_delete_job(job_id: str) -> None:
     with DB_LOCK:
         conn = _db_conn()
         try:
+            conn.execute(
+                "INSERT INTO deleted_jobs(job_id, deleted_at) VALUES(?, ?) "
+                "ON CONFLICT(job_id) DO UPDATE SET deleted_at=excluded.deleted_at",
+                (jid, now_iso()),
+            )
             conn.execute("DELETE FROM jobs WHERE id=?", (jid,))
             conn.execute("DELETE FROM job_outcomes WHERE job_id=?", (jid,))
             conn.execute("DELETE FROM job_recipients WHERE job_id=?", (jid,))

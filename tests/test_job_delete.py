@@ -75,11 +75,21 @@ def test_db_delete_job_removes_job_and_related_rows_and_pending_snapshots(tmp_pa
         conn = shiva._db_conn()
         try:
             assert conn.execute("SELECT COUNT(*) FROM jobs WHERE id=?", (jid,)).fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM deleted_jobs WHERE job_id=?", (jid,)).fetchone()[0] == 1
             assert conn.execute("SELECT COUNT(*) FROM job_outcomes WHERE job_id=?", (jid,)).fetchone()[0] == 0
             assert conn.execute("SELECT COUNT(*) FROM job_recipients WHERE job_id=?", (jid,)).fetchone()[0] == 0
             assert conn.execute("SELECT COUNT(*) FROM accounting_events WHERE job_id=?", (jid,)).fetchone()[0] == 0
             assert conn.execute("SELECT COUNT(*) FROM email_attempt_logs WHERE job_id=?", (jid,)).fetchone()[0] == 0
             assert conn.execute("SELECT COUNT(*) FROM email_attempt_learning WHERE job_id=?", (jid,)).fetchone()[0] == 0
+        finally:
+            conn.close()
+
+    # A stale snapshot write must never resurrect a deleted job id.
+    shiva.db_upsert_job(job)
+    with shiva.DB_LOCK:
+        conn = shiva._db_conn()
+        try:
+            assert conn.execute("SELECT COUNT(*) FROM jobs WHERE id=?", (jid,)).fetchone()[0] == 0
         finally:
             conn.close()
 
