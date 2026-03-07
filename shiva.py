@@ -3036,7 +3036,9 @@ def _should_enable_multi_provider_parallel(
     sender_count = max(0, int(sender_count or 0))
     provider_domain_count = max(0, int(provider_domain_count or 0))
     safe_parallel_cap = max(1, int(lane_parallel_limit or 1))
-    target_lane_count = provider_domain_count if provider_domain_count > 0 else (sender_count if sender_count > 0 else 1)
+    # In single-provider jobs we still want sender-level concurrency when explicitly allowed,
+    # so fan-out should be at least the sender pool size (subject to safety caps).
+    target_lane_count = max(provider_domain_count, sender_count, 1)
     effective_parallel_lanes = max(1, min(int(target_lane_count), safe_parallel_cap))
 
     reason = "enabled"
