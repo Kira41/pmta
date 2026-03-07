@@ -3307,6 +3307,7 @@ class SendJob:
     debug_shadow_events: List[dict] = field(default_factory=list)
     debug_lane_accounting: dict = field(default_factory=dict)
     debug_guardrails: dict = field(default_factory=dict)
+    debug_parallel_lanes_snapshot: dict = field(default_factory=dict)
 
     # PMTA diagnostics snapshot (optional; helps classify failures quickly)
     pmta_diag: dict = field(default_factory=dict)
@@ -4361,6 +4362,7 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "debug_shadow_events": (job.debug_shadow_events or [])[-50:],
         "debug_lane_accounting": job.debug_lane_accounting or {},
         "debug_guardrails": job.debug_guardrails or {},
+        "debug_parallel_lanes_snapshot": job.debug_parallel_lanes_snapshot or {},
         "pmta_diag": job.pmta_diag or {},
         "pmta_diag_ts": job.pmta_diag_ts or "",
         "created_at": job.created_at,
@@ -5405,6 +5407,7 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job.debug_shadow_events = list(s.get("debug_shadow_events") or [])
         job.debug_lane_accounting = (s.get("debug_lane_accounting") if isinstance(s.get("debug_lane_accounting"), dict) else {}) or {}
         job.debug_guardrails = (s.get("debug_guardrails") if isinstance(s.get("debug_guardrails"), dict) else {}) or {}
+        job.debug_parallel_lanes_snapshot = (s.get("debug_parallel_lanes_snapshot") if isinstance(s.get("debug_parallel_lanes_snapshot"), dict) else {}) or {}
         job.pmta_diag = (s.get("pmta_diag") if isinstance(s.get("pmta_diag"), dict) else {}) or {}
         job.pmta_diag_ts = str(s.get("pmta_diag_ts") or "")
         job.updated_at = str(s.get("updated_at") or "")
@@ -10923,8 +10926,37 @@ PAGE_JOB = r"""
       <details open>
         <summary style="cursor:pointer; font-weight:700; margin-bottom:8px">Scheduler + Lanes Telemetry</summary>
         <div class="muted" id="telemetryHeader">—</div>
+        <div class="muted" id="telemetryExecutionModel" style="margin-top:6px">—</div>
+        <div class="muted" id="telemetryParallelSummary" style="margin-top:6px">—</div>
         <div style="margin-top:8px" id="telemetryProviderGroups" class="muted"></div>
-        <div style="overflow:auto; max-height:260px; margin-top:10px">
+
+        <div style="margin-top:10px">
+          <h4 style="margin:0 0 8px">Parallel Sender Lanes</h4>
+          <div class="muted" id="parallelLanesStats">—</div>
+          <div style="overflow:auto; max-height:320px; margin-top:8px">
+            <table>
+              <thead>
+                <tr>
+                  <th>Lane</th>
+                  <th>Sender</th>
+                  <th>Provider</th>
+                  <th>Chunk</th>
+                  <th>Status</th>
+                  <th>Lane state</th>
+                  <th>Processed</th>
+                  <th>Success</th>
+                  <th>Temp fail</th>
+                  <th>Hard fail</th>
+                  <th>Workers</th>
+                  <th>Started / Updated / Finished</th>
+                </tr>
+              </thead>
+              <tbody id="parallelLanesTable"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div style="overflow:auto; max-height:260px; margin-top:12px">
           <table>
             <thead>
               <tr>
@@ -10973,14 +11005,62 @@ PAGE_JOB = r"""
     const rollout = t.rollout || {};
     const scheduler = t.scheduler || {};
     const fallback = t.fallback || {};
+    const parallel = t.parallel_lanes || {};
+    const summary = scheduler.summary || {};
     const hdr = `mode=${esc(scheduler.mode || 'legacy')} · rollout=${esc(rollout.effective_mode || 'off')} · concurrency=${scheduler.concurrency_enabled ? 'on' : 'off'} (${Number(scheduler.max_parallel_lanes||1)}) · fallback=${fallback.active ? 'ACTIVE' : 'inactive'}`;
     const h = document.getElementById('telemetryHeader');
     if(h) h.textContent = hdr;
+
+    const modelNode = document.getElementById('telemetryExecutionModel');
+    const isParallel = String(parallel.mode || scheduler.mode || 'legacy').toLowerCase() === 'v2';
+    if(modelNode){
+      modelNode.textContent = isParallel
+        ? 'Execution model: v2 parallel sender lanes (multiple lanes/chunks can run together).'
+        : 'Execution model: legacy sequential job (single active pipeline lane).';
+    }
+
+    const sumNode = document.getElementById('telemetryParallelSummary');
+    if(sumNode){
+      sumNode.textContent = `Summary: scheduler_mode=${esc(summary.scheduler_mode || scheduler.mode || 'legacy')} · sender_count=${Number(summary.sender_count || parallel.sender_count || 0)} · active_parallel_lanes=${Number(summary.active_parallel_lanes || parallel.active_parallel_lanes || 0)} · configured_max_lanes=${Number(summary.configured_max_lanes || parallel.configured_max_lanes || 1)}`;
+    }
 
     const groups = ((t.provider_canonicalization || {}).groups || {});
     const gtxt = Object.entries(groups).map(([k,v]) => `${k}:${v}`).join(' · ');
     const gp = document.getElementById('telemetryProviderGroups');
     if(gp) gp.textContent = gtxt ? (`Provider groups: ${gtxt}`) : 'Provider groups: —';
+
+    const laneCounts = parallel.lane_counts || {};
+    const pStats = document.getElementById('parallelLanesStats');
+    if(pStats){
+      pStats.textContent = `lanes_total=${Number(laneCounts.total||0)} · running=${Number(laneCounts.running||0)} · completed=${Number(laneCounts.completed||0)} · failed=${Number(laneCounts.failed||0)} · sleeping=${Number(laneCounts.sleeping||0)} · queued=${Number(laneCounts.queued||0)} · backoff=${Number(laneCounts.backoff||0)}`;
+    }
+
+    const plTable = document.getElementById('parallelLanesTable');
+    const plRows = (parallel.lanes || []);
+    if(plTable){
+      plTable.innerHTML = plRows.map((ln) => {
+        const chunkIndex = (ln.chunk_index === null || ln.chunk_index === undefined) ? '-' : Number(ln.chunk_index);
+        const chunkId = (ln.chunk_id || '').toString();
+        const totalChunks = Number(ln.chunks_total || 0);
+        const remChunks = Number(ln.chunks_remaining || 0);
+        const chunkTxt = `${chunkIndex} / ${esc(chunkId || '-')}${totalChunks ? ` · remaining=${remChunks}` : ''}`;
+        const workers = Number(ln.current_workers || 0);
+        return `<tr>`+
+          `<td>${esc(ln.lane_id || '')}</td>`+
+          `<td>${esc(ln.sender_email || ('sender#' + Number(ln.sender_idx||0)))}</td>`+
+          `<td>${esc(ln.provider_domain || '')}</td>`+
+          `<td>${chunkTxt}</td>`+
+          `<td>${esc(ln.status || 'queued')}</td>`+
+          `<td>${esc(ln.lane_state || '')}</td>`+
+          `<td>${Number(ln.processed_count || 0)}</td>`+
+          `<td class="ok">${Number(ln.success_count || 0)}</td>`+
+          `<td>${Number(ln.temp_fail_count || 0)}</td>`+
+          `<td class="no">${Number(ln.hard_fail_count || 0)}</td>`+
+          `<td>${workers}${ln.workers_detail ? ` · ${esc(JSON.stringify(ln.workers_detail))}` : ''}</td>`+
+          `<td>${esc(ln.started_at || '-')}<br>${esc(ln.last_update || '-')}<br>${esc(ln.finished_at || '-')}</td>`+
+        `</tr>`;
+      }).join('') || `<tr><td colspan="12" class="muted">No parallel lanes runtime snapshot yet.</td></tr>`;
+    }
 
     const lanes = (t.lanes || []);
     const tbody = document.getElementById('telemetryLanes');
@@ -11007,8 +11087,8 @@ PAGE_JOB = r"""
     if(ev){
       const fReasons = (fallback.reasons || []).map(x => esc(String(x))).join(' | ') || 'none';
       const completions = (t.executor || {}).recent_completions || [];
-      const lastExec = completions.slice(-5).map(x => `${x.lane}:${x.status}`).join(' | ') || 'none';
-      ev.textContent = `Fallback reasons: ${fReasons} · Executor recent: ${lastExec}`;
+      const lastExec = completions.slice(-5).map(x => `${x.lane}:${x.status}`).join(' · ') || 'none';
+      ev.textContent = `fallback_reasons=${fReasons} · executor_recent=${lastExec}`;
     }
   }
 
@@ -15514,6 +15594,18 @@ def smtp_send_job(
         with JOBS_LOCK:
             job.debug_lane_executor = {}
             job.active_chunks_info = []
+
+    with JOBS_LOCK:
+        job.debug_parallel_lanes_snapshot = {
+            "updated_at": now_iso(),
+            "mode": str(scheduler_mode),
+            "is_parallel": bool(str(scheduler_mode) == "v2"),
+            "sender_count": int(len(sender_emails) or 0),
+            "configured_max_lanes": int(max(1, lane_max_parallel or 1)),
+            "active_parallel_lanes": 0,
+            "lane_counts": {"total": 0, "running": 0, "completed": 0, "failed": 0, "sleeping": 0, "queued": 0, "backoff": 0},
+            "lanes": [],
+        }
     if resource_governor_export:
         with JOBS_LOCK:
             job.debug_resource_governor = {}
@@ -17046,6 +17138,127 @@ def smtp_send_job(
                     job.log("ERROR", f"Lane debug self-check fatal invariant: {e}")
                 raise
 
+        def _lane_status_rank(status: str) -> int:
+            order = {"running": 0, "queued": 1, "sleeping": 2, "backoff": 3, "done": 4, "failed": 5}
+            return int(order.get(str(status or "queued").strip().lower(), 9))
+
+        lane_runtime_lock = threading.Lock()
+        lane_runtime_state: Dict[str, dict] = {}
+
+        def _ensure_lane_runtime_entry(*, lane_id: str, sender_idx: int, sender_email: str, provider_domain: str) -> dict:
+            ent = lane_runtime_state.get(lane_id)
+            if ent is None:
+                ent = {
+                        "lane_id": str(lane_id or ""),
+                        "sender_idx": int(sender_idx or 0),
+                        "sender_email": str(sender_email or "").strip(),
+                        "provider_domain": str(provider_domain or "").strip().lower(),
+                        "lane_state": "created",
+                        "status": "queued",
+                        "chunk_index": None,
+                        "chunk_id": "",
+                        "chunks_total": 0,
+                        "chunks_processed": 0,
+                        "chunks_remaining": 0,
+                        "processed_count": 0,
+                        "success_count": 0,
+                        "temp_fail_count": 0,
+                        "hard_fail_count": 0,
+                        "current_workers": 0,
+                        "workers_detail": {},
+                        "started_at": "",
+                        "last_update": now_iso(),
+                        "finished_at": "",
+                        "last_error": "",
+                        "last_transition": "created",
+                    }
+                lane_runtime_state[lane_id] = ent
+            else:
+                ent["sender_idx"] = int(sender_idx or ent.get("sender_idx") or 0)
+                if sender_email:
+                    ent["sender_email"] = str(sender_email).strip()
+                if provider_domain:
+                    ent["provider_domain"] = str(provider_domain).strip().lower()
+            return ent
+
+        def _update_lane_runtime(*, lane_id: str, sender_idx: int, sender_email: str, provider_domain: str, lane_state: Optional[str] = None, status: Optional[str] = None, chunk_index: Optional[int] = None, chunk_id: Optional[str] = None, chunks_total: Optional[int] = None, chunks_processed: Optional[int] = None, chunks_remaining: Optional[int] = None, processed_inc: int = 0, success_inc: int = 0, temp_fail_inc: int = 0, hard_fail_inc: int = 0, current_workers: Optional[int] = None, workers_detail: Optional[dict] = None, last_error: str = "", transition: str = "") -> None:
+            with lane_runtime_lock:
+                ent = _ensure_lane_runtime_entry(
+                    lane_id=lane_id,
+                    sender_idx=sender_idx,
+                    sender_email=sender_email,
+                    provider_domain=provider_domain,
+                )
+                ts_iso = now_iso()
+                if lane_state:
+                    ent["lane_state"] = str(lane_state)
+                if status:
+                    ent["status"] = str(status)
+                if chunk_index is not None:
+                    ent["chunk_index"] = int(chunk_index)
+                if chunk_id is not None:
+                    ent["chunk_id"] = str(chunk_id)
+                if chunks_total is not None:
+                    ent["chunks_total"] = max(0, int(chunks_total))
+                if chunks_processed is not None:
+                    ent["chunks_processed"] = max(0, int(chunks_processed))
+                if chunks_remaining is not None:
+                    ent["chunks_remaining"] = max(0, int(chunks_remaining))
+                if processed_inc:
+                    ent["processed_count"] = max(0, int(ent.get("processed_count") or 0) + int(processed_inc))
+                if success_inc:
+                    ent["success_count"] = max(0, int(ent.get("success_count") or 0) + int(success_inc))
+                if temp_fail_inc:
+                    ent["temp_fail_count"] = max(0, int(ent.get("temp_fail_count") or 0) + int(temp_fail_inc))
+                if hard_fail_inc:
+                    ent["hard_fail_count"] = max(0, int(ent.get("hard_fail_count") or 0) + int(hard_fail_inc))
+                if current_workers is not None:
+                    ent["current_workers"] = max(0, int(current_workers))
+                if isinstance(workers_detail, dict):
+                    ent["workers_detail"] = dict(workers_detail)
+                if status in {"running", "sleeping", "backoff"} and not str(ent.get("started_at") or ""):
+                    ent["started_at"] = ts_iso
+                if status in {"done", "failed"}:
+                    ent["finished_at"] = ts_iso
+                if last_error:
+                    ent["last_error"] = str(last_error)[:240]
+                if transition:
+                    ent["last_transition"] = str(transition)
+                ent["last_update"] = ts_iso
+
+        def _parallel_lanes_snapshot(mode_label: str, configured_max_lanes: int, sender_count: int) -> dict:
+            with lane_runtime_lock:
+                lanes_raw = [dict(x) for x in lane_runtime_state.values()]
+            lanes_sorted = sorted(lanes_raw, key=lambda x: (_lane_status_rank(str(x.get("status") or "queued")), int(x.get("sender_idx") or 0), str(x.get("lane_id") or "")))
+            counters = {"queued": 0, "running": 0, "sleeping": 0, "backoff": 0, "done": 0, "failed": 0}
+            for item in lanes_sorted:
+                st = str(item.get("status") or "queued").strip().lower()
+                if st in counters:
+                    counters[st] += 1
+            active_parallel = int(counters.get("running", 0) + counters.get("sleeping", 0) + counters.get("backoff", 0))
+            return {
+                "updated_at": now_iso(),
+                "mode": str(mode_label or "legacy"),
+                "is_parallel": bool(str(mode_label or "legacy").strip().lower() == "v2"),
+                "sender_count": int(sender_count or 0),
+                "configured_max_lanes": int(max(1, configured_max_lanes or 1)),
+                "active_parallel_lanes": active_parallel,
+                "lane_counts": {
+                    "total": int(len(lanes_sorted)),
+                    "running": int(counters.get("running", 0)),
+                    "completed": int(counters.get("done", 0)),
+                    "failed": int(counters.get("failed", 0)),
+                    "sleeping": int(counters.get("sleeping", 0)),
+                    "queued": int(counters.get("queued", 0)),
+                    "backoff": int(counters.get("backoff", 0)),
+                },
+                "lanes": lanes_sorted,
+            }
+
+        def _export_parallel_lanes_snapshot(mode_label: str, configured_max_lanes: int, sender_count: int) -> None:
+            snap = _parallel_lanes_snapshot(mode_label, configured_max_lanes, sender_count)
+            job.debug_parallel_lanes_snapshot = snap
+
         if scheduler_mode_runtime == "v2":
             sender_lane_work: Dict[int, Dict[str, List[str]]] = {}
             for _sender_idx, _domains in (sender_bucket_by_idx or {}).items():
@@ -17073,16 +17286,55 @@ def smtp_send_job(
             def _sender_lane_runner(sender_idx_lane: int, sender_domains_lane: Dict[str, List[str]]) -> Dict[str, Any]:
                 lane_sender_email = sender_emails[sender_idx_lane % len(sender_emails)] if sender_emails else ""
                 lane_provider_domains = sorted([str(d or "").strip().lower() for d in sender_domains_lane.keys() if str(d or "").strip()])
+                lane_total_chunks = int(sum((len(v or []) + max(1, int(chunk_size or 1)) - 1) // max(1, int(chunk_size or 1)) for v in sender_domains_lane.values()))
+                lane_done = 0
+                lane_failed_chunks = 0
+                lane_temp_fail_chunks = 0
+
+                for lane_provider_domain in lane_provider_domains:
+                    lane_id = f"{int(sender_idx_lane)}|{str(lane_provider_domain or '').strip().lower()}"
+                    lane_remaining_chunks = int((len(sender_domains_lane.get(lane_provider_domain) or []) + max(1, int(chunk_size or 1)) - 1) // max(1, int(chunk_size or 1)))
+                    _update_lane_runtime(
+                        lane_id=lane_id,
+                        sender_idx=sender_idx_lane,
+                        sender_email=lane_sender_email,
+                        provider_domain=lane_provider_domain,
+                        lane_state="created",
+                        status="queued",
+                        chunks_total=lane_remaining_chunks,
+                        chunks_processed=0,
+                        chunks_remaining=lane_remaining_chunks,
+                        transition="lane_created",
+                    )
+                    with JOBS_LOCK:
+                        job.log("INFO", f"lane transition lane={lane_id} status=queued state=created sender={lane_sender_email} provider={lane_provider_domain} chunks_total={lane_remaining_chunks}")
+                        _export_parallel_lanes_snapshot(scheduler_mode_runtime, configured_lane_cap, len(sender_emails))
+
                 with JOBS_LOCK:
-                    job.log("INFO", f"lane created for sender {lane_sender_email} (sender_idx={sender_idx_lane})")
                     job.log("INFO", f"lane assigned for sender {lane_sender_email}: providers={lane_provider_domains} chunks_pending={sum(len(v or []) for v in sender_domains_lane.values())}")
                     job.log("INFO", f"lane start sender={lane_sender_email} sender_idx={sender_idx_lane}")
+                    _export_parallel_lanes_snapshot(scheduler_mode_runtime, configured_lane_cap, len(sender_emails))
 
-                lane_done = 0
                 for lane_provider_domain in lane_provider_domains:
                     lane_queue = sender_domains_lane.get(lane_provider_domain) or []
                     while lane_queue:
                         if _should_stop() or not _wait_ready():
+                            lane_id = f"{int(sender_idx_lane)}|{str(lane_provider_domain or '').strip().lower()}"
+                            _update_lane_runtime(
+                                lane_id=lane_id,
+                                sender_idx=sender_idx_lane,
+                                sender_email=lane_sender_email,
+                                provider_domain=lane_provider_domain,
+                                lane_state="stopped",
+                                status="failed",
+                                current_workers=0,
+                                workers_detail={"reserved": 0, "mode": "stopped"},
+                                transition="stopped",
+                                last_error="stop_requested",
+                            )
+                            with JOBS_LOCK:
+                                job.log("WARN", f"lane transition lane={lane_id} status=failed state=stopped reason=stop_requested")
+                                _export_parallel_lanes_snapshot(scheduler_mode_runtime, configured_lane_cap, len(sender_emails))
                             return {"sender_idx": sender_idx_lane, "sender_email": lane_sender_email, "chunks_done": lane_done, "stopped": True}
 
                         rt_lane = _runtime_overrides()
@@ -17108,6 +17360,30 @@ def smtp_send_job(
                         chunk_idx_local = _next_lane_chunk_idx()
                         sender_name_lane = from_names_lane[sender_idx_lane % len(from_names_lane)] if from_names_lane else ""
                         sender_email_lane = from_emails_lane[sender_idx_lane % len(from_emails_lane)] if from_emails_lane else ""
+                        lane_id = f"{int(sender_idx_lane)}|{str(lane_provider_domain or '').strip().lower()}"
+                        lane_remaining_chunks = int((len(lane_queue) + max(1, int(lane_chunk_size or 1)) - 1) // max(1, int(lane_chunk_size or 1)))
+                        chunk_id = f"{lane_id}#chunk-{int(chunk_idx_local)}"
+                        _update_lane_runtime(
+                            lane_id=lane_id,
+                            sender_idx=sender_idx_lane,
+                            sender_email=lane_sender_email,
+                            provider_domain=lane_provider_domain,
+                            lane_state="processing",
+                            status="running",
+                            chunk_index=chunk_idx_local,
+                            chunk_id=chunk_id,
+                            chunks_total=lane_remaining_chunks + lane_done + 1,
+                            chunks_processed=lane_done,
+                            chunks_remaining=lane_remaining_chunks + 1,
+                            current_workers=lane_workers_local,
+                            workers_detail={"reserved": int(lane_workers_local), "mode": "chunk_parallel"},
+                            transition="chunk_running",
+                        )
+                        with JOBS_LOCK:
+                            job.log("INFO", f"lane transition lane={lane_id} status=running state=processing chunk={chunk_idx_local} chunk_id={chunk_id} workers={lane_workers_local}")
+                            _export_parallel_lanes_snapshot(scheduler_mode_runtime, configured_lane_cap, len(sender_emails))
+                            before_recent_len_lane = len(job.recent_results or [])
+
                         rot_lane = max(0, chunk_idx_local)
                         subject_lane = _cyclic_pick(subjects_lane, rot_lane)
                         body_lane = _cyclic_pick(body_variants_lane, rot_lane)
@@ -17129,18 +17405,107 @@ def smtp_send_job(
                             chunk_src=src_value_lane,
                         )
 
+                        with JOBS_LOCK:
+                            recent_slice_lane = list((job.recent_results or [])[before_recent_len_lane:])
+                        lane_counts = _lane_chunk_result_from_recent(recent_slice_lane, len(chunk_now))
+                        lane_processed = max(0, int((lane_counts or {}).get("attempts_total") or len(chunk_now)))
+                        lane_success = max(0, int((lane_counts or {}).get("accepted_2xx") or 0))
+                        lane_temp_fail = max(0, int((lane_counts or {}).get("deferrals_4xx") or 0))
+                        lane_hard_fail = max(0, int((lane_counts or {}).get("hardfails_5xx") or 0) + int((lane_counts or {}).get("timeouts_conn") or 0))
+
                         lane_done += 1
+                        lane_temp_fail_chunks += 1 if lane_temp_fail > 0 else 0
+                        lane_failed_chunks += 1 if lane_hard_fail > 0 else 0
+                        _update_lane_runtime(
+                            lane_id=lane_id,
+                            sender_idx=sender_idx_lane,
+                            sender_email=lane_sender_email,
+                            provider_domain=lane_provider_domain,
+                            lane_state="processing",
+                            status="running",
+                            chunk_index=chunk_idx_local,
+                            chunk_id=chunk_id,
+                            chunks_processed=lane_done,
+                            chunks_remaining=lane_remaining_chunks,
+                            processed_inc=lane_processed,
+                            success_inc=lane_success,
+                            temp_fail_inc=lane_temp_fail,
+                            hard_fail_inc=lane_hard_fail,
+                            current_workers=0,
+                            workers_detail={"reserved": 0, "mode": "idle"},
+                            transition="chunk_done",
+                        )
+                        with JOBS_LOCK:
+                            _export_parallel_lanes_snapshot(scheduler_mode_runtime, configured_lane_cap, len(sender_emails))
                         if lane_sleep_s > 0 and (lane_queue or _remaining_total() > 0):
+                            lane_id = f"{int(sender_idx_lane)}|{str(lane_provider_domain or '').strip().lower()}"
+                            _update_lane_runtime(
+                                lane_id=lane_id,
+                                sender_idx=sender_idx_lane,
+                                sender_email=lane_sender_email,
+                                provider_domain=lane_provider_domain,
+                                lane_state="cooldown",
+                                status="sleeping",
+                                current_workers=0,
+                                workers_detail={"reserved": 0, "mode": "sleep"},
+                                transition="sleeping",
+                            )
+                            with JOBS_LOCK:
+                                _export_parallel_lanes_snapshot(scheduler_mode_runtime, configured_lane_cap, len(sender_emails))
                             if not _sleep_checked(lane_sleep_s):
+                                _update_lane_runtime(
+                                    lane_id=lane_id,
+                                    sender_idx=sender_idx_lane,
+                                    sender_email=lane_sender_email,
+                                    provider_domain=lane_provider_domain,
+                                    lane_state="stopped",
+                                    status="failed",
+                                    transition="sleep_interrupted",
+                                    last_error="stop_requested_during_sleep",
+                                )
+                                with JOBS_LOCK:
+                                    job.log("WARN", f"lane transition lane={lane_id} status=failed state=stopped reason=sleep_interrupted")
+                                    _export_parallel_lanes_snapshot(scheduler_mode_runtime, configured_lane_cap, len(sender_emails))
                                 return {"sender_idx": sender_idx_lane, "sender_email": lane_sender_email, "chunks_done": lane_done, "stopped": True}
+                            _update_lane_runtime(
+                                lane_id=lane_id,
+                                sender_idx=sender_idx_lane,
+                                sender_email=lane_sender_email,
+                                provider_domain=lane_provider_domain,
+                                lane_state="processing",
+                                status="queued",
+                                transition="wakeup",
+                            )
+
+                for lane_provider_domain in lane_provider_domains:
+                    lane_id = f"{int(sender_idx_lane)}|{str(lane_provider_domain or '').strip().lower()}"
+                    lane_status_final = "failed" if lane_failed_chunks > 0 else "done"
+                    lane_state_final = "failed" if lane_failed_chunks > 0 else "completed"
+                    _update_lane_runtime(
+                        lane_id=lane_id,
+                        sender_idx=sender_idx_lane,
+                        sender_email=lane_sender_email,
+                        provider_domain=lane_provider_domain,
+                        lane_state=lane_state_final,
+                        status=lane_status_final,
+                        chunks_remaining=0,
+                        current_workers=0,
+                        workers_detail={"reserved": 0, "mode": "finished"},
+                        transition="lane_finished",
+                    )
+                    with JOBS_LOCK:
+                        job.log("INFO", f"lane transition lane={lane_id} status={lane_status_final} state={lane_state_final} processed={lane_done}")
+                        _export_parallel_lanes_snapshot(scheduler_mode_runtime, configured_lane_cap, len(sender_emails))
 
                 with JOBS_LOCK:
-                    job.log("INFO", f"lane finish sender={lane_sender_email} sender_idx={sender_idx_lane} chunks_done={lane_done}")
+                    job.log("INFO", f"lane finish sender={lane_sender_email} sender_idx={sender_idx_lane} chunks_done={lane_done} temp_fail_chunks={lane_temp_fail_chunks} hard_fail_chunks={lane_failed_chunks}")
+                    _export_parallel_lanes_snapshot(scheduler_mode_runtime, configured_lane_cap, len(sender_emails))
                 return {"sender_idx": sender_idx_lane, "sender_email": lane_sender_email, "chunks_done": lane_done, "stopped": False}
 
             if sender_lane_work:
                 with JOBS_LOCK:
                     job.log("INFO", f"v2 sender-driven parallel execution: lanes={len(sender_lane_work)} workers={lane_workers} configured_limit={configured_lane_cap}")
+                    _export_parallel_lanes_snapshot(scheduler_mode_runtime, configured_lane_cap, len(sender_emails))
                 futures: List[Future] = []
                 with ThreadPoolExecutor(max_workers=lane_workers) as sender_pool:
                     for lane_sender_idx, lane_domains in sorted(sender_lane_work.items(), key=lambda kv: kv[0]):
@@ -17149,6 +17514,7 @@ def smtp_send_job(
                         _ = fut.result()
 
             with JOBS_LOCK:
+                _export_parallel_lanes_snapshot(scheduler_mode_runtime, configured_lane_cap, len(sender_emails))
                 job.status = "done"
                 job.current_chunk = -1
                 if isinstance(job.debug_rollout, dict):
@@ -19134,6 +19500,7 @@ def build_scheduler_telemetry_snapshot(job: 'SendJob') -> dict:
     probe_status = getattr(job, "debug_probe_status", {}) or {}
     accounting_recon = getattr(job, "debug_lane_accounting", {}) or {}
     multi_parallel = getattr(job, "debug_multi_provider_parallel", {}) or {}
+    parallel_lanes_runtime = getattr(job, "debug_parallel_lanes_snapshot", {}) or {}
 
     lane_rows: List[dict] = []
     metrics_lanes = (lane_metrics.get("lanes") if isinstance(lane_metrics, dict) else {}) or {}
@@ -19202,6 +19569,24 @@ def build_scheduler_telemetry_snapshot(job: 'SendJob') -> dict:
     recent_completions = list((lane_executor.get("recent_completions") if isinstance(lane_executor, dict) else []) or [])[-max_events:]
     bounded_offsets = list(sorted(((wave_status.get("next_allowed_ts_by_sender") if isinstance(wave_status, dict) else {}) or {}).items(), key=lambda kv: kv[0]))[:max_lanes]
 
+    parallel_runtime_mode = str(parallel_lanes_runtime.get("mode") or (effective_plan.get("scheduler_mode") or "legacy")).strip().lower() or "legacy"
+    parallel_lanes_rows = list((parallel_lanes_runtime.get("lanes") if isinstance(parallel_lanes_runtime, dict) else []) or [])
+    parallel_lanes_rows = parallel_lanes_rows[:max_lanes]
+    parallel_counts = (parallel_lanes_runtime.get("lane_counts") if isinstance(parallel_lanes_runtime, dict) else {}) or {}
+    if not parallel_counts:
+        parallel_counts = {
+            "total": len(parallel_lanes_rows),
+            "running": sum(1 for x in parallel_lanes_rows if str((x or {}).get("status") or "").lower() == "running"),
+            "completed": sum(1 for x in parallel_lanes_rows if str((x or {}).get("status") or "").lower() == "done"),
+            "failed": sum(1 for x in parallel_lanes_rows if str((x or {}).get("status") or "").lower() == "failed"),
+            "sleeping": sum(1 for x in parallel_lanes_rows if str((x or {}).get("status") or "").lower() == "sleeping"),
+            "queued": sum(1 for x in parallel_lanes_rows if str((x or {}).get("status") or "").lower() == "queued"),
+            "backoff": sum(1 for x in parallel_lanes_rows if str((x or {}).get("status") or "").lower() == "backoff"),
+        }
+    active_parallel_lanes = int(parallel_lanes_runtime.get("active_parallel_lanes") or (int(parallel_counts.get("running") or 0) + int(parallel_counts.get("sleeping") or 0) + int(parallel_counts.get("backoff") or 0)))
+    sender_count_summary = int(parallel_lanes_runtime.get("sender_count") or multi_parallel.get("sender_count") or 0)
+    configured_max_lanes_summary = int(parallel_lanes_runtime.get("configured_max_lanes") or rollout.get("max_parallel_lanes") or 1)
+
     out = {
         "rollout": {
             "effective_mode": str(rollout.get("effective_mode") or rollout.get("selected_mode") or "legacy"),
@@ -19215,6 +19600,13 @@ def build_scheduler_telemetry_snapshot(job: 'SendJob') -> dict:
             "concurrency_enabled": bool(effective_plan.get("concurrency_enabled") or rollout.get("lane_concurrency_enabled") or False),
             "max_parallel_lanes": int(rollout.get("max_parallel_lanes") or 1),
             "effective_plan": dict(effective_plan or {}),
+            "execution_model": "parallel_sender_lanes" if str(effective_plan.get("scheduler_mode") or parallel_runtime_mode).strip().lower() == "v2" else "legacy_sequential",
+            "summary": {
+                "scheduler_mode": str(effective_plan.get("scheduler_mode") or parallel_runtime_mode or "legacy"),
+                "sender_count": sender_count_summary,
+                "active_parallel_lanes": active_parallel_lanes,
+                "configured_max_lanes": configured_max_lanes_summary,
+            },
         },
         "probe": {
             "active": bool(probe_status.get("probe_active") or probe_status.get("active") or False),
@@ -19267,6 +19659,24 @@ def build_scheduler_telemetry_snapshot(job: 'SendJob') -> dict:
             "fallback_to_sequential": bool(multi_parallel.get("fallback_to_sequential") or False),
             "active_inflight_lane_count": int(len(inflight_list)),
             "pending_retry_lanes_count": int(multi_parallel.get("pending_retry_lanes_count") or 0),
+        },
+        "parallel_lanes": {
+            "updated_at": str(parallel_lanes_runtime.get("updated_at") or ""),
+            "mode": parallel_runtime_mode,
+            "is_parallel": bool(str(parallel_runtime_mode or "legacy") == "v2"),
+            "sender_count": sender_count_summary,
+            "configured_max_lanes": configured_max_lanes_summary,
+            "active_parallel_lanes": active_parallel_lanes,
+            "lane_counts": {
+                "total": int(parallel_counts.get("total") or 0),
+                "running": int(parallel_counts.get("running") or 0),
+                "completed": int(parallel_counts.get("completed") or 0),
+                "failed": int(parallel_counts.get("failed") or 0),
+                "sleeping": int(parallel_counts.get("sleeping") or 0),
+                "queued": int(parallel_counts.get("queued") or 0),
+                "backoff": int(parallel_counts.get("backoff") or 0),
+            },
+            "lanes": parallel_lanes_rows,
         },
         "events": {
             "fallback_reasons": fallback_reasons,
