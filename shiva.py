@@ -2289,7 +2289,7 @@ def resolve_caps_for_attempt(
     lane_state_enforce = bool(get_env_bool("SHIVA_LANE_STATE_CAPS_ENFORCE", False))
     lane_only_v2 = bool(get_env_bool("SHIVA_LANE_STATE_CAPS_ONLY_IN_LANE_V2", True))
     scheduler_mode_runtime = str(rt.get("__scheduler_mode_runtime") or "legacy").strip().lower() or "legacy"
-    if lane_state_enforce and (not lane_only_v2 or scheduler_mode_runtime == "lane_v2") and lane_registry:
+    if lane_state_enforce and (not lane_only_v2 or scheduler_mode_runtime == "v2") and lane_registry:
         lane_info = lane_registry.get_lane_info(lane)
         lane_rec = dict(lane_info.get("recommended_caps") or {}) if isinstance(lane_info, dict) else {}
         if lane_rec:
@@ -2934,13 +2934,17 @@ class ModeOrchestrator:
         effective_mode = str(rd.get("effective_mode") or "legacy").strip().lower() or "legacy"
         force_legacy = bool(cfg.get("force_legacy"))
 
-        scheduler_mode = "legacy"
-        if not force_legacy and effective_mode in {"v2"}:
-            scheduler_mode = "lane_v2"
+        requested_scheduler_mode = str(cfg.get("requested_scheduler_mode") or "legacy").strip().lower() or "legacy"
 
+        scheduler_mode = "legacy"
+        if requested_scheduler_mode == "v2":
+            scheduler_mode = "v2"
+        elif not force_legacy and effective_mode in {"v2"}:
+            scheduler_mode = "v2"
+
+        # Decision layer is unified: v2 means parallel-first.
         concurrency_enabled = bool(
-            scheduler_mode == "lane_v2"
-            and bool(cfg.get("lane_concurrency_enabled"))
+            scheduler_mode == "v2"
             and not bool(cfg.get("force_disable_concurrency"))
         )
 
@@ -10263,11 +10267,11 @@ PAGE_CONFIG = r"""
         </label>`;
       } else if(key === 'SHIVA_SCHEDULER_MODE'){
         const mode = String(cur || '').trim().toLowerCase();
-        const picked = (mode === 'lane_v2' || mode === 'legacy') ? mode : 'legacy';
+        const picked = (mode === 'v2' || mode === 'lane_v2' || mode === 'legacy') ? (mode === 'lane_v2' ? 'v2' : mode) : 'legacy';
         inp = `<div class="mini" style="display:flex; flex-direction:column; gap:8px; margin:0">
           <label style="display:flex; gap:8px; align-items:center; margin:0">
-            <input name="${esc(id)}" data-k="${esc(key)}" data-type="scheduler_mode" type="radio" value="lane_v2" ${picked === 'lane_v2' ? 'checked' : ''} />
-            <span>line v2</span>
+            <input name="${esc(id)}" data-k="${esc(key)}" data-type="scheduler_mode" type="radio" value="v2" ${picked === 'v2' ? 'checked' : ''} />
+            <span>v2</span>
           </label>
           <label style="display:flex; gap:8px; align-items:center; margin:0">
             <input name="${esc(id)}" data-k="${esc(key)}" data-type="scheduler_mode" type="radio" value="legacy" ${picked === 'legacy' ? 'checked' : ''} />
@@ -15263,9 +15267,13 @@ def smtp_send_job(
     ai_subject_chain = [str(x).strip() for x in (subjects or []) if str(x).strip()] or ["(no subject)"]
     ai_body_chain = str(body or "")
 
-    scheduler_mode = (get_env("SHIVA_SCHEDULER_MODE", "legacy") or "legacy").strip().lower() or "legacy"
-    if scheduler_mode not in {"legacy", "lane_v2"}:
-        scheduler_mode = "legacy"
+    scheduler_mode_raw = (get_env("SHIVA_SCHEDULER_MODE", "legacy") or "legacy").strip().lower() or "legacy"
+    # Scheduler modes are intentionally binary:
+    # - legacy => sequential pipeline
+    # - v2     => parallel sender-driven pipeline
+    # Backward compatibility: accept old `lane_v2` and map it to `v2`.
+    scheduler_mode = "v2" if scheduler_mode_raw in {"v2", "lane_v2"} else "legacy"
+    effective_parallel = bool(scheduler_mode == "v2")
     rollout_mode = (get_env("SHIVA_ROLLOUT_MODE", "off") or "off").strip().lower() or "off"
     canary_percent = max(0, min(100, int(get_env_int("SHIVA_CANARY_PERCENT", 5))))
     canary_seed_mode = (get_env("SHIVA_CANARY_SEED_MODE", "job_id") or "job_id").strip().lower() or "job_id"
@@ -15363,9 +15371,10 @@ def smtp_send_job(
     lane_v2_use_budgets = bool(get_env_bool("SHIVA_LANE_V2_USE_BUDGETS", True))
     lane_v2_use_soft_bias = bool(get_env_bool("SHIVA_LANE_V2_USE_SOFT_BIAS", True))
     lane_v2_max_scan = max(1, int(get_env_int("SHIVA_LANE_V2_MAX_SCAN", 50)))
-    lane_concurrency_enabled = bool(get_env_bool("SHIVA_LANE_CONCURRENCY", False))
-    multi_provider_parallel_senders_flag = bool(get_env_bool("SHIVA_MULTI_PROVIDER_PARALLEL_SENDERS", False))
+    lane_concurrency_flag_legacy = bool(get_env_bool("SHIVA_LANE_CONCURRENCY", False))
+    multi_provider_parallel_senders_flag_legacy = bool(get_env_bool("SHIVA_MULTI_PROVIDER_PARALLEL_SENDERS", False))
     multi_provider_parallel_allow_single_provider = bool(get_env_bool("SHIVA_MULTI_PROVIDER_PARALLEL_ALLOW_SINGLE_PROVIDER", False))
+    lane_concurrency_enabled = bool(effective_parallel)
     lane_max_parallel = max(1, int(get_env_int("SHIVA_MAX_PARALLEL_LANES", 5)))
     lane_task_timeout_s = max(30, int(get_env_int("SHIVA_LANE_TASK_TIMEOUT_S", 900)))
     lane_concurrency_debug = bool(get_env_bool("SHIVA_LANE_CONCURRENCY_DEBUG", False))
@@ -15538,7 +15547,7 @@ def smtp_send_job(
             job.log("WARN", "SHIVA_PROVIDER_SUFFIX_JSON ignored: expected JSON object with suffix->group pairs")
 
     runtime_sender_max_inflight = int(max(1, budget_sender_max_inflight))
-    if multi_provider_parallel_senders_flag:
+    if effective_parallel:
         runtime_sender_max_inflight = max(runtime_sender_max_inflight, max(1, len(sender_emails)))
 
     budget_config = BudgetConfig(
@@ -16301,6 +16310,7 @@ def smtp_send_job(
             job,
             {
                 "force_legacy": force_legacy,
+                "requested_scheduler_mode": scheduler_mode,
                 "force_disable_concurrency": force_disable_concurrency,
                 "lane_concurrency_enabled": lane_concurrency_enabled,
                 "probe_mode_enabled": probe_mode_enabled,
@@ -16417,7 +16427,7 @@ def smtp_send_job(
             max_scan=lane_v2_max_scan,
             lane_weight_multiplier=_lane_weight_multiplier,
             debug_log=lambda msg: job.log("INFO", msg),
-        ) if (lane_v2_rollout_enabled or shadow_mode_active or scheduler_mode == "lane_v2") else None
+        ) if (lane_v2_rollout_enabled or shadow_mode_active or scheduler_mode == "v2") else None
         shadow_recorder = ShadowRecorder(shadow_max_events) if shadow_mode_active else None
         lane_parallel_limit_runtime = min(int(lane_max_parallel), int(max_total_lanes)) if resource_governor_enabled else int(lane_max_parallel)
         resource_governor = GlobalResourceGovernor(
@@ -16429,9 +16439,9 @@ def smtp_send_job(
                 "level3_factor": float(governor_pmta_level3_factor),
             },
         ) if resource_governor_enabled else None
-        if lane_concurrency_enabled and not lane_v2_rollout_enabled:
+        if lane_concurrency_flag_legacy and not effective_parallel:
             with JOBS_LOCK:
-                job.log("INFO", "Lane concurrency disabled for this job (rollout not in v2 mode).")
+                job.log("INFO", "SHIVA_LANE_CONCURRENCY is legacy-compatible only; effective_parallel is controlled by SHIVA_SCHEDULER_MODE.")
         policy_pack_caps_clamps: Dict[str, dict] = {}
         policy_pack_snapshot: dict = {}
         selected_pack: dict = {}
@@ -16518,48 +16528,26 @@ def smtp_send_job(
             if str(d or "").strip() and int(cnt or 0) > 0
         ]
         provider_domain_count = len(set(probe_provider_domains))
-        sender_parallel_hard_mode = bool(multi_provider_parallel_senders_flag)
-        multi_provider_parallel_runtime = _should_enable_multi_provider_parallel(
-            flag_enabled=multi_provider_parallel_senders_flag,
-            sender_count=len(sender_emails),
-            provider_domain_count=provider_domain_count,
-            lane_parallel_limit=lane_parallel_limit_runtime,
-            allow_single_provider=multi_provider_parallel_allow_single_provider,
-            force_disable_concurrency=force_disable_concurrency,
-            fallback_disable_concurrency=False,
-            sender_parallel_hard_mode=sender_parallel_hard_mode,
-        )
-        if bool(sender_parallel_hard_mode):
-            lane_concurrency_runtime = True
-            lane_parallel_limit_runtime = max(1, int(len(sender_emails) or 1))
-            multi_provider_parallel_runtime["allow_single_provider"] = True
-            multi_provider_parallel_runtime["effective_parallel_lanes"] = int(lane_parallel_limit_runtime)
-            multi_provider_parallel_runtime["bypassed_features"] = [
-                "single_provider_restriction",
-                "provider_domain_count_gate",
-                "probe_mode",
-                "single_domain_waves",
-                "budget_manager_enforcement",
-                "fallback_disable_concurrency",
-            ]
-            probe_mode_enabled = False
-            single_domain_waves_enabled = False
-            budget_mgr = None
-            fallback_controller_runtime = False
-        if multi_provider_parallel_runtime.get("enabled"):
+        sender_parallel_hard_mode = bool(effective_parallel)
+        multi_provider_parallel_runtime = {
+            "enabled": bool(effective_parallel),
+            "reason": "scheduler_mode_v2" if effective_parallel else "scheduler_mode_legacy",
+            "sender_count": int(len(sender_emails) or 0),
+            "provider_domain_count": int(provider_domain_count),
+            "target_lane_count": int(max(provider_domain_count, len(sender_emails), 1)),
+            "allow_single_provider": True,
+            "effective_parallel_lanes": int(max(1, min(lane_parallel_limit_runtime, max(1, len(sender_emails)))) if effective_parallel else 1),
+            "fallback_to_sequential": not bool(effective_parallel),
+            "legacy_flags": {
+                "SHIVA_MULTI_PROVIDER_PARALLEL_SENDERS": bool(multi_provider_parallel_senders_flag_legacy),
+                "SHIVA_MULTI_PROVIDER_PARALLEL_ALLOW_SINGLE_PROVIDER": bool(multi_provider_parallel_allow_single_provider),
+            },
+        }
+        if effective_parallel:
             lane_concurrency_runtime = True
             lane_parallel_limit_runtime = int(multi_provider_parallel_runtime.get("effective_parallel_lanes") or 1)
         with JOBS_LOCK:
             job.debug_multi_provider_parallel = dict(multi_provider_parallel_runtime)
-            if bool(multi_provider_parallel_runtime.get("enabled")):
-                job.log(
-                    "INFO",
-                    f"Multi-provider parallel senders enabled: senders={int(multi_provider_parallel_runtime.get('sender_count') or 0)} "
-                    f"providers={int(multi_provider_parallel_runtime.get('provider_domain_count') or 0)} "
-                    f"effective_parallel_lanes={int(multi_provider_parallel_runtime.get('effective_parallel_lanes') or 1)}",
-                )
-            else:
-                job.log("INFO", f"Multi-provider parallel senders disabled: {str(multi_provider_parallel_runtime.get('reason') or 'unknown')}")
         single_provider_domain = str(probe_provider_domains[0] or "").strip().lower() if provider_domain_count == 1 else ""
         wave_mode_active = bool(single_domain_waves_enabled)
         if single_domain_only_if_providers_eq:
@@ -16742,8 +16730,16 @@ def smtp_send_job(
             return out
 
         with JOBS_LOCK:
+            job.log(
+                "INFO",
+                "Scheduler startup: "
+                f"scheduler_mode={scheduler_mode_runtime} "
+                f"effective_parallel={int(effective_parallel)} "
+                f"max_parallel_lanes={int(lane_parallel_limit_runtime)} "
+                f"sender_count={int(len(sender_emails) or 0)}",
+            )
             if scheduler_mode_runtime != "legacy":
-                job.log("INFO", f"Scheduler mode={scheduler_mode_runtime} (rollout effective_mode={rollout_effective_mode}; sending pipeline remains legacy/sequential).")
+                job.log("INFO", f"Scheduler mode={scheduler_mode_runtime} (legacy=sequential pipeline, v2=parallel sender-driven pipeline)")
             job.log(
                 "INFO",
                 "Recipient partition stats: "
@@ -17203,7 +17199,7 @@ def smtp_send_job(
                     "meta": dict(shadow_meta or {}),
                 })
             if not sender_domain_pick:
-                if scheduler_mode_runtime == "lane_v2" and lane_picker_v2:
+                if scheduler_mode_runtime == "v2" and lane_picker_v2:
                     sender_domain_pick, lane_pick_meta = lane_picker_v2.pick_next(
                         now_ts=now_ts,
                         sender_cursor=sender_cursor,
@@ -17232,7 +17228,7 @@ def smtp_send_job(
                 continue
 
             sender_idx_fixed, target_domain = sender_domain_pick
-            if scheduler_mode_runtime == "lane_v2" and len(sender_emails) > 0:
+            if scheduler_mode_runtime == "v2" and len(sender_emails) > 0:
                 sender_cursor = (int(sender_idx_fixed) + 1) % len(sender_emails)
             elif probe_selected_this_iteration and len(sender_emails) > 0:
                 sender_cursor = (int(sender_idx_fixed) + 1) % len(sender_emails)
@@ -18155,7 +18151,7 @@ APP_CONFIG_SCHEMA: List[dict] = [
 
     # Scheduler lane scaffolding (baseline/debug only in this phase)
     {"key": "SHIVA_SCHEDULER_MODE", "type": "str", "default": "legacy", "group": "Scheduler", "restart_required": False,
-     "desc": "Scheduler mode: legacy | lane_v2. legacy remains default."},
+     "desc": "Scheduler mode: legacy | v2. legacy = sequential pipeline, v2 = parallel sender-driven pipeline."},
     {"key": "SHIVA_LANE_V2_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Emit concise LanePickerV2 pick logs (type/lane and skip reasons)."},
     {"key": "SHIVA_LANE_V2_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
@@ -18169,9 +18165,9 @@ APP_CONFIG_SCHEMA: List[dict] = [
     {"key": "SHIVA_LANE_V2_MAX_SCAN", "type": "int", "default": "50", "group": "Scheduler", "restart_required": False,
      "desc": "Maximum domains scanned per sender during LanePickerV2 weighted candidate build."},
     {"key": "SHIVA_LANE_CONCURRENCY", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
-     "desc": "Enable concurrent lane executor for inter-lane chunk scheduling (requires lane_v2 mode)."},
+     "desc": "Legacy compatibility flag. Effective lane concurrency is now controlled by SHIVA_SCHEDULER_MODE=v2."},
     {"key": "SHIVA_MULTI_PROVIDER_PARALLEL_SENDERS", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
-     "desc": "Enable sender-parallel inter-lane execution only when multiple recipient domains/providers are present."},
+     "desc": "Legacy compatibility flag. Sender-parallel mode is now integrated when SHIVA_SCHEDULER_MODE=v2."},
     {"key": "SHIVA_MULTI_PROVIDER_PARALLEL_ALLOW_SINGLE_PROVIDER", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "If enabled with SHIVA_MULTI_PROVIDER_PARALLEL_SENDERS=1, allow sender-parallel lanes even when recipients are from a single provider/domain."},
     {"key": "SHIVA_MAX_PARALLEL_LANES", "type": "int", "default": "5", "group": "Scheduler", "restart_required": False,
@@ -18311,7 +18307,7 @@ APP_CONFIG_SCHEMA: List[dict] = [
     {"key": "SHIVA_LANE_STATE_CAPS_ENFORCE", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "If enabled, enforce LaneRegistry recommended caps as clamp-only limits per lane attempt."},
     {"key": "SHIVA_LANE_STATE_CAPS_ONLY_IN_LANE_V2", "type": "bool", "default": "1", "group": "Scheduler", "restart_required": False,
-     "desc": "When lane-state cap enforcement is enabled, apply only while effective scheduler mode is lane_v2."},
+     "desc": "When lane-state cap enforcement is enabled, apply only while effective scheduler mode is v2."},
     {"key": "SHIVA_CAPS_MIN_CHUNK", "type": "int", "default": "50", "group": "Scheduler", "restart_required": False,
      "desc": "Global minimum chunk size bound for resolved caps."},
     {"key": "SHIVA_CAPS_MAX_CHUNK", "type": "int", "default": "2000", "group": "Scheduler", "restart_required": False,
@@ -18417,15 +18413,15 @@ APP_CONFIG_SCHEMA: List[dict] = [
     {"key": "SHIVA_ROLLOUT_MODE", "type": "str", "default": "off", "group": "Scheduler", "restart_required": False,
      "desc": "Rollout mode: off | shadow | canary | on."},
     {"key": "SHIVA_CANARY_PERCENT", "type": "int", "default": "5", "group": "Scheduler", "restart_required": False,
-     "desc": "Canary percentage of jobs eligible for lane_v2 when rollout mode is canary."},
+     "desc": "Canary percentage of jobs eligible for v2 when rollout mode is canary."},
     {"key": "SHIVA_CANARY_SEED_MODE", "type": "str", "default": "job_id", "group": "Scheduler", "restart_required": False,
      "desc": "Deterministic canary seed mode: job_id | campaign_id."},
     {"key": "SHIVA_CANARY_ALLOWLIST_CAMPAIGNS", "type": "str", "default": "", "group": "Scheduler", "restart_required": False,
-     "desc": "Comma-separated campaign IDs forced into canary lane_v2."},
+     "desc": "Comma-separated campaign IDs forced into canary v2."},
     {"key": "SHIVA_CANARY_DENYLIST_CAMPAIGNS", "type": "str", "default": "", "group": "Scheduler", "restart_required": False,
      "desc": "Comma-separated campaign IDs forced to legacy during canary."},
     {"key": "SHIVA_CANARY_ALLOWLIST_SENDERS", "type": "str", "default": "", "group": "Scheduler", "restart_required": False,
-     "desc": "Comma-separated sender emails/domains forced into canary lane_v2."},
+     "desc": "Comma-separated sender emails/domains forced into canary v2."},
     {"key": "SHIVA_CANARY_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Enable extra rollout/canary debug metadata in job payloads."},
     {"key": "SHIVA_SHADOW_EXPORT", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
@@ -19040,7 +19036,7 @@ def build_scheduler_telemetry_snapshot(job: 'SendJob') -> dict:
             "force_disable_concurrency": bool(rollout.get("force_disable_concurrency") or False),
         },
         "scheduler": {
-            "mode": str(effective_plan.get("scheduler_mode") or ("lane_v2" if bool(rollout.get("lane_v2_enabled") or rollout.get("effective_mode") in {"on", "canary", "shadow"}) else "legacy")),
+            "mode": str(effective_plan.get("scheduler_mode") or ("v2" if bool(rollout.get("lane_v2_enabled") or rollout.get("effective_mode") in {"on", "canary", "shadow"}) else "legacy")),
             "concurrency_enabled": bool(effective_plan.get("concurrency_enabled") or rollout.get("lane_concurrency_enabled") or False),
             "max_parallel_lanes": int(rollout.get("max_parallel_lanes") or 1),
             "effective_plan": dict(effective_plan or {}),
