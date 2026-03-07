@@ -20233,6 +20233,115 @@ def build_scheduler_telemetry_snapshot(job: 'SendJob') -> dict:
     return out
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _normalize_chunk_row_for_api(row: Any, *, fallback_lane_id: str = "", fallback_chunk_id: int = -1) -> dict:
+    src = dict(row or {}) if isinstance(row, dict) else {}
+    chunk_id = _safe_int(src.get("chunk_id", src.get("chunk", fallback_chunk_id)), fallback_chunk_id)
+    lane_id = str(src.get("lane_id") or src.get("lane") or fallback_lane_id or "")
+    sender_mail = str(src.get("sender_mail") or src.get("sender") or "")
+    target_domain = str(src.get("target_domain") or src.get("receiver_domain") or "").strip().lower()
+    status = str(src.get("status") or "running").strip().lower() or "running"
+    next_retry_ts = _safe_int(src.get("next_retry_ts"), 0)
+    if status == "backoff" and next_retry_ts < 0:
+        next_retry_ts = 0
+    normalized = {
+        **src,
+        "chunk": chunk_id,
+        "chunk_id": chunk_id,
+        "lane_id": lane_id,
+        "status": status,
+        "size": max(0, _safe_int(src.get("size"), 0)),
+        "sender_mail": sender_mail,
+        "target_domain": target_domain,
+        "receiver_domain": target_domain,
+        "spam_score": _safe_float(src.get("spam_score")),
+        "blacklist": str(src.get("blacklist") or ""),
+        "attempt": max(0, _safe_int(src.get("attempt"), 0)),
+        "next_retry_ts": max(0, next_retry_ts),
+    }
+    return normalized
+
+
+def _chunk_telemetry_payload(job: 'SendJob') -> dict:
+    runtime = getattr(job, "debug_parallel_lanes_snapshot", {}) or {}
+    mode = str(runtime.get("mode") or "").strip().lower()
+    is_v2 = mode == "v2"
+
+    active_rows = [
+        _normalize_chunk_row_for_api(row)
+        for row in (list(getattr(job, "active_chunks_info", []) or []))
+    ]
+    current_row = _normalize_chunk_row_for_api(
+        getattr(job, "current_chunk_info", {}) or {},
+        fallback_chunk_id=_safe_int(getattr(job, "current_chunk", -1), -1),
+    )
+    chunk_states = [
+        _normalize_chunk_row_for_api(row)
+        for row in ((getattr(job, "chunk_states", []) or [])[-120:])
+    ]
+    backoff_items = [
+        _normalize_chunk_row_for_api(row)
+        for row in ((getattr(job, "backoff_items", []) or [])[-120:])
+    ]
+
+    unique_seen = set()
+    unique_done = set()
+    for row in chunk_states:
+        unique_key = (int(row.get("chunk_id") or -1), str(row.get("target_domain") or ""))
+        if unique_key[0] >= 0:
+            unique_seen.add(unique_key)
+            if str(row.get("status") or "") in {"done", "done_after_backoff", "abandoned"}:
+                unique_done.add(unique_key)
+    for row in active_rows:
+        unique_key = (int(row.get("chunk_id") or -1), str(row.get("target_domain") or ""))
+        if unique_key[0] >= 0:
+            unique_seen.add(unique_key)
+    if int(current_row.get("chunk_id") or -1) >= 0:
+        unique_seen.add((int(current_row.get("chunk_id") or -1), str(current_row.get("target_domain") or "")))
+
+    unique_done_count = max(_safe_int(getattr(job, "chunks_done", 0), 0), len(unique_done))
+    unique_total_count = max(_safe_int(getattr(job, "chunks_total", 0), 0), unique_done_count, len(unique_seen))
+    attempts_total = max(unique_done_count + max(0, _safe_int(getattr(job, "chunks_backoff", 0), 0)), unique_done_count)
+
+    out = {
+        "chunks_total": max(0, _safe_int(getattr(job, "chunks_total", 0), 0)),
+        "chunks_done": max(0, _safe_int(getattr(job, "chunks_done", 0), 0)),
+        "chunks_backoff": max(0, _safe_int(getattr(job, "chunks_backoff", 0), 0)),
+        "chunks_abandoned": max(0, _safe_int(getattr(job, "chunks_abandoned", 0), 0)),
+        "current_chunk": _safe_int(getattr(job, "current_chunk", -1), -1),
+        "current_chunk_info": current_row,
+        "active_chunks_info": active_rows,
+        "chunk_states": chunk_states,
+        "backoff_items": backoff_items,
+        "debug_parallel_lanes_snapshot": runtime,
+    }
+    if is_v2:
+        out.update(
+            {
+                "chunk_unique_total": unique_total_count,
+                "chunk_unique_done": unique_done_count,
+                "chunk_attempts_total": attempts_total,
+                "telemetry_source": "v2",
+            }
+        )
+    return out
+
+
 @app.get("/api/job/<job_id>")
 def job_api(job_id: str):
     try:
@@ -20268,6 +20377,8 @@ def job_api(job_id: str):
         provider_reason_buckets = dict(job.accounting_error_counts or {})
         internal_samples = list(bridge_state.get("internal_error_samples") or [])[-10:]
         integrity_samples = list(bridge_state.get("integrity_samples") or [])[-10:]
+
+        chunk_payload = _chunk_telemetry_payload(job)
 
         return jsonify(
             {
@@ -20310,23 +20421,28 @@ def job_api(job_id: str):
                 "safe_list_total": job.safe_list_total,
                 "safe_list_invalid": job.safe_list_invalid,
                 "last_error": job.last_error,
-                "chunks_total": job.chunks_total,
-                "chunks_done": job.chunks_done,
-                "chunks_backoff": job.chunks_backoff,
-                "chunks_abandoned": job.chunks_abandoned,
+                "chunks_total": chunk_payload["chunks_total"],
+                "chunks_done": chunk_payload["chunks_done"],
+                "chunks_backoff": chunk_payload["chunks_backoff"],
+                "chunks_abandoned": chunk_payload["chunks_abandoned"],
                 "paused": job.paused,
                 "stop_requested": job.stop_requested,
                 "stop_reason": job.stop_reason,
                 "resumable": _job_can_resume(job),
                 "speed_epm": job.speed_epm(),
                 "eta_s": job.eta_seconds(),
-                "current_chunk_info": job.current_chunk_info,
-                "active_chunks_info": list(job.active_chunks_info or []),
+                "current_chunk_info": chunk_payload["current_chunk_info"],
+                "active_chunks_info": chunk_payload["active_chunks_info"],
                 "current_chunk_domains": job.current_chunk_domains,
                 "error_counts": job.error_counts,
-                "current_chunk": job.current_chunk,
-                "chunk_states": job.chunk_states[-120:],
-                "backoff_items": job.backoff_items[-120:],
+                "current_chunk": chunk_payload["current_chunk"],
+                "chunk_states": chunk_payload["chunk_states"],
+                "backoff_items": chunk_payload["backoff_items"],
+                "chunk_unique_total": chunk_payload.get("chunk_unique_total"),
+                "chunk_unique_done": chunk_payload.get("chunk_unique_done"),
+                "chunk_attempts_total": chunk_payload.get("chunk_attempts_total"),
+                "telemetry_source": chunk_payload.get("telemetry_source"),
+                "debug_parallel_lanes_snapshot": chunk_payload["debug_parallel_lanes_snapshot"],
                 "debug_backoff_jitter": (job.debug_backoff_jitter or [])[-50:],
                 "domain_plan": job.domain_plan,
                 "domain_sent": job.domain_sent,
