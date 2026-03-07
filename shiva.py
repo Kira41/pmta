@@ -4506,6 +4506,49 @@ def db_get_job_outcome_counts(job_id: str) -> Dict[str, int]:
     }
 
 
+def db_get_job_recipients_for_export(job_id: str, bucket: str) -> List[str]:
+    """Return recipient emails for export buckets in Jobs UI."""
+    jid = (job_id or "").strip().lower()
+    b = str(bucket or "").strip().lower()
+    if not jid:
+        return []
+
+    queries: Dict[str, Tuple[str, Tuple[Any, ...]]] = {
+        "delivered": (
+            "SELECT rcpt FROM job_outcomes WHERE job_id=? AND status='delivered' ORDER BY rcpt ASC",
+            (jid,),
+        ),
+        "pending": (
+            "SELECT rcpt FROM job_recipients WHERE job_id=? "
+            "AND delivery_status IN ('not_yet','not_sent','not_sending') "
+            "AND chunk_idx < 0 ORDER BY rcpt ASC",
+            (jid,),
+        ),
+        "failed": (
+            "SELECT rcpt FROM job_outcomes WHERE job_id=? AND status IN ('bounced','deferred','complained') ORDER BY rcpt ASC",
+            (jid,),
+        ),
+    }
+    if b not in queries:
+        return []
+
+    sql, params = queries[b]
+    with DB_LOCK:
+        conn = _db_conn()
+        try:
+            rows = conn.execute(sql, params).fetchall()
+            out: List[str] = []
+            for row in rows or []:
+                rcpt = str((row[0] if row else "") or "").strip().lower()
+                if rcpt:
+                    out.append(rcpt)
+            return out
+        except Exception:
+            return []
+        finally:
+            conn.close()
+
+
 def _sync_job_outcome_counters_from_db(job: 'SendJob') -> None:
     """Refresh in-memory outcome counters from SQLite for consistency after restarts."""
     if not job or not job.id:
@@ -10612,6 +10655,11 @@ PAGE_JOB = r"""
 
     <div class="card">
       <h3 style="margin:0 0 10px" class="titleTip">Recent Results <span class="tip" data-tip="Browse job results in pages. Use Prev/Next to navigate the latest processed recipients.">ⓘ</span></h3>
+      <div class="row" style="margin-bottom:8px; align-items:center; gap:8px; flex-wrap:wrap">
+        <button class="navBtn" id="downloadDeliveredBtn" type="button" title="Download recipients that reached delivered status">📥 Delivered CSV</button>
+        <button class="navBtn" id="downloadPendingBtn" type="button" title="Download recipients still pending and not assigned to any chunk yet">⏳ Queue CSV</button>
+        <button class="navBtn" id="downloadFailedBtn" type="button" title="Download recipients that ended in bounce/deferred/complained outcomes">🚫 Failed CSV</button>
+      </div>
       <div class="row" style="margin-bottom:8px; align-items:center; gap:8px">
         <button class="navBtn" id="resultsPrevBtn" type="button">← Prev</button>
         <button class="navBtn" id="resultsNextBtn" type="button">Next →</button>
@@ -10723,6 +10771,13 @@ PAGE_JOB = r"""
       const lastExec = completions.slice(-5).map(x => `${x.lane}:${x.status}`).join(' | ') || 'none';
       ev.textContent = `Fallback reasons: ${fReasons} · Executor recent: ${lastExec}`;
     }
+  }
+
+  function triggerResultsExport(kind){
+    const safeKind = (kind || '').toString().trim().toLowerCase();
+    if(!safeKind) return;
+    const url = `/api/job/${encodeURIComponent(jobId)}/recent-results/export?kind=${encodeURIComponent(safeKind)}`;
+    window.location.href = url;
   }
 
   function renderResultsPager(){
@@ -10840,6 +10895,21 @@ PAGE_JOB = r"""
       clearInterval(window._t);
       window._t = setInterval(tick, 3500);
     }
+  }
+
+  const downloadDeliveredBtn = document.getElementById('downloadDeliveredBtn');
+  if(downloadDeliveredBtn){
+    downloadDeliveredBtn.addEventListener('click', () => triggerResultsExport('delivered'));
+  }
+
+  const downloadPendingBtn = document.getElementById('downloadPendingBtn');
+  if(downloadPendingBtn){
+    downloadPendingBtn.addEventListener('click', () => triggerResultsExport('pending'));
+  }
+
+  const downloadFailedBtn = document.getElementById('downloadFailedBtn');
+  if(downloadFailedBtn){
+    downloadFailedBtn.addEventListener('click', () => triggerResultsExport('failed'));
   }
 
   const prevBtn = document.getElementById('resultsPrevBtn');
@@ -18770,6 +18840,40 @@ def _resume_job_thread(job: 'SendJob') -> bool:
     t = threading.Thread(target=smtp_send_job_thread_entry, daemon=True, args=args)
     t.start()
     return True
+
+
+@app.get("/api/job/<job_id>/recent-results/export")
+def api_job_recent_results_export(job_id: str):
+    jid = (job_id or "").strip().lower()
+    if not jid:
+        return jsonify({"ok": False, "error": "missing job id"}), 400
+
+    kind = str(request.args.get("kind") or "").strip().lower()
+    labels = {
+        "delivered": "delivered",
+        "pending": "pending_queue",
+        "failed": "failed_outcomes",
+    }
+    if kind not in labels:
+        return jsonify({"ok": False, "error": "invalid export kind"}), 400
+
+    with JOBS_LOCK:
+        job = JOBS.get(jid)
+        if (not job) or getattr(job, "deleted", False):
+            return jsonify({"ok": False, "error": "not found"}), 404
+
+    recipients = db_get_job_recipients_for_export(jid, kind)
+
+    lines = ["email"]
+    lines.extend(recipients)
+    csv_text = "\n".join(lines) + "\n"
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"job_{jid}_{labels[kind]}_{stamp}.csv"
+    resp = make_response(csv_text)
+    resp.headers["Content-Type"] = "text/csv; charset=utf-8"
+    resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return resp
 
 
 @app.post("/api/job/<job_id>/control")
