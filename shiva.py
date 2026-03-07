@@ -3484,6 +3484,191 @@ class SendJob:
                 )
             ]
         self.maybe_persist()
+    def _chunk_identity_v2(self, *, lane_id: str, chunk_id: int, sender_idx: int, sender_mail: str, target_domain: str, attempt: int) -> dict:
+        return {
+            "lane_id": str(lane_id or ""),
+            "chunk_id": int(chunk_id or 0),
+            "sender_idx": int(sender_idx or 0),
+            "sender_mail": str(sender_mail or ""),
+            "target_domain": str(target_domain or "").strip().lower(),
+            "attempt": int(attempt or 0),
+        }
+    def begin_chunk_telemetry_v2(self, *, lane_id: str, chunk_id: int, sender_idx: int, sender_mail: str, target_domain: str, attempt: int, size: int, chunk_size: int, workers: int, delay_s: float, sleep_chunks: float, body_format: str, reply_to: str, domains: Optional[Dict[str, int]] = None):
+        self.updated_at = now_iso()
+        ident = self._chunk_identity_v2(
+            lane_id=lane_id,
+            chunk_id=chunk_id,
+            sender_idx=sender_idx,
+            sender_mail=sender_mail,
+            target_domain=target_domain,
+            attempt=attempt,
+        )
+        self.current_chunk = int(chunk_id)
+        self.current_chunk_domains = dict(domains or {})
+        self.current_chunk_info = {
+            "chunk": int(chunk_id),
+            "size": int(size or 0),
+            "chunk_size": int(chunk_size or 0),
+            "workers": int(workers or 0),
+            "delay_s": float(delay_s or 0.0),
+            "sleep_chunks": float(sleep_chunks or 0.0),
+            "status": "running",
+            "sender": str(sender_mail or ""),
+            "subject": "",
+            "body_variant": "",
+            "body_format": str(body_format or ""),
+            "reply_to": str(reply_to or ""),
+            "reason": "",
+            "next_retry_ts": 0,
+            "spam_score": None,
+            "blacklist": "",
+            "pmta_reason": "",
+            **ident,
+        }
+        self.upsert_active_chunk(str(lane_id or ""), {
+            "chunk": int(chunk_id),
+            "receiver_domain": str(target_domain or "").strip().lower(),
+            "size": int(size or 0),
+            "status": "running",
+            "next_retry_ts": 0,
+            "reason": "",
+            "spam_score": None,
+            "blacklist": "",
+            "pmta_reason": "",
+            **ident,
+        })
+    def update_chunk_preflight_v2(self, *, lane_id: str, chunk_id: int, sender_idx: int, sender_mail: str, target_domain: str, attempt: int, subject: str, body_variant: int, spam_score: Optional[float], blacklist: str, pmta_reason: str = "", reason: str = ""):
+        self.updated_at = now_iso()
+        ident = self._chunk_identity_v2(
+            lane_id=lane_id,
+            chunk_id=chunk_id,
+            sender_idx=sender_idx,
+            sender_mail=sender_mail,
+            target_domain=target_domain,
+            attempt=attempt,
+        )
+        self.current_chunk = int(chunk_id)
+        self.current_chunk_info.update({
+            "chunk": int(chunk_id),
+            "status": "running",
+            "sender": str(sender_mail or ""),
+            "subject": str(subject or ""),
+            "body_variant": int(body_variant or 0),
+            "spam_score": (float(spam_score) if spam_score is not None else None),
+            "blacklist": str(blacklist or ""),
+            "pmta_reason": str(pmta_reason or ""),
+            "reason": str(reason or ""),
+            **ident,
+        })
+        self.upsert_active_chunk(str(lane_id or ""), {
+            "chunk": int(chunk_id),
+            "receiver_domain": str(target_domain or "").strip().lower(),
+            "status": "running",
+            "reason": str(reason or ""),
+            "spam_score": (float(spam_score) if spam_score is not None else None),
+            "blacklist": str(blacklist or ""),
+            "pmta_reason": str(pmta_reason or ""),
+            **ident,
+        })
+    def mark_chunk_done_v2(self, *, lane_id: str, chunk_id: int, sender_idx: int, sender_mail: str, target_domain: str, attempt: int, size: int, subject: str, spam_score: Optional[float], blacklist: str):
+        self.updated_at = now_iso()
+        ident = self._chunk_identity_v2(
+            lane_id=lane_id,
+            chunk_id=chunk_id,
+            sender_idx=sender_idx,
+            sender_mail=sender_mail,
+            target_domain=target_domain,
+            attempt=attempt,
+        )
+        self.chunks_done += 1
+        self.remove_active_chunk(lane_id, chunk_id)
+        self.push_chunk_state({
+            "chunk": int(chunk_id),
+            "status": "done",
+            "size": int(size or 0),
+            "sender": str(sender_mail or ""),
+            "subject": str(subject or ""),
+            "spam_score": (float(spam_score) if spam_score is not None else None),
+            "blacklist": str(blacklist or ""),
+            "next_retry_ts": 0,
+            "reason": "",
+            **ident,
+        })
+        if int(self.current_chunk or -1) == int(chunk_id):
+            self.current_chunk = -1
+            self.current_chunk_info = {}
+            self.current_chunk_domains = {}
+    def mark_chunk_backoff_v2(self, *, lane_id: str, chunk_id: int, sender_idx: int, sender_mail: str, target_domain: str, attempt: int, size: int, reason: str, next_retry_ts: int, spam_score: Optional[float], blacklist: str, pmta_reason: str = ""):
+        self.updated_at = now_iso()
+        ident = self._chunk_identity_v2(
+            lane_id=lane_id,
+            chunk_id=chunk_id,
+            sender_idx=sender_idx,
+            sender_mail=sender_mail,
+            target_domain=target_domain,
+            attempt=attempt,
+        )
+        self.chunks_backoff += 1
+        backoff_entry = {
+            "chunk": int(chunk_id),
+            "size": int(size or 0),
+            "next_retry_ts": int(next_retry_ts or 0),
+            "reason": str(reason or ""),
+            "sender": str(sender_mail or ""),
+            "pmta_reason": str(pmta_reason or ""),
+            **ident,
+        }
+        self.push_backoff(backoff_entry)
+        self.push_chunk_state({**backoff_entry, "status": "backoff"})
+        self.upsert_active_chunk(str(lane_id or ""), {
+            "chunk": int(chunk_id),
+            "receiver_domain": str(target_domain or "").strip().lower(),
+            "size": int(size or 0),
+            "status": "backoff",
+            "next_retry_ts": int(next_retry_ts or 0),
+            "reason": str(reason or ""),
+            "spam_score": (float(spam_score) if spam_score is not None else None),
+            "blacklist": str(blacklist or ""),
+            "pmta_reason": str(pmta_reason or ""),
+            **ident,
+        })
+        self.current_chunk_info.update({
+            "status": "backoff",
+            "next_retry_ts": int(next_retry_ts or 0),
+            "reason": str(reason or ""),
+            "pmta_reason": str(pmta_reason or ""),
+            **ident,
+        })
+    def mark_chunk_abandoned_v2(self, *, lane_id: str, chunk_id: int, sender_idx: int, sender_mail: str, target_domain: str, attempt: int, size: int, reason: str, subject: str, spam_score: Optional[float], blacklist: str, next_retry_ts: int = 0, pmta_reason: str = ""):
+        self.updated_at = now_iso()
+        ident = self._chunk_identity_v2(
+            lane_id=lane_id,
+            chunk_id=chunk_id,
+            sender_idx=sender_idx,
+            sender_mail=sender_mail,
+            target_domain=target_domain,
+            attempt=attempt,
+        )
+        self.chunks_abandoned += 1
+        self.chunks_done += 1
+        self.remove_active_chunk(lane_id, chunk_id)
+        self.push_chunk_state({
+            "chunk": int(chunk_id),
+            "status": "abandoned",
+            "size": int(size or 0),
+            "sender": str(sender_mail or ""),
+            "subject": str(subject or ""),
+            "spam_score": (float(spam_score) if spam_score is not None else None),
+            "blacklist": str(blacklist or ""),
+            "next_retry_ts": int(next_retry_ts or 0),
+            "reason": str(reason or ""),
+            "pmta_reason": str(pmta_reason or ""),
+            **ident,
+        })
+        if int(self.current_chunk or -1) == int(chunk_id):
+            self.current_chunk = -1
+            self.current_chunk_info = {}
+            self.current_chunk_domains = {}
     def record_error(self, err: str):
         """Increment a simple error histogram for Jobs UI."""
         self.updated_at = now_iso()
@@ -15659,6 +15844,12 @@ def smtp_send_job(
         with JOBS_LOCK:
             job.debug_lane_executor = {}
             job.active_chunks_info = []
+            job.current_chunk_info = {}
+            job.chunk_states = []
+            job.backoff_items = []
+            job.chunks_done = 0
+            job.chunks_backoff = 0
+            job.chunks_abandoned = 0
 
     with JOBS_LOCK:
         job.debug_parallel_lanes_snapshot = {
@@ -17543,38 +17734,22 @@ def smtp_send_job(
                             transition="chunk_running",
                         )
                         with JOBS_LOCK:
-                            job.current_chunk = int(chunk_idx_local)
-                            job.current_chunk_domains = count_recipient_domains(chunk_now)
-                            job.current_chunk_info = {
-                                "chunk": int(chunk_idx_local),
-                                "size": int(len(chunk_now)),
-                                "target_domain": str(lane_provider_domain or ""),
-                                "chunk_size": int(lane_chunk_size),
-                                "workers": int(lane_workers_local),
-                                "delay_s": float(lane_delay_s),
-                                "sleep_chunks": float(lane_sleep_s),
-                                "attempt": 0,
-                                "sender": str(sender_email_lane or ""),
-                                "subject": "",
-                                "body_variant": "",
-                                "body_format": str(body_format_lane or ""),
-                                "reply_to": str(reply_to_lane or ""),
-                            }
-                            job.upsert_active_chunk(lane_id, {
-                                "chunk_id": int(chunk_idx_local),
-                                "sender_idx": int(sender_idx_lane),
-                                "sender_mail": str(sender_email_lane or ""),
-                                "receiver_domain": str(lane_provider_domain or ""),
-                                "target_domain": str(lane_provider_domain or ""),
-                                "size": int(len(chunk_now)),
-                                "status": "running",
-                                "attempt": 0,
-                                "next_retry_ts": 0,
-                                "reason": "",
-                                "spam_score": None,
-                                "blacklist": "",
-                                "pmta_reason": "",
-                            })
+                            job.begin_chunk_telemetry_v2(
+                                lane_id=lane_id,
+                                chunk_id=int(chunk_idx_local),
+                                sender_idx=int(sender_idx_lane),
+                                sender_mail=str(sender_email_lane or ""),
+                                target_domain=str(lane_provider_domain or ""),
+                                attempt=0,
+                                size=int(len(chunk_now)),
+                                chunk_size=int(lane_chunk_size),
+                                workers=int(lane_workers_local),
+                                delay_s=float(lane_delay_s),
+                                sleep_chunks=float(lane_sleep_s),
+                                body_format=str(body_format_lane or ""),
+                                reply_to=str(reply_to_lane or ""),
+                                domains=count_recipient_domains(chunk_now),
+                            )
                             job.log("INFO", f"lane transition lane={lane_id} status=running state=processing chunk={chunk_idx_local} chunk_id={chunk_id} workers={lane_workers_local}")
                             _export_parallel_lanes_snapshot(scheduler_mode_runtime, configured_lane_cap, len(sender_emails))
                             before_recent_len_lane = len(job.recent_results or [])
@@ -17591,55 +17766,38 @@ def smtp_send_job(
                         if bl_listed_lane:
                             preflight_reason = str(bl_detail_lane or "listed")
                         with JOBS_LOCK:
-                            job.current_chunk_info.update({
-                                "attempt": 0,
-                                "sender": str(sender_email_lane or ""),
-                                "subject": str(subject_lane or ""),
-                                "body_variant": int(rot_lane % max(1, len(body_variants_lane))) if body_variants_lane else 0,
-                                "spam_score": (float(spam_score_lane) if spam_score_lane is not None else None),
-                                "blacklist": str(bl_detail_lane or ""),
-                                "pmta_reason": "",
-                                "target_domain": str(lane_provider_domain or ""),
-                            })
-                            job.upsert_active_chunk(lane_id, {
-                                "chunk_id": int(chunk_idx_local),
-                                "sender_idx": int(sender_idx_lane),
-                                "sender_mail": str(sender_email_lane or ""),
-                                "receiver_domain": str(lane_provider_domain or ""),
-                                "target_domain": str(lane_provider_domain or ""),
-                                "size": int(len(chunk_now)),
-                                "status": "running",
-                                "attempt": 0,
-                                "next_retry_ts": 0,
-                                "reason": str(preflight_reason or ""),
-                                "spam_score": (float(spam_score_lane) if spam_score_lane is not None else None),
-                                "blacklist": str(bl_detail_lane or ""),
-                                "pmta_reason": "",
-                            })
+                            job.update_chunk_preflight_v2(
+                                lane_id=lane_id,
+                                chunk_id=int(chunk_idx_local),
+                                sender_idx=int(sender_idx_lane),
+                                sender_mail=str(sender_email_lane or ""),
+                                target_domain=str(lane_provider_domain or ""),
+                                attempt=0,
+                                subject=str(subject_lane or ""),
+                                body_variant=int(rot_lane % max(1, len(body_variants_lane))) if body_variants_lane else 0,
+                                spam_score=(float(spam_score_lane) if spam_score_lane is not None else None),
+                                blacklist=str(bl_detail_lane or ""),
+                                pmta_reason="",
+                                reason=str(preflight_reason or ""),
+                            )
 
                         if (spam_score_lane is not None and spam_score_lane > job.spam_threshold) or bool(bl_listed_lane):
                             abandoned_reason = f"preflight_blocked: {'spam' if (spam_score_lane is not None and spam_score_lane > job.spam_threshold) else 'blacklist'}"
                             with JOBS_LOCK:
-                                job.chunks_abandoned += 1
-                                job.chunks_done += 1
-                                job.remove_active_chunk(lane_id, chunk_idx_local)
-                                if int(job.current_chunk or -1) == int(chunk_idx_local):
-                                    job.current_chunk = -1
-                                    job.current_chunk_info = {}
-                                    job.current_chunk_domains = {}
-                                job.push_chunk_state({
-                                    "chunk": int(chunk_idx_local),
-                                    "status": "abandoned",
-                                    "size": int(len(chunk_now)),
-                                    "sender": str(sender_email_lane or ""),
-                                    "subject": str(subject_lane or ""),
-                                    "spam_score": (float(spam_score_lane) if spam_score_lane is not None else None),
-                                    "blacklist": str(bl_detail_lane or ""),
-                                    "attempt": 0,
-                                    "next_retry_ts": 0,
-                                    "reason": abandoned_reason,
-                                    "target_domain": str(lane_provider_domain or ""),
-                                })
+                                job.mark_chunk_abandoned_v2(
+                                    lane_id=lane_id,
+                                    chunk_id=int(chunk_idx_local),
+                                    sender_idx=int(sender_idx_lane),
+                                    sender_mail=str(sender_email_lane or ""),
+                                    target_domain=str(lane_provider_domain or ""),
+                                    attempt=0,
+                                    size=int(len(chunk_now)),
+                                    reason=abandoned_reason,
+                                    subject=str(subject_lane or ""),
+                                    spam_score=(float(spam_score_lane) if spam_score_lane is not None else None),
+                                    blacklist=str(bl_detail_lane or ""),
+                                    next_retry_ts=0,
+                                )
                                 job.log("WARN", f"Chunk {chunk_idx_local+1} [{lane_provider_domain}]: abandoned at preflight ({abandoned_reason})")
                             lane_done += 1
                             continue
@@ -17694,87 +17852,63 @@ def smtp_send_job(
                             if lane_temp_fail > 0 and lane_success <= 0 and lane_hard_fail <= 0:
                                 next_retry_ts = int(time.time() + max(1.0, float(backoff_base_s or 1.0)))
                                 chunk_reason = "temporary_failures"
-                                job.chunks_backoff += 1
-                                backoff_entry = {
-                                    "chunk": int(chunk_idx_local),
-                                    "attempt": 1,
-                                    "next_retry_ts": next_retry_ts,
-                                    "reason": chunk_reason,
-                                    "target_domain": str(lane_provider_domain or ""),
-                                    "sender": str(sender_email_lane or ""),
-                                    "size": int(len(chunk_now)),
-                                }
-                                job.push_backoff(backoff_entry)
-                                job.push_chunk_state({**backoff_entry, "status": "backoff"})
-                                job.upsert_active_chunk(lane_id, {
-                                    "chunk_id": int(chunk_idx_local),
-                                    "sender_idx": int(sender_idx_lane),
-                                    "sender_mail": str(sender_email_lane or ""),
-                                    "receiver_domain": str(lane_provider_domain or ""),
-                                    "target_domain": str(lane_provider_domain or ""),
-                                    "size": int(len(chunk_now)),
-                                    "status": "backoff",
-                                    "attempt": 1,
-                                    "next_retry_ts": int(next_retry_ts),
-                                    "reason": chunk_reason,
-                                    "spam_score": (float(spam_score_lane) if spam_score_lane is not None else None),
-                                    "blacklist": str(bl_detail_lane or ""),
-                                    "pmta_reason": "",
-                                })
-                                job.chunks_abandoned += 1
-                                job.chunks_done += 1
-                                job.remove_active_chunk(lane_id, chunk_idx_local)
-                                job.push_chunk_state({
-                                    "chunk": int(chunk_idx_local),
-                                    "status": "abandoned",
-                                    "size": int(len(chunk_now)),
-                                    "sender": str(sender_email_lane or ""),
-                                    "subject": str(subject_lane or ""),
-                                    "spam_score": (float(spam_score_lane) if spam_score_lane is not None else None),
-                                    "blacklist": str(bl_detail_lane or ""),
-                                    "attempt": 1,
-                                    "next_retry_ts": int(next_retry_ts),
-                                    "reason": "backoff_without_retry_in_v2_lane",
-                                    "target_domain": str(lane_provider_domain or ""),
-                                })
+                                job.mark_chunk_backoff_v2(
+                                    lane_id=lane_id,
+                                    chunk_id=int(chunk_idx_local),
+                                    sender_idx=int(sender_idx_lane),
+                                    sender_mail=str(sender_email_lane or ""),
+                                    target_domain=str(lane_provider_domain or ""),
+                                    attempt=1,
+                                    size=int(len(chunk_now)),
+                                    reason=chunk_reason,
+                                    next_retry_ts=int(next_retry_ts),
+                                    spam_score=(float(spam_score_lane) if spam_score_lane is not None else None),
+                                    blacklist=str(bl_detail_lane or ""),
+                                    pmta_reason="",
+                                )
+                                job.mark_chunk_abandoned_v2(
+                                    lane_id=lane_id,
+                                    chunk_id=int(chunk_idx_local),
+                                    sender_idx=int(sender_idx_lane),
+                                    sender_mail=str(sender_email_lane or ""),
+                                    target_domain=str(lane_provider_domain or ""),
+                                    attempt=1,
+                                    size=int(len(chunk_now)),
+                                    reason="backoff_without_retry_in_v2_lane",
+                                    subject=str(subject_lane or ""),
+                                    spam_score=(float(spam_score_lane) if spam_score_lane is not None else None),
+                                    blacklist=str(bl_detail_lane or ""),
+                                    next_retry_ts=int(next_retry_ts),
+                                )
                             elif lane_hard_fail > 0 and lane_success <= 0:
                                 chunk_reason = "hard_failures"
-                                job.chunks_abandoned += 1
-                                job.chunks_done += 1
-                                job.remove_active_chunk(lane_id, chunk_idx_local)
-                                job.push_chunk_state({
-                                    "chunk": int(chunk_idx_local),
-                                    "status": "abandoned",
-                                    "size": int(len(chunk_now)),
-                                    "sender": str(sender_email_lane or ""),
-                                    "subject": str(subject_lane or ""),
-                                    "spam_score": (float(spam_score_lane) if spam_score_lane is not None else None),
-                                    "blacklist": str(bl_detail_lane or ""),
-                                    "attempt": 0,
-                                    "next_retry_ts": 0,
-                                    "reason": chunk_reason,
-                                    "target_domain": str(lane_provider_domain or ""),
-                                })
+                                job.mark_chunk_abandoned_v2(
+                                    lane_id=lane_id,
+                                    chunk_id=int(chunk_idx_local),
+                                    sender_idx=int(sender_idx_lane),
+                                    sender_mail=str(sender_email_lane or ""),
+                                    target_domain=str(lane_provider_domain or ""),
+                                    attempt=0,
+                                    size=int(len(chunk_now)),
+                                    reason=chunk_reason,
+                                    subject=str(subject_lane or ""),
+                                    spam_score=(float(spam_score_lane) if spam_score_lane is not None else None),
+                                    blacklist=str(bl_detail_lane or ""),
+                                    next_retry_ts=0,
+                                )
                             else:
-                                job.chunks_done += 1
-                                job.remove_active_chunk(lane_id, chunk_idx_local)
-                                job.push_chunk_state({
-                                    "chunk": int(chunk_idx_local),
-                                    "status": "done",
-                                    "size": int(len(chunk_now)),
-                                    "sender": str(sender_email_lane or ""),
-                                    "subject": str(subject_lane or ""),
-                                    "spam_score": (float(spam_score_lane) if spam_score_lane is not None else None),
-                                    "blacklist": str(bl_detail_lane or ""),
-                                    "attempt": 0,
-                                    "next_retry_ts": 0,
-                                    "reason": "",
-                                    "target_domain": str(lane_provider_domain or ""),
-                                })
-                            if int(job.current_chunk or -1) == int(chunk_idx_local):
-                                job.current_chunk = -1
-                                job.current_chunk_info = {}
-                                job.current_chunk_domains = {}
+                                job.mark_chunk_done_v2(
+                                    lane_id=lane_id,
+                                    chunk_id=int(chunk_idx_local),
+                                    sender_idx=int(sender_idx_lane),
+                                    sender_mail=str(sender_email_lane or ""),
+                                    target_domain=str(lane_provider_domain or ""),
+                                    attempt=0,
+                                    size=int(len(chunk_now)),
+                                    subject=str(subject_lane or ""),
+                                    spam_score=(float(spam_score_lane) if spam_score_lane is not None else None),
+                                    blacklist=str(bl_detail_lane or ""),
+                                )
                             _export_parallel_lanes_snapshot(scheduler_mode_runtime, configured_lane_cap, len(sender_emails))
                         if lane_sleep_s > 0 and (lane_queue or _remaining_total() > 0):
                             lane_id = f"{int(sender_idx_lane)}|{str(lane_provider_domain or '').strip().lower()}"
