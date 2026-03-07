@@ -4396,9 +4396,10 @@ def db_delete_job(job_id: str) -> None:
     with DB_LOCK:
         conn = _db_conn()
         try:
+            # Keep this statement compatible with older SQLite builds that do
+            # not support UPSERT syntax ("... ON CONFLICT ... DO UPDATE ...").
             conn.execute(
-                "INSERT INTO deleted_jobs(job_id, deleted_at) VALUES(?, ?) "
-                "ON CONFLICT(job_id) DO UPDATE SET deleted_at=excluded.deleted_at",
+                "INSERT OR REPLACE INTO deleted_jobs(job_id, deleted_at) VALUES(?, ?)",
                 (jid, now_iso()),
             )
             conn.execute("DELETE FROM jobs WHERE id=?", (jid,))
