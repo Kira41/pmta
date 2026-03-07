@@ -39,3 +39,18 @@ def test_budget_manager_external_gate_works_with_hint():
     assert ok is True
     assert deny is False
     assert reason == "too_big"
+
+
+def test_budget_manager_sender_inflight_cap_can_be_raised_at_runtime():
+    cfg = shiva.BudgetConfig(enabled=True, sender_max_inflight=1, provider_max_inflight_default=5)
+    bm = shiva.BudgetManager(cfg)
+
+    bm.on_start((0, "gmail.com"), 1.0)
+    deny, reason = bm.can_start((0, "yahoo.com"), 1.1, False, False)
+    assert deny is False
+    assert reason == "sender_inflight_cap"
+
+    bm.set_sender_max_inflight(3)
+    ok, reason2 = bm.can_start((0, "yahoo.com"), 1.2, False, False)
+    assert ok is True
+    assert reason2 == "allow"

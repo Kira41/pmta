@@ -1572,6 +1572,9 @@ class BudgetManager:
             return
         self.provider_max_inflight_overrides[p] = max(1, min(10, int(value or 1)))
 
+    def set_sender_max_inflight(self, value: int) -> None:
+        self.config.sender_max_inflight = max(1, min(10, int(value or 1)))
+
     def register_external_gate(
         self,
         name: str,
@@ -16547,6 +16550,11 @@ def smtp_send_job(
         if scheduler_mode_runtime == "v2":
             # v2 bypass: keep sender-parallel fanout from collapsing into sequential-by-cap.
             lane_parallel_limit_runtime = max(2, int(lane_parallel_limit_runtime), min(int(max_total_lanes), max(2, len(sender_emails))))
+        if lane_concurrency_runtime and budget_mgr:
+            # Parallel mode can run multiple provider lanes for the same sender.
+            # Keep sender inflight cap aligned with lane fanout unless operator
+            # explicitly configured a higher value.
+            budget_mgr.set_sender_max_inflight(max(int(budget_sender_max_inflight), int(max(1, lane_parallel_limit_runtime))))
         resource_governor = GlobalResourceGovernor(
             max_total_workers=max_total_workers,
             debug=resource_governor_debug,
