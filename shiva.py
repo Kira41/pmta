@@ -10078,6 +10078,7 @@ PAGE_CONFIG = r"""
       const t = (it.type || 'str');
       const desc = (it.desc || '');
       const isSecret = !!it.secret;
+      const choices = Array.isArray(it.choices) ? it.choices.filter(x => (x ?? '').toString().trim() !== '') : [];
 
       const hay = (key + ' ' + group + ' ' + desc).toLowerCase();
       if(q && !hay.includes(q)) continue;
@@ -10090,7 +10091,19 @@ PAGE_CONFIG = r"""
       const id = 'v_' + key.replaceAll(/[^a-zA-Z0-9_]/g, '_');
       const cur = (it.value ?? '');
 
-      if(key === 'SHIVA_ROLLOUT_MODE'){
+      if(choices.length >= 2){
+        const curNorm = String(cur || '').trim().toLowerCase();
+        inp = `<div class="mini" style="display:flex; flex-direction:column; gap:8px; margin:0">` +
+          choices.map((opt, idx) => {
+            const optStr = (opt ?? '').toString().trim();
+            const checked = (optStr.toLowerCase() === curNorm) || (!curNorm && idx === 0);
+            return `<label style="display:flex; gap:8px; align-items:center; margin:0">`+
+              `<input name="${esc(id)}" data-k="${esc(key)}" data-type="choice" type="radio" value="${esc(optStr)}" ${checked ? 'checked' : ''} />`+
+              `<span>${esc(optStr)}</span>`+
+            `</label>`;
+          }).join('') +
+        `</div>`;
+      } else if(key === 'SHIVA_ROLLOUT_MODE'){
         const on = String(cur || '').trim().toLowerCase() !== 'off';
         inp = `<label class="mini" style="display:flex; gap:10px; align-items:center; margin:0">
           <input id="${esc(id)}" data-k="${esc(key)}" data-type="rollout_toggle" type="checkbox" ${on ? 'checked' : ''} />
@@ -10164,6 +10177,10 @@ PAGE_CONFIG = r"""
       const t = el.getAttribute('data-type');
       if(t === 'bool') return el.checked ? '1' : '0';
       if(t === 'rollout_toggle') return el.checked ? 'on' : 'off';
+      if(t === 'choice'){
+        const selected = tb.querySelector(`input[data-k="${CSS.escape(el.getAttribute('data-k') || '')}"][data-type="choice"]:checked`);
+        return (selected?.value ?? '').toString();
+      }
       if(t === 'scheduler_mode'){
         const selected = tb.querySelector(`input[data-k="${CSS.escape(el.getAttribute('data-k') || '')}"][data-type="scheduler_mode"]:checked`);
         return (selected?.value ?? 'legacy').toString();
@@ -10222,6 +10239,16 @@ PAGE_CONFIG = r"""
   function readCurrentInput(key){
     const row = document.querySelector(`tr[data-key="${CSS.escape(key)}"]`);
     if(!row) return null;
+    const choiceSelected = row.querySelector('input[data-k][data-type="choice"]:checked');
+    if(choiceSelected){
+      return {key, value: (choiceSelected.value ?? '').toString()};
+    }
+
+    const schedulerSelected = row.querySelector('input[data-k][data-type="scheduler_mode"]:checked');
+    if(schedulerSelected){
+      return {key, value: (schedulerSelected.value ?? 'legacy').toString()};
+    }
+
     const el = row.querySelector('input[data-k], textarea[data-k]');
     if(!el) return null;
     const t = el.getAttribute('data-type');
@@ -18134,6 +18161,24 @@ APP_CONFIG_SCHEMA: List[dict] = [
 APP_CONFIG_INDEX: Dict[str, dict] = {it["key"]: it for it in APP_CONFIG_SCHEMA if isinstance(it, dict) and it.get("key")}
 
 
+def _cfg_extract_choices(meta: dict) -> List[str]:
+    """Best-effort extraction of fixed allowed values for UI radio rendering + validation."""
+    if not isinstance(meta, dict):
+        return []
+
+    raw_choices = meta.get("choices")
+    if isinstance(raw_choices, (list, tuple)):
+        out = [str(x).strip() for x in raw_choices if str(x).strip()]
+        return out
+
+    desc = str(meta.get("desc") or "")
+    m = re.search(r":\s*([A-Za-z0-9_\-]+(?:\s*\|\s*[A-Za-z0-9_\-]+)+)", desc)
+    if not m:
+        return []
+    opts = [x.strip() for x in m.group(1).split("|") if x.strip()]
+    return opts if 2 <= len(opts) <= 6 else []
+
+
 def _cfg_boolish(s: str) -> bool:
     v = (s or "").strip().lower()
     return v in {"1", "true", "yes", "on", "y"}
@@ -18252,6 +18297,7 @@ def config_items() -> List[dict]:
             "type": typ,
             "group": str(it.get("group") or "Other"),
             "desc": str(it.get("desc") or ""),
+            "choices": _cfg_extract_choices(it),
             "secret": bool(it.get("secret") or False),
             "restart_required": bool(it.get("restart_required") or False),
             "value": eff,
@@ -19238,6 +19284,14 @@ def _cfg_validate_and_canon(key: str, value: Any) -> Tuple[bool, str, str]:
             return True, str(float(v.strip() or "0")), ""
         except Exception:
             return False, "", "invalid float"
+
+    choices = _cfg_extract_choices(meta)
+    if choices:
+        value_norm = v.strip().lower()
+        allowed = {x.strip().lower(): x for x in choices}
+        if value_norm not in allowed:
+            return False, "", f"invalid value (allowed: {', '.join(choices)})"
+        return True, allowed[value_norm], ""
 
     # str
     if len(v) > 20000:
