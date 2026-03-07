@@ -3335,6 +3335,8 @@ class SendJob:
     current_chunk_domains: Dict[str, int] = field(default_factory=dict)
     chunk_states: List[dict] = field(default_factory=list)   # bounded
     backoff_items: List[dict] = field(default_factory=list)  # bounded
+    v2_active_empty_since_ts: float = 0.0
+    v2_telemetry_assertions: Dict[str, int] = field(default_factory=dict)
 
     # Domain state (recipient domains)
     domain_plan: Dict[str, int] = field(default_factory=dict)
@@ -3493,6 +3495,78 @@ class SendJob:
             "target_domain": str(target_domain or "").strip().lower(),
             "attempt": int(attempt or 0),
         }
+    def _v2_lane_runtime_active_count(self) -> int:
+        runtime = self.debug_parallel_lanes_snapshot if isinstance(self.debug_parallel_lanes_snapshot, dict) else {}
+        lanes = runtime.get("lanes") if isinstance(runtime.get("lanes"), dict) else {}
+        active = 0
+        for lane in lanes.values():
+            if not isinstance(lane, dict):
+                continue
+            lane_status = str(lane.get("status") or "").strip().lower()
+            lane_state = str(lane.get("lane_state") or lane.get("state") or "").strip().lower()
+            if lane_status in {"running", "processing", "backoff", "sleeping", "queued"}:
+                active += 1
+                continue
+            if lane_state in {"running", "processing", "backoff", "cooldown", "queued"}:
+                active += 1
+        return active
+    def _record_v2_assertion(self, key: str, detail: str) -> None:
+        k = str(key or "v2_telemetry_assert").strip().lower() or "v2_telemetry_assert"
+        self.v2_telemetry_assertions[k] = int(self.v2_telemetry_assertions.get(k, 0) or 0) + 1
+        try:
+            self.record_internal_error("telemetry_assert", f"{k}: {str(detail or '').strip()[:260]}")
+        except Exception:
+            pass
+        try:
+            self.log("ERROR", f"telemetry assertion failed: {k} detail={str(detail or '')[:260]}")
+        except Exception:
+            pass
+    def _runtime_assert_v2_chunk_telemetry(self, context: str = "") -> None:
+        mode = str((self.debug_parallel_lanes_snapshot or {}).get("mode") or "").strip().lower()
+        if mode != "v2":
+            self.v2_active_empty_since_ts = 0.0
+            return
+        now_t = float(time.time())
+        lane_active = self._v2_lane_runtime_active_count()
+        active_rows = len(self.active_chunks_info or [])
+        is_running = str(self.status or "").strip().lower() == "running"
+        if is_running and int(self.chunks_total or 0) > 0 and lane_active > 0 and active_rows <= 0:
+            if float(self.v2_active_empty_since_ts or 0.0) <= 0.0:
+                self.v2_active_empty_since_ts = now_t
+            elif (now_t - float(self.v2_active_empty_since_ts or now_t)) >= 2.0:
+                self._record_v2_assertion(
+                    "active_chunks_stuck_empty",
+                    f"running job with active lanes has empty active_chunks_info for >=2s (context={context}, lane_active={lane_active}, chunks_total={int(self.chunks_total or 0)})",
+                )
+                self.v2_active_empty_since_ts = now_t
+        else:
+            self.v2_active_empty_since_ts = 0.0
+    def _runtime_assert_success_reflected(self, *, chunk_id: int, target_domain: str, attempt: int, expected_status: str) -> None:
+        status_norm = str(expected_status or "").strip().lower()
+        if status_norm not in {"done", "done_after_backoff"}:
+            return
+        seen = False
+        domain_norm = str(target_domain or "").strip().lower()
+        for row in reversed(self.chunk_states or []):
+            if int(row.get("chunk") or row.get("chunk_id") or -1) != int(chunk_id or -1):
+                continue
+            if str(row.get("target_domain") or row.get("receiver_domain") or "").strip().lower() != domain_norm:
+                continue
+            if int(row.get("attempt") or 0) != int(attempt or 0):
+                continue
+            if str(row.get("status") or "").strip().lower() == status_norm:
+                seen = True
+                break
+        if not seen:
+            self._record_v2_assertion(
+                "success_not_reflected_in_chunk_states",
+                f"missing status={status_norm} for chunk={int(chunk_id or -1)} domain={domain_norm} attempt={int(attempt or 0)}",
+            )
+        if int(self.chunks_done or 0) <= 0:
+            self._record_v2_assertion(
+                "success_not_reflected_in_chunks_done",
+                f"status={status_norm} for chunk={int(chunk_id or -1)} but chunks_done={int(self.chunks_done or 0)}",
+            )
     def begin_chunk_telemetry_v2(self, *, lane_id: str, chunk_id: int, sender_idx: int, sender_mail: str, target_domain: str, attempt: int, size: int, chunk_size: int, workers: int, delay_s: float, sleep_chunks: float, body_format: str, reply_to: str, domains: Optional[Dict[str, int]] = None):
         self.updated_at = now_iso()
         ident = self._chunk_identity_v2(
@@ -3537,6 +3611,7 @@ class SendJob:
             "pmta_reason": "",
             **ident,
         })
+        self._runtime_assert_v2_chunk_telemetry("begin_chunk")
     def update_chunk_preflight_v2(self, *, lane_id: str, chunk_id: int, sender_idx: int, sender_mail: str, target_domain: str, attempt: int, subject: str, body_variant: int, spam_score: Optional[float], blacklist: str, pmta_reason: str = "", reason: str = ""):
         self.updated_at = now_iso()
         ident = self._chunk_identity_v2(
@@ -3582,9 +3657,10 @@ class SendJob:
         )
         self.chunks_done += 1
         self.remove_active_chunk(lane_id, chunk_id)
+        done_status = "done" if int(attempt or 0) <= 0 else "done_after_backoff"
         self.push_chunk_state({
             "chunk": int(chunk_id),
-            "status": "done",
+            "status": done_status,
             "size": int(size or 0),
             "sender": str(sender_mail or ""),
             "subject": str(subject or ""),
@@ -3594,6 +3670,13 @@ class SendJob:
             "reason": "",
             **ident,
         })
+        self._runtime_assert_success_reflected(
+            chunk_id=int(chunk_id),
+            target_domain=str(target_domain or ""),
+            attempt=int(attempt or 0),
+            expected_status=done_status,
+        )
+        self._runtime_assert_v2_chunk_telemetry("mark_done")
         if int(self.current_chunk or -1) == int(chunk_id):
             self.current_chunk = -1
             self.current_chunk_info = {}
@@ -3639,6 +3722,7 @@ class SendJob:
             "pmta_reason": str(pmta_reason or ""),
             **ident,
         })
+        self._runtime_assert_v2_chunk_telemetry("mark_backoff")
     def mark_chunk_abandoned_v2(self, *, lane_id: str, chunk_id: int, sender_idx: int, sender_mail: str, target_domain: str, attempt: int, size: int, reason: str, subject: str, spam_score: Optional[float], blacklist: str, next_retry_ts: int = 0, pmta_reason: str = ""):
         self.updated_at = now_iso()
         ident = self._chunk_identity_v2(
@@ -3669,6 +3753,7 @@ class SendJob:
             self.current_chunk = -1
             self.current_chunk_info = {}
             self.current_chunk_domains = {}
+        self._runtime_assert_v2_chunk_telemetry("mark_abandoned")
     def record_error(self, err: str):
         """Increment a simple error histogram for Jobs UI."""
         self.updated_at = now_iso()
@@ -20373,6 +20458,10 @@ def _normalize_chunk_row_for_api(row: Any, *, fallback_lane_id: str = "", fallba
 
 
 def _chunk_telemetry_payload(job: 'SendJob') -> dict:
+    try:
+        job._runtime_assert_v2_chunk_telemetry("api_payload")
+    except Exception:
+        pass
     runtime = getattr(job, "debug_parallel_lanes_snapshot", {}) or {}
     mode = str(runtime.get("mode") or "").strip().lower()
     is_v2 = mode == "v2"
@@ -20429,6 +20518,7 @@ def _chunk_telemetry_payload(job: 'SendJob') -> dict:
         "chunk_states": chunk_states,
         "backoff_items": backoff_items,
         "debug_parallel_lanes_snapshot": runtime,
+        "v2_telemetry_assertions": dict(getattr(job, "v2_telemetry_assertions", {}) or {}),
     }
     if is_v2:
         out.update(
@@ -20545,6 +20635,7 @@ def job_api(job_id: str):
                 "chunk_attempts_total": chunk_payload.get("chunk_attempts_total"),
                 "telemetry_source": chunk_payload.get("telemetry_source"),
                 "debug_parallel_lanes_snapshot": chunk_payload["debug_parallel_lanes_snapshot"],
+                "v2_telemetry_assertions": chunk_payload.get("v2_telemetry_assertions", {}),
                 "debug_backoff_jitter": (job.debug_backoff_jitter or [])[-50:],
                 "domain_plan": job.domain_plan,
                 "domain_sent": job.domain_sent,
