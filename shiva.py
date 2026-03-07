@@ -8991,7 +8991,11 @@ This will remove it from Jobs history.`);
     const tb = qk(card,'chunkHist');
     if(!tb) return;
     const finalized = new Set(['done', 'done_after_backoff', 'abandoned']);
-    const cs = (j.chunk_states || []).filter(x => finalized.has((x?.status || '').toString().toLowerCase())).slice().reverse().slice(0,12);
+    const cs = (j.chunk_states || [])
+      .filter(x => finalized.has((x?.status || '').toString().toLowerCase()))
+      .slice()
+      .reverse()
+      .slice(0,12);
     if(!cs.length){
       tb.innerHTML = `<tr><td colspan="10" class="mini">No chunk states yet.</td></tr>`;
       return;
@@ -9006,6 +9010,8 @@ This will remove it from Jobs history.`);
       const spam = (x.spam_score === null || x.spam_score === undefined) ? '' : Number(x.spam_score).toFixed(2);
       const reason = (x.reason || '').toString();
       const reasonShort = reason.length > 40 ? (reason.slice(0,40) + '…') : reason;
+      const attempt = (x.attempt === null || x.attempt === undefined || x.attempt === '') ? '—' : String(x.attempt);
+      const retryText = next || '—';
 
       return `<tr>`+
         `<td>${Number(x.chunk)+1}</td>`+
@@ -9015,9 +9021,9 @@ This will remove it from Jobs history.`);
         `<td>${esc(receiverDomain)}</td>`+
         `<td>${esc(spam)}</td>`+
         `<td title="${esc(bl)}">${esc(blShort)}</td>`+
-        `<td>${esc(String(x.attempt ?? ''))}</td>`+
-        `<td>${esc(next)}</td>`+
-        `<td title="${esc(reason)}">${esc(reasonShort)}</td>`+
+        `<td><b>${esc(attempt)}</b></td>`+
+        `<td><span title="${esc(next || '')}">${esc(retryText)}</span></td>`+
+        `<td title="${esc(reason)}">${esc(reasonShort || '—')}</td>`+
       `</tr>`;
     }).join('');
   }
@@ -9027,7 +9033,15 @@ This will remove it from Jobs history.`);
     if(!tb) return;
     const active = getLiveChunks(j);
     if(!active.length){
-      tb.innerHTML = `<tr><td colspan="7" class="mini">No active chunk right now.</td></tr>`;
+      const isRunning = ['running','backoff'].includes((j.status || '').toString().toLowerCase());
+      const snap = (j.debug_parallel_lanes_snapshot && typeof j.debug_parallel_lanes_snapshot === 'object') ? j.debug_parallel_lanes_snapshot : {};
+      const laneCount = Number(snap.lanes_active ?? snap.active_lanes ?? snap.lanes ?? 0);
+      const v2Active = !!j.v2_parallel_enabled || laneCount > 0;
+      if(isRunning && v2Active){
+        tb.innerHTML = `<tr><td colspan="7" class="mini">⚠️ No live chunk rows yet from active_chunks_info. This can be a brief telemetry gap in V2 parallel mode (lanes=${Number.isFinite(laneCount) ? laneCount : 0}).</td></tr>`;
+      }else{
+        tb.innerHTML = `<tr><td colspan="7" class="mini">No active chunk right now.</td></tr>`;
+      }
       return;
     }
     tb.innerHTML = active.slice(0,12).map(ci => {
@@ -9038,8 +9052,11 @@ This will remove it from Jobs history.`);
       const bl = (ci.blacklist || '').toString();
       const blShort = bl.length > 30 ? (bl.slice(0,30) + '…') : bl;
       const status = (ci.status || (((j.status || '').toString().toLowerCase() === 'backoff') ? 'backoff' : 'running'));
+      const laneBadge = (ci.lane_id !== undefined && ci.lane_id !== null && ci.lane_id !== '')
+        ? ` · lane ${esc(String(ci.lane_id))}`
+        : '';
       return `<tr>`+
-        `<td>${Number(ci.chunk_id ?? ci.chunk)+1}</td>`+
+        `<td>${Number(ci.chunk_id ?? ci.chunk)+1}${laneBadge}</td>`+
         `<td>${esc(status)}</td>`+
         `<td>${Number(ci.size||0)}</td>`+
         `<td title="${esc(sender)}">${esc(senderShort || '—')}</td>`+
@@ -9050,9 +9067,49 @@ This will remove it from Jobs history.`);
     }).join('');
   }
 
+  function normalizeLiveChunkStatus(rawStatus, jobStatus){
+    const s = (rawStatus || '').toString().toLowerCase();
+    if(s === 'backoff') return 'backoff';
+    if(s === 'running') return 'running';
+    const js = (jobStatus || '').toString().toLowerCase();
+    return js === 'backoff' ? 'backoff' : 'running';
+  }
+
+  function hasLiveIdentity(ci){
+    if(!ci || typeof ci !== 'object') return false;
+    const hasChunk = ci.chunk_id !== undefined && ci.chunk_id !== null && ci.chunk_id !== '';
+    const hasChunkAlt = ci.chunk !== undefined && ci.chunk !== null && ci.chunk !== '';
+    const hasLane = ci.lane_id !== undefined && ci.lane_id !== null && ci.lane_id !== '';
+    const hasLaneAlt = ci.lane !== undefined && ci.lane !== null && ci.lane !== '';
+    const hasDomain = !!((ci.target_domain || ci.receiver_domain || '').toString().trim());
+    return hasChunk || hasChunkAlt || hasLane || hasLaneAlt || hasDomain;
+  }
+
+  function liveChunkSort(a, b){
+    const rank = (x) => (normalizeLiveChunkStatus(x?.status, '').toLowerCase() === 'running' ? 0 : 1);
+    const byStatus = rank(a) - rank(b);
+    if(byStatus !== 0) return byStatus;
+    const laneA = Number(a?.lane_id ?? a?.lane ?? Number.MAX_SAFE_INTEGER);
+    const laneB = Number(b?.lane_id ?? b?.lane ?? Number.MAX_SAFE_INTEGER);
+    if(laneA !== laneB) return laneA - laneB;
+    const chunkA = Number(a?.chunk_id ?? a?.chunk ?? Number.MAX_SAFE_INTEGER);
+    const chunkB = Number(b?.chunk_id ?? b?.chunk ?? Number.MAX_SAFE_INTEGER);
+    return chunkA - chunkB;
+  }
+
   function getLiveChunks(j){
-    const active = Array.isArray(j.active_chunks_info) ? j.active_chunks_info.filter(x => x && Number(x.size || 0) > 0) : [];
+    const active = Array.isArray(j.active_chunks_info)
+      ? j.active_chunks_info
+          .filter(x => hasLiveIdentity(x))
+          .map(x => ({
+            ...x,
+            status: normalizeLiveChunkStatus(x?.status, j?.status),
+            lane_id: x?.lane_id ?? x?.lane,
+          }))
+          .sort(liveChunkSort)
+      : [];
     if(active.length) return active;
+
     const running = Array.isArray(j.chunk_states)
       ? j.chunk_states
           .filter(x => ['running', 'backoff'].includes((x?.status || '').toString().toLowerCase()))
@@ -9065,12 +9122,19 @@ This will remove it from Jobs history.`);
             receiver_domain: x.target_domain || x.provider_domain || '',
             spam_score: x.spam_score,
             blacklist: x.blacklist,
+            lane_id: x.lane_id ?? x.lane,
+            target_domain: x.target_domain || x.provider_domain || '',
           }))
+          .filter(x => hasLiveIdentity(x))
+          .map(x => ({ ...x, status: normalizeLiveChunkStatus(x?.status, j?.status) }))
+          .sort(liveChunkSort)
       : [];
     if(running.length) return running;
+
     const ci = j.current_chunk_info || {};
-    const hasChunk = ci && ((ci.chunk !== undefined && ci.chunk !== null) || (ci.chunk_id !== undefined && ci.chunk_id !== null)) && Number(ci.size || 0) > 0;
-    return hasChunk ? [ci] : [];
+    return hasLiveIdentity(ci)
+      ? [{ ...ci, status: normalizeLiveChunkStatus(ci?.status, j?.status), lane_id: ci?.lane_id ?? ci?.lane }]
+      : [];
   }
 
   function updateCard(card, j){
