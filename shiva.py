@@ -3314,6 +3314,7 @@ class SendJob:
     last_error: str = ""
     logs: List[JobLog] = field(default_factory=list)
     recent_results: List[dict] = field(default_factory=list)  # {ts, email, ok, detail}
+    resume_payload: dict = field(default_factory=dict)  # immutable launch settings for restart/resume after process crash
 
     def log(self, level: str, msg: str):
         self.updated_at = now_iso()
@@ -4311,6 +4312,7 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "last_error": (job.last_error or "")[:600],
         "logs": [l.__dict__ for l in (job.logs or [])[-400:]],
         "recent_results": (job.recent_results or [])[-400:],
+        "resume_payload": job.resume_payload or {},
     }
 
 
@@ -5304,18 +5306,20 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
             if isinstance(l, dict):
                 job.logs.append(JobLog(ts=str(l.get("ts") or ""), level=str(l.get("level") or ""), message=str(l.get("message") or "")))
         job.recent_results = list(s.get("recent_results") or [])
+        job.resume_payload = (s.get("resume_payload") if isinstance(s.get("resume_payload"), dict) else {}) or {}
 
         # Throttle state
         job.persist_ts = time.time()
         job.persist_counter = 0
 
-        # If job was active when server died, mark as stopped (history only)
+        # If job was active when server died, keep it resumable for operator restart.
         if job.status in {"queued", "running", "backoff", "paused"}:
-            job.status = "stopped"
-            job.stop_requested = True
-            job.paused = False
-            job.stop_reason = job.stop_reason or "restored from DB (server restarted)"
-            job.log("WARN", "Restored from DB; job was active but server restarted. Marked as stopped.")
+            job.status = "paused"
+            job.paused = True
+            job.stop_requested = False
+            if str(job.stop_reason or "").strip().lower().startswith("restored from db"):
+                job.stop_reason = ""
+            job.log("WARN", "Restored from DB after server restart. Job is paused and can be resumed from last checkpoint.")
 
         return job
     except Exception:
@@ -9252,7 +9256,7 @@ This will remove it from Jobs history.`);
     const btnResume = card.querySelector('[data-action="resume"]');
     const btnStop = card.querySelector('[data-action="stop"]');
     if(btnPause) btnPause.disabled = !!j.paused || (st||'').toLowerCase() === 'done' || (st||'').toLowerCase() === 'error' || (st||'').toLowerCase() === 'stopped';
-    if(btnResume) btnResume.disabled = !j.paused || (st||'').toLowerCase() === 'done' || (st||'').toLowerCase() === 'error' || (st||'').toLowerCase() === 'stopped';
+    if(btnResume) btnResume.disabled = !j.resumable || !j.paused || (st||'').toLowerCase() === 'done' || (st||'').toLowerCase() === 'stopped';
     if(btnStop) btnStop.disabled = (st||'').toLowerCase() === 'done' || (st||'').toLowerCase() === 'error' || (st||'').toLowerCase() === 'stopped';
 
     state.lastJobPayload[jobId] = j;
@@ -18610,6 +18614,7 @@ def job_api(job_id: str):
                 "paused": job.paused,
                 "stop_requested": job.stop_requested,
                 "stop_reason": job.stop_reason,
+                "resumable": _job_can_resume(job),
                 "speed_epm": job.speed_epm(),
                 "eta_s": job.eta_seconds(),
                 "current_chunk_info": job.current_chunk_info,
@@ -18654,6 +18659,55 @@ def job_api(job_id: str):
         )
 
 
+def _job_can_resume(job: 'SendJob') -> bool:
+    if not job or getattr(job, "deleted", False):
+        return False
+    st = str(getattr(job, "status", "") or "").strip().lower()
+    if st in {"done", "stopped"}:
+        return False
+    payload = getattr(job, "resume_payload", None)
+    return isinstance(payload, dict) and bool(payload.get("recipients"))
+
+
+def _resume_job_thread(job: 'SendJob') -> bool:
+    payload = dict(getattr(job, "resume_payload", {}) or {})
+    if not payload:
+        return False
+
+    recipients = [str(x).strip() for x in (payload.get("recipients") or []) if str(x).strip()]
+    if not recipients:
+        return False
+
+    args = (
+        str(job.id or ""),
+        str(payload.get("smtp_host") or job.smtp_host or ""),
+        int(payload.get("smtp_port") or 2525),
+        str(payload.get("smtp_security") or "none"),
+        int(payload.get("smtp_timeout") or 25),
+        str(payload.get("smtp_user") or ""),
+        str(payload.get("smtp_pass") or ""),
+        [str(x) for x in (payload.get("sender_names") or [])],
+        [str(x) for x in (payload.get("sender_emails") or [])],
+        [str(x) for x in (payload.get("subjects") or [])],
+        str(payload.get("reply_to") or ""),
+        str(payload.get("body_format") or "text"),
+        str(payload.get("body") or ""),
+        recipients,
+        float(payload.get("delay_s") or 0.0),
+        [str(x) for x in (payload.get("urls_list") or [])],
+        [str(x) for x in (payload.get("src_list") or [])],
+        int(payload.get("chunk_size") or 50),
+        int(payload.get("thread_workers") or 5),
+        float(payload.get("sleep_chunks") or 0.0),
+        bool(payload.get("use_ai_rewrite") or False),
+        str(payload.get("ai_token") or ""),
+    )
+
+    t = threading.Thread(target=smtp_send_job_thread_entry, daemon=True, args=args)
+    t.start()
+    return True
+
+
 @app.post("/api/job/<job_id>/control")
 def api_job_control(job_id: str):
     """Pause/Resume/Stop a running job (used by Jobs UI)."""
@@ -18674,10 +18728,26 @@ def api_job_control(job_id: str):
             return jsonify({"ok": True, "status": job.status})
 
         if action in {"resume", "unpause"}:
+            if not _job_can_resume(job):
+                return jsonify({"ok": False, "error": "job is not resumable"}), 409
+
+            resume_spawns_worker = str(job.status or "").strip().lower() in {"paused", "error"}
             job.paused = False
-            if job.status == "paused":
+            if job.status in {"paused", "error"}:
                 job.status = "running"
-            job.log("INFO", "Resumed by user")
+
+            if resume_spawns_worker:
+                if not _resume_job_thread(job):
+                    job.paused = True
+                    job.status = "error"
+                    job.last_error = "Missing resume payload"
+                    job.log("ERROR", "Resume failed: missing or invalid resume payload.")
+                    return jsonify({"ok": False, "error": "missing resume payload"}), 409
+                job.log("INFO", "Resumed by user (worker restarted from checkpoint)")
+            else:
+                job.log("INFO", "Resumed by user")
+
+            job.maybe_persist(force=True)
             return jsonify({"ok": True, "status": job.status})
 
         if action == "stop":
@@ -19742,6 +19812,30 @@ def start():
         "INFO",
         f"Chunk controls: chunk_size={chunk_size} workers={thread_workers} sleep_between_chunks={sleep_chunks}s delay_between_messages={delay_s}s",
     )
+
+    job.resume_payload = {
+        "smtp_host": smtp_host,
+        "smtp_port": int(smtp_port),
+        "smtp_security": smtp_security,
+        "smtp_timeout": int(smtp_timeout),
+        "smtp_user": smtp_user,
+        "smtp_pass": smtp_pass,
+        "sender_names": list(from_names),
+        "sender_emails": list(valid_sender_emails),
+        "subjects": list(subjects),
+        "reply_to": reply_to,
+        "body_format": body_format,
+        "body": body,
+        "recipients": list(valid),
+        "delay_s": float(delay_s),
+        "urls_list": list(urls_list),
+        "src_list": list(src_list),
+        "chunk_size": int(chunk_size),
+        "thread_workers": int(thread_workers),
+        "sleep_chunks": float(sleep_chunks),
+        "use_ai_rewrite": bool(use_ai),
+        "ai_token": ai_token,
+    }
 
     with JOBS_LOCK:
         JOBS[job_id] = job
