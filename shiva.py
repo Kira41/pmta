@@ -16989,6 +16989,117 @@ def smtp_send_job(
                     job.log("ERROR", f"Lane debug self-check fatal invariant: {e}")
                 raise
 
+        if scheduler_mode_runtime == "v2":
+            sender_lane_work: Dict[int, Dict[str, List[str]]] = {}
+            for _sender_idx, _domains in (sender_bucket_by_idx or {}).items():
+                cleaned_domains: Dict[str, List[str]] = {}
+                for _provider_domain, _rcpts in (_domains or {}).items():
+                    rcpt_list = list(_rcpts or [])
+                    if rcpt_list:
+                        cleaned_domains[str(_provider_domain or "").strip().lower()] = rcpt_list
+                if cleaned_domains:
+                    sender_lane_work[int(_sender_idx)] = cleaned_domains
+
+            max_sender_lanes = int(len(sender_lane_work))
+            configured_lane_cap = max(1, int(lane_parallel_limit_runtime or 1))
+            lane_workers = max(1, min(max_sender_lanes, configured_lane_cap)) if max_sender_lanes > 0 else 1
+
+            lane_seq_lock = threading.Lock()
+            lane_chunk_idx = int(chunk_idx)
+
+            def _next_lane_chunk_idx() -> int:
+                nonlocal lane_chunk_idx
+                with lane_seq_lock:
+                    lane_chunk_idx += 1
+                    return lane_chunk_idx
+
+            def _sender_lane_runner(sender_idx_lane: int, sender_domains_lane: Dict[str, List[str]]) -> Dict[str, Any]:
+                lane_sender_email = sender_emails[sender_idx_lane % len(sender_emails)] if sender_emails else ""
+                lane_provider_domains = sorted([str(d or "").strip().lower() for d in sender_domains_lane.keys() if str(d or "").strip()])
+                with JOBS_LOCK:
+                    job.log("INFO", f"lane created for sender {lane_sender_email} (sender_idx={sender_idx_lane})")
+                    job.log("INFO", f"lane assigned for sender {lane_sender_email}: providers={lane_provider_domains} chunks_pending={sum(len(v or []) for v in sender_domains_lane.values())}")
+                    job.log("INFO", f"lane start sender={lane_sender_email} sender_idx={sender_idx_lane}")
+
+                lane_done = 0
+                for lane_provider_domain in lane_provider_domains:
+                    lane_queue = sender_domains_lane.get(lane_provider_domain) or []
+                    while lane_queue:
+                        if _should_stop() or not _wait_ready():
+                            return {"sender_idx": sender_idx_lane, "sender_email": lane_sender_email, "chunks_done": lane_done, "stopped": True}
+
+                        rt_lane = _runtime_overrides()
+                        lane_chunk_size = _safe_int(rt_lane.get("chunk_size", chunk_size), _safe_int(chunk_size, 1))
+                        lane_workers_local = _safe_int(rt_lane.get("thread_workers", thread_workers), _safe_int(thread_workers, 1))
+                        lane_delay_s = float(rt_lane.get("delay_s", delay_s))
+                        lane_sleep_s = float(rt_lane.get("sleep_chunks", sleep_chunks))
+
+                        from_names_lane = rt_lane.get("from_names") or sender_names
+                        from_emails_lane = rt_lane.get("from_emails") or sender_emails
+                        subjects_lane = rt_lane.get("subjects") or subjects
+                        body_format_lane = str(rt_lane.get("body_format") or body_format).strip().lower() or body_format
+                        body_variants_lane = rt_lane.get("body_variants") or split_body_variants(body)
+                        reply_to_lane = str(rt_lane.get("reply_to") or reply_to)
+                        urls_lane = rt_lane.get("urls_list") or urls_list
+                        src_lane = rt_lane.get("src_list") or src_list
+
+                        chunk_now = list(lane_queue[:lane_chunk_size])
+                        del lane_queue[:lane_chunk_size]
+                        if not chunk_now:
+                            continue
+
+                        chunk_idx_local = _next_lane_chunk_idx()
+                        sender_name_lane = from_names_lane[sender_idx_lane % len(from_names_lane)] if from_names_lane else ""
+                        sender_email_lane = from_emails_lane[sender_idx_lane % len(from_emails_lane)] if from_emails_lane else ""
+                        rot_lane = max(0, chunk_idx_local)
+                        subject_lane = _cyclic_pick(subjects_lane, rot_lane)
+                        body_lane = _cyclic_pick(body_variants_lane, rot_lane)
+                        url_lane = _cyclic_pick(urls_lane, rot_lane)
+                        src_value_lane = _cyclic_pick(src_lane, rot_lane)
+
+                        _send_chunk(
+                            chunk_idx=chunk_idx_local,
+                            chunk_rcpts=chunk_now,
+                            from_name=sender_name_lane,
+                            from_email=sender_email_lane,
+                            subject=subject_lane,
+                            body_used=body_lane,
+                            body_format2=body_format_lane,
+                            reply_to2=reply_to_lane,
+                            delay2=lane_delay_s,
+                            workers2=lane_workers_local,
+                            chunk_url=url_lane,
+                            chunk_src=src_value_lane,
+                        )
+
+                        lane_done += 1
+                        if lane_sleep_s > 0 and (lane_queue or _remaining_total() > 0):
+                            if not _sleep_checked(lane_sleep_s):
+                                return {"sender_idx": sender_idx_lane, "sender_email": lane_sender_email, "chunks_done": lane_done, "stopped": True}
+
+                with JOBS_LOCK:
+                    job.log("INFO", f"lane finish sender={lane_sender_email} sender_idx={sender_idx_lane} chunks_done={lane_done}")
+                return {"sender_idx": sender_idx_lane, "sender_email": lane_sender_email, "chunks_done": lane_done, "stopped": False}
+
+            if sender_lane_work:
+                with JOBS_LOCK:
+                    job.log("INFO", f"v2 sender-driven parallel execution: lanes={len(sender_lane_work)} workers={lane_workers} configured_limit={configured_lane_cap}")
+                futures: List[Future] = []
+                with ThreadPoolExecutor(max_workers=lane_workers) as sender_pool:
+                    for lane_sender_idx, lane_domains in sorted(sender_lane_work.items(), key=lambda kv: kv[0]):
+                        futures.append(sender_pool.submit(_sender_lane_runner, lane_sender_idx, lane_domains))
+                    for fut in futures:
+                        _ = fut.result()
+
+            with JOBS_LOCK:
+                job.status = "done"
+                job.current_chunk = -1
+                if isinstance(job.debug_rollout, dict):
+                    job.debug_rollout["used_legacy_selector"] = False
+                job.log("INFO", "Job finished.")
+                job.maybe_persist(force=True)
+            return
+
         while _remaining_total() > 0:
             _tick_accounting_recon(time.time())
             with JOBS_LOCK:
