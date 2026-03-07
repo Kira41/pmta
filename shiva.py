@@ -19200,6 +19200,7 @@ def job_api(job_id: str):
                 "speed_epm": job.speed_epm(),
                 "eta_s": job.eta_seconds(),
                 "current_chunk_info": job.current_chunk_info,
+                "active_chunks_info": list(job.active_chunks_info or []),
                 "current_chunk_domains": job.current_chunk_domains,
                 "error_counts": job.error_counts,
                 "current_chunk": job.current_chunk,
