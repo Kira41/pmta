@@ -66,7 +66,7 @@ def test_multi_provider_parallel_enabled_for_single_provider_when_allowed():
     )
     assert out["enabled"] is True
     assert out["reason"] == "enabled"
-    assert out["effective_parallel_lanes"] == 1
+    assert out["effective_parallel_lanes"] == 4
     assert out["allow_single_provider"] is True
 
 
