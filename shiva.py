@@ -3434,6 +3434,27 @@ class SendJob:
         if len(self.backoff_items) > 600:
             self.backoff_items = self.backoff_items[-400:]
         self.maybe_persist()
+    def upsert_active_chunk(self, lane: str, item: dict):
+        """Upsert live chunk state per lane for parallel jobs monitor."""
+        self.updated_at = now_iso()
+        lane_key = str(lane or "")
+        next_item = {**(item or {}), "lane": lane_key}
+        replaced = False
+        for idx, prev in enumerate(self.active_chunks_info or []):
+            if str((prev or {}).get("lane") or "") == lane_key:
+                self.active_chunks_info[idx] = {**(prev or {}), **next_item}
+                replaced = True
+                break
+        if not replaced:
+            self.active_chunks_info.append(next_item)
+        if len(self.active_chunks_info) > 120:
+            self.active_chunks_info = self.active_chunks_info[-80:]
+        self.maybe_persist()
+    def remove_active_chunk(self, lane: str):
+        self.updated_at = now_iso()
+        lane_key = str(lane or "")
+        self.active_chunks_info = [x for x in (self.active_chunks_info or []) if str((x or {}).get("lane") or "") != lane_key]
+        self.maybe_persist()
     def record_error(self, err: str):
         """Increment a simple error histogram for Jobs UI."""
         self.updated_at = now_iso()
@@ -8789,50 +8810,37 @@ This will remove it from Jobs history.`);
   function renderChunkLive(card, j){
     const tb = qk(card,'chunkLive');
     if(!tb) return;
-    const active = Array.isArray(j.active_chunks_info) ? j.active_chunks_info.filter(x => x && Number(x.size || 0) > 0) : [];
-    if(active.length){
-      tb.innerHTML = active.slice(0,12).map(ci => {
-        const sender = (ci.sender_mail || ci.sender || '').toString();
-        const senderShort = sender.length > 30 ? (sender.slice(0,30) + '…') : sender;
-        const receiverDomain = (ci.receiver_domain || ci.target_domain || '').toString();
-        const spam = (ci.spam_score === null || ci.spam_score === undefined) ? '—' : Number(ci.spam_score).toFixed(2);
-        const bl = (ci.blacklist || '').toString();
-        const blShort = bl.length > 30 ? (bl.slice(0,30) + '…') : bl;
-        const status = (ci.status || (((j.status || '').toString().toLowerCase() === 'backoff') ? 'backoff' : 'running'));
-        return `<tr>`+
-          `<td>${Number(ci.chunk_id ?? ci.chunk)+1}</td>`+
-          `<td>${esc(status)}</td>`+
-          `<td>${Number(ci.size||0)}</td>`+
-          `<td title="${esc(sender)}">${esc(senderShort || '—')}</td>`+
-          `<td>${esc(receiverDomain || '—')}</td>`+
-          `<td>${esc(spam)}</td>`+
-          `<td title="${esc(bl)}">${esc(blShort || '—')}</td>`+
-        `</tr>`;
-      }).join('');
-      return;
-    }
-    const ci = j.current_chunk_info || {};
-    const hasChunk = (ci && ci.chunk !== undefined && ci.chunk !== null && Number(ci.size || 0) > 0);
-    if(!hasChunk){
+    const active = getLiveChunks(j);
+    if(!active.length){
       tb.innerHTML = `<tr><td colspan="7" class="mini">No active chunk right now.</td></tr>`;
       return;
     }
-    const sender = (ci.sender || '').toString();
-    const senderShort = sender.length > 30 ? (sender.slice(0,30) + '…') : sender;
-    const receiverDomain = (ci.target_domain || '').toString();
-    const spam = (ci.spam_score === null || ci.spam_score === undefined) ? '—' : Number(ci.spam_score).toFixed(2);
-    const bl = (ci.blacklist || '').toString();
-    const blShort = bl.length > 30 ? (bl.slice(0,30) + '…') : bl;
-    const status = ((j.status || '').toString().toLowerCase() === 'backoff') ? 'backoff' : 'running';
-    tb.innerHTML = `<tr>`+
-      `<td>${Number(ci.chunk)+1}</td>`+
-      `<td>${esc(status)}</td>`+
-      `<td>${Number(ci.size||0)}</td>`+
-      `<td title="${esc(sender)}">${esc(senderShort || '—')}</td>`+
-      `<td>${esc(receiverDomain || '—')}</td>`+
-      `<td>${esc(spam)}</td>`+
-      `<td title="${esc(bl)}">${esc(blShort || '—')}</td>`+
-    `</tr>`;
+    tb.innerHTML = active.slice(0,12).map(ci => {
+      const sender = (ci.sender_mail || ci.sender || '').toString();
+      const senderShort = sender.length > 30 ? (sender.slice(0,30) + '…') : sender;
+      const receiverDomain = (ci.receiver_domain || ci.target_domain || '').toString();
+      const spam = (ci.spam_score === null || ci.spam_score === undefined) ? '—' : Number(ci.spam_score).toFixed(2);
+      const bl = (ci.blacklist || '').toString();
+      const blShort = bl.length > 30 ? (bl.slice(0,30) + '…') : bl;
+      const status = (ci.status || (((j.status || '').toString().toLowerCase() === 'backoff') ? 'backoff' : 'running'));
+      return `<tr>`+
+        `<td>${Number(ci.chunk_id ?? ci.chunk)+1}</td>`+
+        `<td>${esc(status)}</td>`+
+        `<td>${Number(ci.size||0)}</td>`+
+        `<td title="${esc(sender)}">${esc(senderShort || '—')}</td>`+
+        `<td>${esc(receiverDomain || '—')}</td>`+
+        `<td>${esc(spam)}</td>`+
+        `<td title="${esc(bl)}">${esc(blShort || '—')}</td>`+
+      `</tr>`;
+    }).join('');
+  }
+
+  function getLiveChunks(j){
+    const active = Array.isArray(j.active_chunks_info) ? j.active_chunks_info.filter(x => x && Number(x.size || 0) > 0) : [];
+    if(active.length) return active;
+    const ci = j.current_chunk_info || {};
+    const hasChunk = ci && ((ci.chunk !== undefined && ci.chunk !== null) || (ci.chunk_id !== undefined && ci.chunk_id !== null)) && Number(ci.size || 0) > 0;
+    return hasChunk ? [ci] : [];
   }
 
   function updateCard(card, j){
@@ -8964,15 +8972,16 @@ This will remove it from Jobs history.`);
     qk(card,'barDomains').style.width = pDom + '%';
     qk(card,'domainsText').textContent = `Domains: ${pDom}% (${domDone}/${planTotal})`; 
 
-    // Current chunk info
-    const ci = j.current_chunk_info || {};
+    // Current chunk info (parallel-aware)
+    const liveChunks = getLiveChunks(j);
+    const ci = liveChunks[0] || (j.current_chunk_info || {});
     const cDom = j.current_chunk_domains || {};
 
     let chunkLine = '<div class="mini">—</div>';
-    if(ci && (ci.chunk !== undefined) && (ci.chunk !== null) && Number(ci.size||0) > 0){
-      const cnum = Number(ci.chunk||0) + 1;
+    if(ci && ((ci.chunk !== undefined && ci.chunk !== null) || (ci.chunk_id !== undefined && ci.chunk_id !== null)) && Number(ci.size||0) > 0){
+      const cnum = Number((ci.chunk_id ?? ci.chunk) || 0) + 1;
       const at = Number(ci.attempt||0);
-      const sender = (ci.sender||'').toString();
+      const sender = (ci.sender || ci.sender_mail || '').toString();
       const subj = (ci.subject||'').toString();
       const subjShort = subj.length > 70 ? (subj.slice(0,70) + '…') : subj;
       const spam = (ci.spam_score === null || ci.spam_score === undefined) ? '—' : Number(ci.spam_score).toFixed(2);
@@ -9020,6 +9029,9 @@ This will remove it from Jobs history.`);
         : '—';
 
       chunkLine = [
+        (liveChunks.length > 1)
+          ? `<div class="mini" style="margin-bottom:6px"><b>Live chunks:</b> ${Number(liveChunks.length)} parallel lanes active.</div>`
+          : '',
         `<div class="chunkMeta">`,
           `<span class="chunkMetaPill">#️⃣ Chunk #${cnum}</span>`,
           `<span class="chunkMetaPill">📦 size=${Number(ci.size||0)}</span>`,
@@ -9398,9 +9410,11 @@ This will remove it from Jobs history.`);
 
     // Adaptive pressure toasts (health/accounting-driven)
     try{
-      const ah = (j.current_chunk_info && j.current_chunk_info.adaptive_health) ? j.current_chunk_info.adaptive_health : null;
+      const liveRef = getLiveChunks(j);
+      const liveHead = liveRef[0] || (j.current_chunk_info || {});
+      const ah = (liveHead && liveHead.adaptive_health) ? liveHead.adaptive_health : null;
       if(ah && ah.ok){
-        const targetDomain = ((j.current_chunk_info && j.current_chunk_info.target_domain) || '').toString();
+        const targetDomain = ((liveHead && (liveHead.target_domain || liveHead.receiver_domain)) || '').toString();
         const signature = [
           Number(ah.level || 0),
           !!ah.reduced,
@@ -9427,9 +9441,9 @@ This will remove it from Jobs history.`);
 
     // Route/IP/domain switch toast per provider domain
     try{
-      const ci2 = j.current_chunk_info || {};
-      const pDom = (ci2.target_domain || '').toString();
-      const senderNow = (ci2.sender || '').toString();
+      const ci2 = (getLiveChunks(j)[0] || j.current_chunk_info || {});
+      const pDom = (ci2.target_domain || ci2.receiver_domain || '').toString();
+      const senderNow = (ci2.sender || ci2.sender_mail || '').toString();
       if(pDom && senderNow){
         const key = `${jobId}:${pDom}`;
         const prevSender = (state.lastRoute[key] || '').toString();
@@ -18092,8 +18106,7 @@ def smtp_send_job(
                 }
                 if sender_parallel_hard_mode:
                     lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
-                    job.active_chunks_info = [x for x in (job.active_chunks_info or []) if str(x.get("lane") or "") != lane_id]
-                    job.active_chunks_info.append({
+                    job.upsert_active_chunk(lane_id, {
                         "lane": lane_id,
                         "chunk_id": int(chunk_idx_local),
                         "sender_idx": int(sender_idx_fixed),
@@ -18104,6 +18117,8 @@ def smtp_send_job(
                         "attempt": int(attempt or 0),
                         "next_retry": 0,
                         "reason": "",
+                        "spam_score": None,
+                        "blacklist": "",
                     })
 
             # keep chunks_total roughly correct
@@ -18174,7 +18189,7 @@ def smtp_send_job(
                         job.current_chunk_info = {}
                         if sender_parallel_hard_mode:
                             lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
-                            job.active_chunks_info = [x for x in (job.active_chunks_info or []) if str(x.get("lane") or "") != lane_id]
+                            job.remove_active_chunk(lane_id)
                         job.current_chunk_domains = {}
                         job.push_chunk_state({
                             "chunk": chunk_idx_local,
@@ -18319,6 +18334,22 @@ def smtp_send_job(
                         "target_domain": target_domain,
                         "learning": recommendation,
                     })
+                    if sender_parallel_hard_mode:
+                        lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
+                        job.upsert_active_chunk(lane_id, {
+                            "chunk_id": int(chunk_idx_local),
+                            "sender_idx": int(sender_idx_fixed),
+                            "sender_mail": str(fe or ""),
+                            "receiver_domain": str(target_domain or ""),
+                            "size": int(len(chunk)),
+                            "status": "running",
+                            "attempt": int(attempt or 0),
+                            "next_retry": 0,
+                            "reason": "",
+                            "spam_score": (float(sc) if sc is not None else None),
+                            "blacklist": str(bl_detail or ""),
+                            "pmta_reason": str(pmta_reason or ""),
+                        })
 
                 if blocked:
                     attempt += 1
@@ -18343,7 +18374,7 @@ def smtp_send_job(
                             job.current_chunk_info = {}
                             if sender_parallel_hard_mode:
                                 lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
-                                job.active_chunks_info = [x for x in (job.active_chunks_info or []) if str(x.get("lane") or "") != lane_id]
+                                job.remove_active_chunk(lane_id)
                             job.current_chunk_domains = {}
                             job.push_chunk_state({
                                 "chunk": chunk_idx_local,
@@ -18416,6 +18447,22 @@ def smtp_send_job(
                         job.chunks_backoff += 1
                         job.push_backoff(entry)
                         job.push_chunk_state({**entry, "status": "backoff", "target_domain": target_domain})
+                        if sender_parallel_hard_mode:
+                            lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
+                            job.upsert_active_chunk(lane_id, {
+                                "chunk_id": int(chunk_idx_local),
+                                "sender_idx": int(sender_idx_fixed),
+                                "sender_mail": str(fe or ""),
+                                "receiver_domain": str(target_domain or ""),
+                                "size": int(len(chunk)),
+                                "status": "backoff",
+                                "attempt": int(attempt or 0),
+                                "next_retry": float(next_ts or 0),
+                                "reason": str(rtxt or ""),
+                                "spam_score": (float(sc) if sc is not None else None),
+                                "blacklist": str(bl_detail or ""),
+                                "pmta_reason": str(pmta_reason or ""),
+                            })
                     msg = (
                         f"Chunk {chunk_idx_local+1} [{target_domain}]: BACKOFF retry#{attempt} "
                         f"wait={int(wait_s)}s type={failure_type} ({rtxt}) trend={recommendation.get('provider_trend','unknown')}"
@@ -18578,7 +18625,7 @@ def smtp_send_job(
                     job.current_chunk_info = {}
                     if sender_parallel_hard_mode:
                         lane_id = f"{int(sender_idx_fixed)}|{str(target_domain or '').strip().lower()}"
-                        job.active_chunks_info = [x for x in (job.active_chunks_info or []) if str(x.get("lane") or "") != lane_id]
+                        job.remove_active_chunk(lane_id)
                     job.current_chunk_domains = {}
                     job.push_chunk_state({
                         "chunk": chunk_idx_local,
