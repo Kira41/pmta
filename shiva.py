@@ -9930,7 +9930,7 @@ PAGE_CONFIG = r"""
     .btn.secondary{ background: rgba(255,255,255,.08); }
     .btn.danger{ background: rgba(255,94,115,.18); }
 
-    input[type="text"], input[type="number"], input[type="password"], textarea{
+    input[type="text"], input[type="number"], input[type="password"], select, textarea{
       padding: 10px 12px;
       border-radius: 12px;
       border: 1px solid rgba(255,255,255,.16);
@@ -10020,6 +10020,9 @@ PAGE_CONFIG = r"""
       </div>
       <div class="right">
         <input class="q" id="q" type="text" placeholder="Search key or group..." />
+        <select id="groupFilter" title="Filter by group" style="min-width:220px">
+          <option value="">All groups</option>
+        </select>
         <div class="btnRow">
           <button class="btn secondary" type="button" id="btnReload">🔄 Reload</button>
           <button class="btn" type="button" id="btnSaveAll">💾 Save All</button>
@@ -10087,6 +10090,7 @@ PAGE_CONFIG = r"""
   function render(){
     const tb = document.getElementById('tb');
     const q = (document.getElementById('q')?.value || '').trim().toLowerCase();
+    const selectedGroup = (document.getElementById('groupFilter')?.value || '').trim();
 
     const rows = [];
     for(const it of ITEMS){
@@ -10099,6 +10103,7 @@ PAGE_CONFIG = r"""
 
       const hay = (key + ' ' + group + ' ' + desc).toLowerCase();
       if(q && !hay.includes(q)) continue;
+      if(selectedGroup && group !== selectedGroup) continue;
 
       const restart = !!it.restart_required;
       const restartPill = restart ? '<span class="pill bad">restart</span>' : '<span class="pill good">live</span>';
@@ -10241,8 +10246,15 @@ PAGE_CONFIG = r"""
       const r = await fetch('/api/config');
       const j = await r.json().catch(()=>({}));
       if(r.ok && j && j.ok){
+        const previousGroup = (document.getElementById('groupFilter')?.value || '').trim();
         ITEMS = j.items || [];
         document.getElementById('status').textContent = `Loaded ${ITEMS.length} keys · saved_overrides=${j.saved_overrides || 0}`;
+        const sel = document.getElementById('groupFilter');
+        if(sel){
+          const allGroups = Array.from(new Set(ITEMS.map(it => (it.group || 'Other').toString().trim() || 'Other'))).sort((a,b)=>a.localeCompare(b));
+          sel.innerHTML = `<option value="">All groups</option>` + allGroups.map(g => `<option value="${esc(g)}">${esc(g)}</option>`).join('');
+          if(previousGroup && allGroups.includes(previousGroup)) sel.value = previousGroup;
+        }
         CHANGED.clear();
         render();
         return;
@@ -10344,6 +10356,7 @@ This removes the UI override and falls back to ENV/default.`);
   document.getElementById('btnReload')?.addEventListener('click', load);
   document.getElementById('btnSaveAll')?.addEventListener('click', saveAll);
   document.getElementById('q')?.addEventListener('input', render);
+  document.getElementById('groupFilter')?.addEventListener('change', render);
 
   load();
 </script>
