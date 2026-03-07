@@ -3990,12 +3990,23 @@ def db_init() -> None:
                        job_id TEXT NOT NULL,
                        campaign_id TEXT NOT NULL,
                        rcpt TEXT NOT NULL,
+                       delivery_status TEXT NOT NULL DEFAULT 'not_yet',
+                       chunk_idx INTEGER NOT NULL DEFAULT -1,
+                       last_attempt_at TEXT NOT NULL DEFAULT '',
                        first_seen_at TEXT NOT NULL,
                        last_seen_at TEXT NOT NULL,
                        PRIMARY KEY(job_id, rcpt)
                    )"""
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_job_recipients_rcpt ON job_recipients(rcpt, last_seen_at)")
+
+            rcpt_cols = {str(r[1] or "") for r in conn.execute("PRAGMA table_info(job_recipients)").fetchall()}
+            if "delivery_status" not in rcpt_cols:
+                conn.execute("ALTER TABLE job_recipients ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'not_yet'")
+            if "chunk_idx" not in rcpt_cols:
+                conn.execute("ALTER TABLE job_recipients ADD COLUMN chunk_idx INTEGER NOT NULL DEFAULT -1")
+            if "last_attempt_at" not in rcpt_cols:
+                conn.execute("ALTER TABLE job_recipients ADD COLUMN last_attempt_at TEXT NOT NULL DEFAULT ''")
 
             # File offsets for PMTA accounting tailing
             conn.execute(
@@ -4453,6 +4464,11 @@ def db_set_outcome(job_id: str, rcpt: str, status: str, message_id: str = "", ds
         conn = _db_conn()
         try:
             _db_set_outcome_payload(conn, payload)
+            final_status = _normalize_recipient_delivery_status(st)
+            conn.execute(
+                "UPDATE job_recipients SET delivery_status=?, last_seen_at=? WHERE job_id=? AND rcpt=?",
+                (final_status, payload["updated_at"], jid, r),
+            )
             conn.commit()
         finally:
             conn.close()
@@ -11834,25 +11850,49 @@ def compute_sender_domain_states(domain_counts: Dict[str, int]) -> List[dict]:
     return out_items
 
 
-def db_mark_job_recipient(job_id: str, campaign_id: str, rcpt: str) -> None:
+def _normalize_recipient_delivery_status(status: str) -> str:
+    s = str(status or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if not s:
+        return "not_yet"
+    aliases = {
+        "notsending": "not_sending",
+        "notsent": "not_sent",
+        "yet": "not_yet",
+        "pending": "not_yet",
+        "queued": "not_yet",
+        "send": "sent",
+        "ok": "sent",
+        "defer": "deferred",
+        "backoff": "in_backoff",
+        "blocked": "in_backoff",
+    }
+    s = aliases.get(s, s)
+    if s in {"not_yet", "not_sending", "not_sent", "sending", "sent", "delivered", "bounced", "deferred", "complained", "in_backoff"}:
+        return s
+    return s
+
+
+def db_mark_job_recipient(job_id: str, campaign_id: str, rcpt: str, *, delivery_status: str = "sending", chunk_idx: int = -1) -> None:
     jid = (job_id or "").strip().lower()
     cid = (campaign_id or "").strip()
     em = (rcpt or "").strip().lower()
     if not jid or not em:
         return
     ts = now_iso()
+    status = _normalize_recipient_delivery_status(delivery_status)
+    chunk = int(chunk_idx) if str(chunk_idx).strip() else -1
     with DB_LOCK:
         conn = _db_conn()
         try:
             _exec_upsert_compat(
                 conn,
-                "INSERT INTO job_recipients(job_id, campaign_id, rcpt, first_seen_at, last_seen_at) VALUES(?,?,?,?,?) "
-                "ON CONFLICT(job_id, rcpt) DO UPDATE SET campaign_id=excluded.campaign_id, last_seen_at=excluded.last_seen_at",
-                (jid, cid, em, ts, ts),
-                "UPDATE job_recipients SET campaign_id=?, last_seen_at=? WHERE job_id=? AND rcpt=?",
-                (cid, ts, jid, em),
-                "INSERT INTO job_recipients(job_id, campaign_id, rcpt, first_seen_at, last_seen_at) VALUES(?,?,?,?,?)",
-                (jid, cid, em, ts, ts),
+                "INSERT INTO job_recipients(job_id, campaign_id, rcpt, delivery_status, chunk_idx, last_attempt_at, first_seen_at, last_seen_at) VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(job_id, rcpt) DO UPDATE SET campaign_id=excluded.campaign_id, delivery_status=excluded.delivery_status, chunk_idx=excluded.chunk_idx, last_attempt_at=excluded.last_attempt_at, last_seen_at=excluded.last_seen_at",
+                (jid, cid, em, status, chunk, ts, ts, ts),
+                "UPDATE job_recipients SET campaign_id=?, delivery_status=?, chunk_idx=?, last_attempt_at=?, last_seen_at=? WHERE job_id=? AND rcpt=?",
+                (cid, status, chunk, ts, ts, jid, em),
+                "INSERT INTO job_recipients(job_id, campaign_id, rcpt, delivery_status, chunk_idx, last_attempt_at, first_seen_at, last_seen_at) VALUES(?,?,?,?,?,?,?,?)",
+                (jid, cid, em, status, chunk, ts, ts, ts),
             )
             conn.commit()
         finally:
@@ -11886,13 +11926,13 @@ def db_seed_job_recipient_index(job_id: str, campaign_id: str, recipients: List[
             for rcpt in deduped:
                 _exec_upsert_compat(
                     conn,
-                    "INSERT INTO job_recipients(job_id, campaign_id, rcpt, first_seen_at, last_seen_at) VALUES(?,?,?,?,?) "
-                    "ON CONFLICT(job_id, rcpt) DO UPDATE SET campaign_id=excluded.campaign_id, last_seen_at=excluded.last_seen_at",
-                    (jid, cid, rcpt, ts, ts),
-                    "UPDATE job_recipients SET campaign_id=?, last_seen_at=? WHERE job_id=? AND rcpt=?",
-                    (cid, ts, jid, rcpt),
-                    "INSERT INTO job_recipients(job_id, campaign_id, rcpt, first_seen_at, last_seen_at) VALUES(?,?,?,?,?)",
-                    (jid, cid, rcpt, ts, ts),
+                    "INSERT INTO job_recipients(job_id, campaign_id, rcpt, delivery_status, chunk_idx, last_attempt_at, first_seen_at, last_seen_at) VALUES(?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(job_id, rcpt) DO UPDATE SET campaign_id=excluded.campaign_id, delivery_status=excluded.delivery_status, chunk_idx=excluded.chunk_idx, last_seen_at=excluded.last_seen_at",
+                    (jid, cid, rcpt, "not_yet", -1, "", ts, ts),
+                    "UPDATE job_recipients SET campaign_id=?, delivery_status=?, chunk_idx=?, last_seen_at=? WHERE job_id=? AND rcpt=?",
+                    (cid, "not_yet", -1, ts, jid, rcpt),
+                    "INSERT INTO job_recipients(job_id, campaign_id, rcpt, delivery_status, chunk_idx, last_attempt_at, first_seen_at, last_seen_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (jid, cid, rcpt, "not_yet", -1, "", ts, ts),
                 )
                 _db_set_outcome_payload(conn, {
                     "job_id": jid,
@@ -15790,7 +15830,7 @@ def smtp_send_job(
                     if not _wait_ready():
                         return
 
-                    db_mark_job_recipient(job_id, job.campaign_id or "", rcpt)
+                    db_mark_job_recipient(job_id, job.campaign_id or "", rcpt, delivery_status="sending", chunk_idx=chunk_idx)
 
                     msg = EmailMessage()
                     msg["From"] = formataddr((from_name, from_email))
@@ -15823,6 +15863,7 @@ def smtp_send_job(
                         server.send_message(msg)
                         with JOBS_LOCK:
                             job.sent += 1
+                            db_mark_job_recipient(job_id, job.campaign_id or "", rcpt, delivery_status="sent", chunk_idx=chunk_idx)
                             if dom:
                                 job.domain_sent[dom] = job.domain_sent.get(dom, 0) + 1
                             job.push_result(rcpt, True, f"sent (chunk={chunk_idx})")
