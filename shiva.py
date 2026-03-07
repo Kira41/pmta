@@ -5413,7 +5413,16 @@ def db_load_jobs_into_memory() -> None:
     with DB_LOCK:
         conn = _db_conn()
         try:
+            deleted_rows = conn.execute("SELECT job_id FROM deleted_jobs").fetchall()
             rows = conn.execute("SELECT snapshot FROM jobs ORDER BY created_at DESC").fetchall()
+            deleted_ids = {str(r[0] or "").strip() for r in (deleted_rows or []) if str(r[0] or "").strip()}
+
+            # Safety cleanup: if a row exists in both jobs and deleted_jobs,
+            # keep the tombstone as source-of-truth and purge the stale job row.
+            if deleted_ids:
+                placeholders = ",".join(["?"] * len(deleted_ids))
+                conn.execute(f"DELETE FROM jobs WHERE id IN ({placeholders})", tuple(deleted_ids))
+                conn.commit()
         finally:
             conn.close()
 
@@ -5424,7 +5433,7 @@ def db_load_jobs_into_memory() -> None:
         except Exception:
             continue
         job = _sendjob_from_snapshot(s)
-        if job and job.id and not job.deleted:
+        if job and job.id and not job.deleted and job.id not in deleted_ids:
             _sync_job_outcome_counters_from_db(job)
             loaded[job.id] = job
 
@@ -19000,11 +19009,12 @@ def api_job_delete(job_id: str):
             except Exception:
                 pass
 
-    # remove from DB
+    # remove from DB (must succeed before returning ok)
     try:
         db_delete_job(jid)
-    except Exception:
-        pass
+    except Exception as e:
+        app.logger.exception("job delete failed for %s", jid)
+        return jsonify({"ok": False, "error": f"delete failed: {e}"}), 500
 
     return jsonify({"ok": True})
 
