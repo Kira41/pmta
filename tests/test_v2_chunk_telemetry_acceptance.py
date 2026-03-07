@@ -278,3 +278,61 @@ def test_v2_runtime_assertion_flags_empty_live_rows_when_lanes_active(monkeypatc
     job._runtime_assert_v2_chunk_telemetry("second")
 
     assert int(job.v2_telemetry_assertions.get("active_chunks_stuck_empty") or 0) >= 1
+
+
+def test_v2_chunk_telemetry_structured_logs_can_be_enabled(monkeypatch):
+    monkeypatch.setenv("SHIVA_V2_CHUNK_TELEMETRY_LOGS", "1")
+    job = _new_v2_job("v2-log-flag")
+
+    job.begin_chunk_telemetry_v2(
+        lane_id="0|gmail.com",
+        chunk_id=777,
+        sender_idx=0,
+        sender_mail="s0@example.com",
+        target_domain="gmail.com",
+        attempt=0,
+        size=3,
+        chunk_size=3,
+        workers=1,
+        delay_s=0.1,
+        sleep_chunks=0.0,
+        body_format="text",
+        reply_to="",
+    )
+    job.update_chunk_preflight_v2(
+        lane_id="0|gmail.com",
+        chunk_id=777,
+        sender_idx=0,
+        sender_mail="s0@example.com",
+        target_domain="gmail.com",
+        attempt=0,
+        subject="sub",
+        body_variant=1,
+        spam_score=0.1,
+        blacklist="",
+    )
+    job.mark_chunk_done_v2(
+        lane_id="0|gmail.com",
+        chunk_id=777,
+        sender_idx=0,
+        sender_mail="s0@example.com",
+        target_domain="gmail.com",
+        attempt=0,
+        size=3,
+        subject="sub",
+        spam_score=0.2,
+        blacklist="",
+    )
+
+    events_blob = "\n".join(str(x.message) for x in (job.logs or []))
+    shiva._chunk_telemetry_payload(job)
+
+    events_blob = "\n".join(str(x.message) for x in (job.logs or []))
+    assert "begin_chunk_telemetry" in events_blob
+    assert "preflight_update" in events_blob
+    assert "active_chunk_upsert" in events_blob
+    assert "push_chunk_state" in events_blob
+    assert "remove_active_chunk" in events_blob
+    assert "counter_increment" in events_blob
+    assert "api_chunk_telemetry_serialization" in events_blob
+    assert '"job_id": "v2-log-flag"' in events_blob

@@ -3495,6 +3495,28 @@ class SendJob:
             "target_domain": str(target_domain or "").strip().lower(),
             "attempt": int(attempt or 0),
         }
+    def _v2_chunk_telemetry_logs_enabled(self) -> bool:
+        return bool(get_env_bool("SHIVA_V2_CHUNK_TELEMETRY_LOGS", False))
+    def _log_v2_chunk_telemetry(self, event: str, *, ident: Optional[dict] = None, status: str = "", extra: Optional[dict] = None) -> None:
+        if not self._v2_chunk_telemetry_logs_enabled():
+            return
+        idv = ident if isinstance(ident, dict) else {}
+        payload = {
+            "event": str(event or "v2_chunk_telemetry"),
+            "job_id": str(self.id or ""),
+            "lane_id": str(idv.get("lane_id") or ""),
+            "chunk_id": int(idv.get("chunk_id") or -1),
+            "target_domain": str(idv.get("target_domain") or ""),
+            "sender_mail": str(idv.get("sender_mail") or ""),
+            "attempt": int(idv.get("attempt") or 0),
+            "status": str(status or ""),
+        }
+        if isinstance(extra, dict) and extra:
+            payload.update(extra)
+        try:
+            self.log("INFO", f"v2_chunk_telemetry {json.dumps(payload, ensure_ascii=False, sort_keys=True)}")
+        except Exception:
+            pass
     def _v2_lane_runtime_active_count(self) -> int:
         runtime = self.debug_parallel_lanes_snapshot if isinstance(self.debug_parallel_lanes_snapshot, dict) else {}
         lanes = runtime.get("lanes") if isinstance(runtime.get("lanes"), dict) else {}
@@ -3599,6 +3621,18 @@ class SendJob:
             "pmta_reason": "",
             **ident,
         }
+        self._log_v2_chunk_telemetry(
+            "begin_chunk_telemetry",
+            ident=ident,
+            status="running",
+            extra={
+                "size": int(size or 0),
+                "chunk_size": int(chunk_size or 0),
+                "workers": int(workers or 0),
+                "delay_s": float(delay_s or 0.0),
+                "sleep_chunks": float(sleep_chunks or 0.0),
+            },
+        )
         self.upsert_active_chunk(str(lane_id or ""), {
             "chunk": int(chunk_id),
             "receiver_domain": str(target_domain or "").strip().lower(),
@@ -3611,6 +3645,7 @@ class SendJob:
             "pmta_reason": "",
             **ident,
         })
+        self._log_v2_chunk_telemetry("active_chunk_upsert", ident=ident, status="running")
         self._runtime_assert_v2_chunk_telemetry("begin_chunk")
     def update_chunk_preflight_v2(self, *, lane_id: str, chunk_id: int, sender_idx: int, sender_mail: str, target_domain: str, attempt: int, subject: str, body_variant: int, spam_score: Optional[float], blacklist: str, pmta_reason: str = "", reason: str = ""):
         self.updated_at = now_iso()
@@ -3635,6 +3670,17 @@ class SendJob:
             "reason": str(reason or ""),
             **ident,
         })
+        self._log_v2_chunk_telemetry(
+            "preflight_update",
+            ident=ident,
+            status="running",
+            extra={
+                "subject": str(subject or "")[:120],
+                "body_variant": int(body_variant or 0),
+                "reason": str(reason or ""),
+                "pmta_reason": str(pmta_reason or ""),
+            },
+        )
         self.upsert_active_chunk(str(lane_id or ""), {
             "chunk": int(chunk_id),
             "receiver_domain": str(target_domain or "").strip().lower(),
@@ -3645,6 +3691,7 @@ class SendJob:
             "pmta_reason": str(pmta_reason or ""),
             **ident,
         })
+        self._log_v2_chunk_telemetry("active_chunk_upsert", ident=ident, status="running")
     def mark_chunk_done_v2(self, *, lane_id: str, chunk_id: int, sender_idx: int, sender_mail: str, target_domain: str, attempt: int, size: int, subject: str, spam_score: Optional[float], blacklist: str):
         self.updated_at = now_iso()
         ident = self._chunk_identity_v2(
@@ -3656,7 +3703,14 @@ class SendJob:
             attempt=attempt,
         )
         self.chunks_done += 1
+        self._log_v2_chunk_telemetry(
+            "counter_increment",
+            ident=ident,
+            status="done_pending",
+            extra={"counter": "chunks_done", "value": int(self.chunks_done or 0)},
+        )
         self.remove_active_chunk(lane_id, chunk_id)
+        self._log_v2_chunk_telemetry("remove_active_chunk", ident=ident, status="done")
         done_status = "done" if int(attempt or 0) <= 0 else "done_after_backoff"
         self.push_chunk_state({
             "chunk": int(chunk_id),
@@ -3670,6 +3724,7 @@ class SendJob:
             "reason": "",
             **ident,
         })
+        self._log_v2_chunk_telemetry("push_chunk_state", ident=ident, status=done_status)
         self._runtime_assert_success_reflected(
             chunk_id=int(chunk_id),
             target_domain=str(target_domain or ""),
@@ -3692,6 +3747,12 @@ class SendJob:
             attempt=attempt,
         )
         self.chunks_backoff += 1
+        self._log_v2_chunk_telemetry(
+            "counter_increment",
+            ident=ident,
+            status="backoff_pending",
+            extra={"counter": "chunks_backoff", "value": int(self.chunks_backoff or 0)},
+        )
         backoff_entry = {
             "chunk": int(chunk_id),
             "size": int(size or 0),
@@ -3702,7 +3763,9 @@ class SendJob:
             **ident,
         }
         self.push_backoff(backoff_entry)
+        self._log_v2_chunk_telemetry("backoff_entry_created", ident=ident, status="backoff", extra={"next_retry_ts": int(next_retry_ts or 0), "reason": str(reason or "")})
         self.push_chunk_state({**backoff_entry, "status": "backoff"})
+        self._log_v2_chunk_telemetry("push_chunk_state", ident=ident, status="backoff")
         self.upsert_active_chunk(str(lane_id or ""), {
             "chunk": int(chunk_id),
             "receiver_domain": str(target_domain or "").strip().lower(),
@@ -3715,6 +3778,7 @@ class SendJob:
             "pmta_reason": str(pmta_reason or ""),
             **ident,
         })
+        self._log_v2_chunk_telemetry("active_chunk_upsert", ident=ident, status="backoff")
         self.current_chunk_info.update({
             "status": "backoff",
             "next_retry_ts": int(next_retry_ts or 0),
@@ -3734,8 +3798,21 @@ class SendJob:
             attempt=attempt,
         )
         self.chunks_abandoned += 1
+        self._log_v2_chunk_telemetry(
+            "counter_increment",
+            ident=ident,
+            status="abandoned_pending",
+            extra={"counter": "chunks_abandoned", "value": int(self.chunks_abandoned or 0)},
+        )
         self.chunks_done += 1
+        self._log_v2_chunk_telemetry(
+            "counter_increment",
+            ident=ident,
+            status="abandoned_pending",
+            extra={"counter": "chunks_done", "value": int(self.chunks_done or 0)},
+        )
         self.remove_active_chunk(lane_id, chunk_id)
+        self._log_v2_chunk_telemetry("remove_active_chunk", ident=ident, status="abandoned")
         self.push_chunk_state({
             "chunk": int(chunk_id),
             "status": "abandoned",
@@ -3749,6 +3826,7 @@ class SendJob:
             "pmta_reason": str(pmta_reason or ""),
             **ident,
         })
+        self._log_v2_chunk_telemetry("push_chunk_state", ident=ident, status="abandoned")
         if int(self.current_chunk or -1) == int(chunk_id):
             self.current_chunk = -1
             self.current_chunk_info = {}
@@ -19723,6 +19801,8 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "Max events included in scheduler_telemetry snapshot."},
     {"key": "SHIVA_UI_TELEMETRY_DEBUG", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Verbose UI telemetry debug logging for snapshot assembly."},
+    {"key": "SHIVA_V2_CHUNK_TELEMETRY_LOGS", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Emit temporary structured logs for V2 chunk telemetry lifecycle (chunk-level only)."},
     {"key": "SHIVA_LANE_ACCOUNTING_RECON", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Enable per-lane PMTA accounting reconciliation loop (ground-truth outcomes)."},
     {"key": "SHIVA_LANE_ACCOUNTING_RECON_INTERVAL_S", "type": "int", "default": "30", "group": "Scheduler", "restart_required": False,
@@ -20458,6 +20538,23 @@ def _normalize_chunk_row_for_api(row: Any, *, fallback_lane_id: str = "", fallba
 
 
 def _chunk_telemetry_payload(job: 'SendJob') -> dict:
+    try:
+        if bool(get_env_bool("SHIVA_V2_CHUNK_TELEMETRY_LOGS", False)):
+            current_info = getattr(job, "current_chunk_info", {}) if isinstance(getattr(job, "current_chunk_info", {}), dict) else {}
+            ident = {
+                "lane_id": str(current_info.get("lane_id") or ""),
+                "chunk_id": int(current_info.get("chunk_id") or current_info.get("chunk") or -1),
+                "target_domain": str(current_info.get("target_domain") or current_info.get("receiver_domain") or ""),
+                "sender_mail": str(current_info.get("sender_mail") or current_info.get("sender") or ""),
+                "attempt": int(current_info.get("attempt") or 0),
+            }
+            job._log_v2_chunk_telemetry(
+                "api_chunk_telemetry_serialization",
+                ident=ident,
+                status=str(current_info.get("status") or ""),
+            )
+    except Exception:
+        pass
     try:
         job._runtime_assert_v2_chunk_telemetry("api_payload")
     except Exception:
