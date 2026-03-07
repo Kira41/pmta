@@ -10216,6 +10216,7 @@ PAGE_CONFIG = r"""
     "Low Resource": {"PMTA_LIVE_POLL_S":"8","PMTA_DOMAINS_POLL_S":"10","PMTA_MONITOR_TIMEOUT_S":"2","PMTA_DOMAIN_STATS":"0","PMTA_PRESSURE_CONTROL":"0","PMTA_DIAG_ON_ERROR":"0"},
     "Balanced Monitoring": {"PMTA_DIAG_ON_ERROR":"1","PMTA_DIAG_RATE_S":"1.5","PMTA_DOMAIN_STATS":"1","PMTA_DOMAINS_POLL_S":"4","PMTA_PRESSURE_CONTROL":"1","PMTA_PRESSURE_POLL_S":"3"},
     "Bulk Throughput": {"SHIVA_LANE_CONCURRENCY":"1","SHIVA_MAX_PARALLEL_LANES":"8","SHIVA_LANE_V2_MAX_SCAN":"120","PMTA_SLOW_WORKERS_MAX":"8","PMTA_SLOW_DELAY_S":"0.08","PMTA_DOMAIN_CHECK_TOP_N":"1"},
+    "V2 Parallel Sand": {"SHIVA_SCHEDULER_MODE":"v2","SHIVA_LANE_CONCURRENCY":"1","SHIVA_MULTI_PROVIDER_PARALLEL_SENDERS":"1","SHIVA_MULTI_PROVIDER_PARALLEL_ALLOW_SINGLE_PROVIDER":"1","SHIVA_MAX_PARALLEL_LANES":"8","SHIVA_MAX_TOTAL_LANES":"8","SHIVA_RESOURCE_GOVERNOR":"1","SHIVA_MAX_TOTAL_WORKERS":"40","SHIVA_WORKER_RESERVE_MODE":"workers","SHIVA_FALLBACK_CONTROLLER":"1","SHIVA_CONCURRENCY_STOP_GRACE_S":"30","SHIVA_CONCURRENCY_STOP_FORCE_DISABLE":"1","SHIVA_SINGLE_DOMAIN_WAVES":"0"},
     "Single Domain Safe": {"SHIVA_SINGLE_DOMAIN_WAVES":"1","SHIVA_SINGLE_DOMAIN_ONLY_IF_PROVIDERS_EQ":"1","SHIVA_WAVE_BURST_TOKENS":"250","SHIVA_WAVE_REFILL_PER_SEC":"2.0","PMTA_QUEUE_BACKOFF":"1","SHIVA_DISABLE_BACKOFF":"0"},
     "Learning Enforced": {"SHIVA_LEARNING_CAPS":"1","SHIVA_LEARNING_CAPS_ENFORCE":"1","SHIVA_POLICY_PACKS":"1","SHIVA_POLICY_PACKS_ENFORCE":"1","SHIVA_PROVIDER_CANON":"1","SHIVA_PROVIDER_CANON_ENFORCE":"1"},
     "Legacy Compatibility": {"SHIVA_SCHEDULER_MODE":"legacy","SHIVA_LANE_CONCURRENCY":"0","SHIVA_RESOURCE_GOVERNOR":"0","SHIVA_POLICY_PACKS":"0","SHIVA_SINGLE_DOMAIN_WAVES":"0","SHIVA_LEARNING_CAPS":"0"}
@@ -10225,7 +10226,8 @@ PAGE_CONFIG = r"""
     "Extra Fast": "⚠️ كلما زادت سرعة الإرسال قلّ أمان الـ IP والدومين وزاد خطر الـ blacklist والرفض من الـ providers.",
     "Very Fast": "⚠️ هذا المود عالي السرعة ويقلل عوامل الحماية والـ checks.",
     "No Check Blacklist": "⚠️ تم تعطيل فحص الـ blacklist بالكامل (RBL/DBL).",
-    "No Monitoring": "⚠️ تم تعطيل/تقليل المراقبة؛ قد لا ترى المشاكل مبكرًا."
+    "No Monitoring": "⚠️ تم تعطيل/تقليل المراقبة؛ قد لا ترى المشاكل مبكرًا.",
+    "V2 Parallel Sand": "يشغّل مسار v2 المتوازي مع governor وfallback safeguards لتهيئة الإرسال parallel بأمان تشغيلي."
   };
 
   function pill(source){
