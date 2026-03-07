@@ -2942,11 +2942,8 @@ class ModeOrchestrator:
         elif not force_legacy and effective_mode in {"v2"}:
             scheduler_mode = "v2"
 
-        # Decision layer is unified: v2 means parallel-first.
-        concurrency_enabled = bool(
-            scheduler_mode == "v2"
-            and not bool(cfg.get("force_disable_concurrency"))
-        )
+        # v2 bypass: decision layer is parallel-first and ignores legacy force-disable concurrency flags.
+        concurrency_enabled = bool(scheduler_mode == "v2")
 
         provider_canon_enabled = bool(cfg.get("provider_canon_enabled"))
         provider_canon_enforced = bool(provider_canon_enabled and cfg.get("provider_canon_enforce"))
@@ -3028,6 +3025,7 @@ def _shadow_state_counts(sender_buckets: Dict[int, Dict[str, List[str]]], provid
 
 def _should_enable_multi_provider_parallel(
     *,
+    scheduler_mode: str = "legacy",
     flag_enabled: bool,
     sender_count: int,
     provider_domain_count: int,
@@ -3048,11 +3046,20 @@ def _should_enable_multi_provider_parallel(
 
     reason = "enabled"
     enabled = True
+    scheduler_mode_norm = str(scheduler_mode or "legacy").strip().lower() or "legacy"
+    if scheduler_mode_norm == "v2":
+        # v2 bypass: sender-driven parallel must not depend on provider-count/legacy flags.
+        enabled = sender_count > 0
+        reason = "scheduler_mode_v2" if enabled else "insufficient_senders"
+        allow_single_provider = True
+        effective_parallel_lanes = max(1, min(int(target_lane_count), safe_parallel_cap))
     if bool(sender_parallel_hard_mode):
         enabled = sender_count > 0
         reason = "forced_by_SHIVA_MULTI_PROVIDER_PARALLEL_SENDERS" if enabled else "insufficient_senders"
         allow_single_provider = True
         effective_parallel_lanes = max(1, sender_count)
+    elif scheduler_mode_norm == "v2":
+        pass
     elif not bool(flag_enabled):
         enabled = False
         reason = "feature_flag_off"
@@ -16403,6 +16410,10 @@ def smtp_send_job(
                 elif field_name == "plan.resource_governor_enabled":
                     mode_plan.resource_governor_enabled = bool(after_v)
         scheduler_mode_runtime = str(mode_plan.scheduler_mode)
+        # v2 bypass: ignore legacy force-disable switch; v2 remains parallel-first unless fatal/stop.
+        if scheduler_mode_runtime == "v2" and force_disable_concurrency:
+            with JOBS_LOCK:
+                job.log("INFO", "v2 bypass: ignored force_disable_concurrency guard")
         lane_concurrency_runtime = bool(mode_plan.concurrency_enabled)
         probe_mode_enabled = bool(mode_plan.probe_enabled)
         single_domain_waves_enabled = bool(mode_plan.waves_enabled)
@@ -16430,6 +16441,9 @@ def smtp_send_job(
         ) if (lane_v2_rollout_enabled or shadow_mode_active or scheduler_mode == "v2") else None
         shadow_recorder = ShadowRecorder(shadow_max_events) if shadow_mode_active else None
         lane_parallel_limit_runtime = min(int(lane_max_parallel), int(max_total_lanes)) if resource_governor_enabled else int(lane_max_parallel)
+        if scheduler_mode_runtime == "v2":
+            # v2 bypass: keep sender-parallel fanout from collapsing into sequential-by-cap.
+            lane_parallel_limit_runtime = max(2, int(lane_parallel_limit_runtime), min(int(max_total_lanes), max(2, len(sender_emails))))
         resource_governor = GlobalResourceGovernor(
             max_total_workers=max_total_workers,
             debug=resource_governor_debug,
@@ -16546,12 +16560,22 @@ def smtp_send_job(
         if effective_parallel:
             lane_concurrency_runtime = True
             lane_parallel_limit_runtime = int(multi_provider_parallel_runtime.get("effective_parallel_lanes") or 1)
+            if lane_parallel_limit_runtime <= 1 and len(sender_emails) > 1:
+                # v2 bypass: do not allow single-domain/provider heuristics to collapse runtime lanes to 1.
+                lane_parallel_limit_runtime = max(2, min(int(max_total_lanes), len(sender_emails)))
+                with JOBS_LOCK:
+                    job.log("INFO", "v2 bypass: raised lane_parallel_limit_runtime above sequential floor")
         with JOBS_LOCK:
             job.debug_multi_provider_parallel = dict(multi_provider_parallel_runtime)
         single_provider_domain = str(probe_provider_domains[0] or "").strip().lower() if provider_domain_count == 1 else ""
         wave_mode_active = bool(single_domain_waves_enabled)
         if single_domain_only_if_providers_eq:
             wave_mode_active = bool(wave_mode_active and provider_domain_count == 1)
+        if scheduler_mode_runtime == "v2" and wave_mode_active:
+            # v2 bypass: disable single-domain wave gating that can force sequential pacing.
+            wave_mode_active = False
+            with JOBS_LOCK:
+                job.log("INFO", "v2 bypass: disabled single-domain wave pacing guard")
         wave_controller = WaveController(
             enabled=wave_mode_active,
             provider_domain=single_provider_domain,
@@ -16617,6 +16641,11 @@ def smtp_send_job(
         fallback_controller_runtime = bool(fallback_controller_enabled)
         if sender_parallel_hard_mode:
             fallback_controller_runtime = False
+        if scheduler_mode_runtime == "v2":
+            # v2 bypass: disable heuristic fallback controller actions that auto-disable parallel execution.
+            fallback_controller_runtime = False
+            with JOBS_LOCK:
+                job.log("INFO", "v2 bypass: fallback controller heuristics disabled")
         fallback_thresholds = {
             "deferral_rate": fallback_deferral_rate,
             "hardfail_rate": fallback_hardfail_rate,
@@ -16673,6 +16702,11 @@ def smtp_send_job(
 
         def _switch_scheduler_legacy() -> None:
             nonlocal scheduler_mode_runtime
+            if scheduler_mode_runtime == "v2":
+                # v2 bypass: never auto-switch to legacy unless an explicit fatal-stop path does it.
+                with JOBS_LOCK:
+                    job.log("INFO", "v2 bypass: ignored switch_scheduler_legacy fallback action")
+                return
             if scheduler_mode_runtime != "legacy":
                 scheduler_mode_runtime = "legacy"
                 with JOBS_LOCK:
@@ -16680,6 +16714,14 @@ def smtp_send_job(
 
         def _disable_concurrency_runtime() -> None:
             nonlocal lane_concurrency_runtime
+            nonlocal lane_parallel_limit_runtime
+            if scheduler_mode_runtime == "v2":
+                # v2 bypass: keep sender-parallel active; only fatal/stop paths may fully stop the job.
+                lane_concurrency_runtime = True
+                lane_parallel_limit_runtime = max(2, int(lane_parallel_limit_runtime or 2), min(int(max_total_lanes), max(2, len(sender_emails))))
+                with JOBS_LOCK:
+                    job.log("INFO", "v2 bypass: ignored disable_concurrency fallback action")
+                return
             if lane_concurrency_runtime:
                 lane_concurrency_runtime = False
                 lane_parallel_limit_runtime = 1
@@ -16821,7 +16863,12 @@ def smtp_send_job(
                         if budget_mgr and budget_config.apply_to_retry:
                             allowed2, _reason2 = _budget_can_start(lane_key2, now_ts, True, False, planned_chunk_size_hint=cs)
                             if not allowed2:
-                                continue
+                                if scheduler_mode_runtime == "v2":
+                                    # v2 bypass: soft-ignore non-fatal budget retry denials to preserve parallel-first behavior.
+                                    with JOBS_LOCK:
+                                        job.log("INFO", f"v2 bypass: ignored budget retry denial lane={lane_key2[0]}|{lane_key2[1]} reason={_reason2}")
+                                else:
+                                    continue
                         sender_cursor = (sender_idx2 + 1) % n
                         return sender_idx2, dom2
             return None
@@ -16837,7 +16884,12 @@ def smtp_send_job(
                     if budget_mgr:
                         allowed_legacy, _reason_legacy = _budget_can_start(lane_key, now_ts, False, False, planned_chunk_size_hint=cs)
                         if not allowed_legacy:
-                            continue
+                            if scheduler_mode_runtime == "v2":
+                                # v2 bypass: ignore non-fatal budget gating in sequential-picker path.
+                                with JOBS_LOCK:
+                                    job.log("INFO", f"v2 bypass: ignored budget gate lane={lane_key[0]}|{lane_key[1]} reason={_reason_legacy}")
+                            else:
+                                continue
                     weighted_legacy.append((d, len(v)))
                 if not weighted_legacy:
                     return None
@@ -16860,7 +16912,12 @@ def smtp_send_job(
                 if budget_mgr:
                     allowed, _reason = _budget_can_start(lane_key, now_ts, False, False, planned_chunk_size_hint=cs)
                     if not allowed:
-                        continue
+                        if scheduler_mode_runtime == "v2":
+                            # v2 bypass: ignore non-fatal budget gating in main lane-pick path.
+                            with JOBS_LOCK:
+                                job.log("INFO", f"v2 bypass: ignored budget gate lane={lane_key[0]}|{lane_key[1]} reason={_reason}")
+                        else:
+                            continue
                 if _is_lane_temporarily_blocked(lane_key, now_ts):
                     continue
                 lane_mul = _lane_weight_multiplier(lane_key)
@@ -17223,7 +17280,14 @@ def smtp_send_job(
                     if learning_caps_enforce:
                         if isinstance(suggested_inflight, int):
                             baseline_inflight = budget_mgr.provider_max_inflight(provider_domain)
-                            budget_mgr.set_provider_max_inflight_override(provider_domain, min(baseline_inflight, int(suggested_inflight)))
+                            if scheduler_mode_runtime == "v2":
+                                # v2 bypass: keep a minimum inflight floor so policy suggestions don't force sequential execution.
+                                v2_floor = min(int(max_total_lanes), max(2, len(sender_emails)))
+                                budget_mgr.set_provider_max_inflight_override(provider_domain, max(v2_floor, min(baseline_inflight, int(suggested_inflight))))
+                                with JOBS_LOCK:
+                                    job.log("INFO", f"v2 bypass: guarded provider_max_inflight floor for {provider_domain}")
+                            else:
+                                budget_mgr.set_provider_max_inflight_override(provider_domain, min(baseline_inflight, int(suggested_inflight)))
                         if isinstance(suggested_min_gap, (int, float)):
                             prev_gap = float(budget_config.provider_min_gap_s_map.get(provider_domain, budget_config.provider_min_gap_s_default))
                             budget_config.provider_min_gap_s_map[provider_domain] = max(prev_gap, float(suggested_min_gap))
