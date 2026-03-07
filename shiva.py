@@ -10004,7 +10004,26 @@ PAGE_CONFIG = r"""
       const id = 'v_' + key.replaceAll(/[^a-zA-Z0-9_]/g, '_');
       const cur = (it.value ?? '');
 
-      if(t === 'bool'){
+      if(key === 'SHIVA_ROLLOUT_MODE'){
+        const on = String(cur || '').trim().toLowerCase() !== 'off';
+        inp = `<label class="mini" style="display:flex; gap:10px; align-items:center; margin:0">
+          <input id="${esc(id)}" data-k="${esc(key)}" data-type="rollout_toggle" type="checkbox" ${on ? 'checked' : ''} />
+          <span>${on ? 'on' : 'off'}</span>
+        </label>`;
+      } else if(key === 'SHIVA_SCHEDULER_MODE'){
+        const mode = String(cur || '').trim().toLowerCase();
+        const picked = (mode === 'lane_v2' || mode === 'legacy') ? mode : 'legacy';
+        inp = `<div class="mini" style="display:flex; flex-direction:column; gap:8px; margin:0">
+          <label style="display:flex; gap:8px; align-items:center; margin:0">
+            <input name="${esc(id)}" data-k="${esc(key)}" data-type="scheduler_mode" type="radio" value="lane_v2" ${picked === 'lane_v2' ? 'checked' : ''} />
+            <span>line v2</span>
+          </label>
+          <label style="display:flex; gap:8px; align-items:center; margin:0">
+            <input name="${esc(id)}" data-k="${esc(key)}" data-type="scheduler_mode" type="radio" value="legacy" ${picked === 'legacy' ? 'checked' : ''} />
+            <span>legacy</span>
+          </label>
+        </div>`;
+      } else if(t === 'bool'){
         const checked = (String(cur) === '1' || String(cur).toLowerCase() === 'true' || String(cur).toLowerCase() === 'yes' || String(cur).toLowerCase() === 'on');
         inp = `<label class="mini" style="display:flex; gap:10px; align-items:center; margin:0">
           <input id="${esc(id)}" data-k="${esc(key)}" data-type="bool" type="checkbox" ${checked ? 'checked' : ''} />
@@ -10055,25 +10074,31 @@ PAGE_CONFIG = r"""
     tb.innerHTML = rows.join('') || `<tr><td colspan="5" class="mini">No matches.</td></tr>`;
 
     // bind input changes
+    function valueFromInput(el){
+      const t = el.getAttribute('data-type');
+      if(t === 'bool') return el.checked ? '1' : '0';
+      if(t === 'rollout_toggle') return el.checked ? 'on' : 'off';
+      if(t === 'scheduler_mode'){
+        const selected = tb.querySelector(`input[data-k="${CSS.escape(el.getAttribute('data-k') || '')}"][data-type="scheduler_mode"]:checked`);
+        return (selected?.value ?? 'legacy').toString();
+      }
+      return (el.value ?? '').toString();
+    }
+
     tb.querySelectorAll('input[data-k], textarea[data-k]').forEach(el => {
-      el.addEventListener('input', () => {
+      const applyChanged = () => {
         const k = el.getAttribute('data-k');
         const t = el.getAttribute('data-type');
-        let v = '';
-        if(t === 'bool') v = el.checked ? '1' : '0';
-        else v = (el.value ?? '').toString();
+        const v = valueFromInput(el);
         CHANGED.set(k, {value: v, type: t});
+        if(t === 'rollout_toggle'){
+          const lbl = el.closest('label')?.querySelector('span');
+          if(lbl) lbl.textContent = el.checked ? 'on' : 'off';
+        }
         document.getElementById('status').textContent = `Changed: ${CHANGED.size}`;
-      });
-      el.addEventListener('change', () => {
-        const k = el.getAttribute('data-k');
-        const t = el.getAttribute('data-type');
-        let v = '';
-        if(t === 'bool') v = el.checked ? '1' : '0';
-        else v = (el.value ?? '').toString();
-        CHANGED.set(k, {value: v, type: t});
-        document.getElementById('status').textContent = `Changed: ${CHANGED.size}`;
-      });
+      };
+      el.addEventListener('input', applyChanged);
+      el.addEventListener('change', applyChanged);
     });
 
     // bind actions
@@ -10116,7 +10141,11 @@ PAGE_CONFIG = r"""
     const t = el.getAttribute('data-type');
     let v = '';
     if(t === 'bool') v = el.checked ? '1' : '0';
-    else v = (el.value ?? '').toString();
+    else if(t === 'rollout_toggle') v = el.checked ? 'on' : 'off';
+    else if(t === 'scheduler_mode'){
+      const selected = row.querySelector('input[data-k][data-type="scheduler_mode"]:checked');
+      v = (selected?.value ?? 'legacy').toString();
+    } else v = (el.value ?? '').toString();
     return {key, value: v};
   }
 
