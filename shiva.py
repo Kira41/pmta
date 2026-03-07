@@ -3022,6 +3022,49 @@ def _shadow_state_counts(sender_buckets: Dict[int, Dict[str, List[str]]], provid
     return {"sender_bucket_total": int(bucket_total), "retry_queue_total": int(retry_total)}
 
 
+def _should_enable_multi_provider_parallel(
+    *,
+    flag_enabled: bool,
+    sender_count: int,
+    provider_domain_count: int,
+    lane_parallel_limit: int,
+    force_disable_concurrency: bool,
+    fallback_disable_concurrency: bool = False,
+) -> dict:
+    """Decide whether sender-parallel inter-lane mode should be active for this job."""
+    sender_count = max(0, int(sender_count or 0))
+    provider_domain_count = max(0, int(provider_domain_count or 0))
+    safe_parallel_cap = max(1, int(lane_parallel_limit or 1))
+    effective_parallel_lanes = max(1, min(sender_count if sender_count > 0 else 1, safe_parallel_cap))
+
+    reason = "enabled"
+    enabled = True
+    if not bool(flag_enabled):
+        enabled = False
+        reason = "feature_flag_off"
+    elif bool(force_disable_concurrency):
+        enabled = False
+        reason = "force_disable_concurrency"
+    elif bool(fallback_disable_concurrency):
+        enabled = False
+        reason = "fallback_disable_concurrency"
+    elif sender_count <= 1:
+        enabled = False
+        reason = "insufficient_senders"
+    elif provider_domain_count <= 1:
+        enabled = False
+        reason = "single_provider"
+
+    return {
+        "enabled": bool(enabled),
+        "reason": str(reason),
+        "sender_count": int(sender_count),
+        "provider_domain_count": int(provider_domain_count),
+        "effective_parallel_lanes": int(effective_parallel_lanes),
+        "fallback_to_sequential": not bool(enabled),
+    }
+
+
 def _run_rollout_selftests() -> List[str]:
     logs: List[str] = []
     rcpts = [f"user{i}@gmail.com" for i in range(12)] + [f"user{i}@yahoo.com" for i in range(9)]
@@ -3226,6 +3269,7 @@ class SendJob:
     debug_probe_status: dict = field(default_factory=dict)
     debug_budget_status: dict = field(default_factory=dict)
     debug_lane_executor: dict = field(default_factory=dict)
+    debug_multi_provider_parallel: dict = field(default_factory=dict)
     debug_resource_governor: dict = field(default_factory=dict)
     debug_fallback: dict = field(default_factory=dict)
     debug_provider_canon: dict = field(default_factory=dict)
@@ -4278,6 +4322,7 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "debug_probe_status": job.debug_probe_status or {},
         "debug_budget_status": job.debug_budget_status or {},
         "debug_lane_executor": job.debug_lane_executor or {},
+        "debug_multi_provider_parallel": job.debug_multi_provider_parallel or {},
         "debug_resource_governor": job.debug_resource_governor or {},
         "debug_fallback": job.debug_fallback or {},
         "debug_provider_canon": job.debug_provider_canon or {},
@@ -5320,6 +5365,7 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job.debug_probe_status = (s.get("debug_probe_status") if isinstance(s.get("debug_probe_status"), dict) else {}) or {}
         job.debug_budget_status = (s.get("debug_budget_status") if isinstance(s.get("debug_budget_status"), dict) else {}) or {}
         job.debug_lane_executor = (s.get("debug_lane_executor") if isinstance(s.get("debug_lane_executor"), dict) else {}) or {}
+        job.debug_multi_provider_parallel = (s.get("debug_multi_provider_parallel") if isinstance(s.get("debug_multi_provider_parallel"), dict) else {}) or {}
         job.debug_resource_governor = (s.get("debug_resource_governor") if isinstance(s.get("debug_resource_governor"), dict) else {}) or {}
         job.debug_fallback = (s.get("debug_fallback") if isinstance(s.get("debug_fallback"), dict) else {}) or {}
         job.debug_provider_canon = (s.get("debug_provider_canon") if isinstance(s.get("debug_provider_canon"), dict) else {}) or {}
@@ -15281,6 +15327,7 @@ def smtp_send_job(
     lane_v2_use_soft_bias = bool(get_env_bool("SHIVA_LANE_V2_USE_SOFT_BIAS", True))
     lane_v2_max_scan = max(1, int(get_env_int("SHIVA_LANE_V2_MAX_SCAN", 50)))
     lane_concurrency_enabled = bool(get_env_bool("SHIVA_LANE_CONCURRENCY", False))
+    multi_provider_parallel_senders_flag = bool(get_env_bool("SHIVA_MULTI_PROVIDER_PARALLEL_SENDERS", False))
     lane_max_parallel = max(1, int(get_env_int("SHIVA_MAX_PARALLEL_LANES", 5)))
     lane_task_timeout_s = max(30, int(get_env_int("SHIVA_LANE_TASK_TIMEOUT_S", 900)))
     lane_concurrency_debug = bool(get_env_bool("SHIVA_LANE_CONCURRENCY_DEBUG", False))
@@ -16428,6 +16475,28 @@ def smtp_send_job(
             if str(d or "").strip() and int(cnt or 0) > 0
         ]
         provider_domain_count = len(set(probe_provider_domains))
+        multi_provider_parallel_runtime = _should_enable_multi_provider_parallel(
+            flag_enabled=multi_provider_parallel_senders_flag,
+            sender_count=len(sender_emails),
+            provider_domain_count=provider_domain_count,
+            lane_parallel_limit=lane_parallel_limit_runtime,
+            force_disable_concurrency=force_disable_concurrency,
+            fallback_disable_concurrency=False,
+        )
+        if multi_provider_parallel_runtime.get("enabled"):
+            lane_concurrency_runtime = True
+            lane_parallel_limit_runtime = int(multi_provider_parallel_runtime.get("effective_parallel_lanes") or 1)
+        with JOBS_LOCK:
+            job.debug_multi_provider_parallel = dict(multi_provider_parallel_runtime)
+            if bool(multi_provider_parallel_runtime.get("enabled")):
+                job.log(
+                    "INFO",
+                    f"Multi-provider parallel senders enabled: senders={int(multi_provider_parallel_runtime.get('sender_count') or 0)} "
+                    f"providers={int(multi_provider_parallel_runtime.get('provider_domain_count') or 0)} "
+                    f"effective_parallel_lanes={int(multi_provider_parallel_runtime.get('effective_parallel_lanes') or 1)}",
+                )
+            else:
+                job.log("INFO", f"Multi-provider parallel senders disabled: {str(multi_provider_parallel_runtime.get('reason') or 'unknown')}")
         single_provider_domain = str(probe_provider_domains[0] or "").strip().lower() if provider_domain_count == 1 else ""
         wave_mode_active = bool(single_domain_waves_enabled)
         if single_domain_only_if_providers_eq:
@@ -16544,6 +16613,7 @@ def smtp_send_job(
                 "is_shadow": bool(shadow_mode_active),
                 "force_legacy": bool(force_legacy),
                 "force_disable_concurrency": bool(force_disable_concurrency),
+                "multi_provider_parallel": dict(getattr(job, "debug_multi_provider_parallel", {}) or {}),
             }
             if mode_plan.ui_telemetry_enabled:
                 job.debug_effective_plan = asdict(mode_plan)
@@ -16669,6 +16739,10 @@ def smtp_send_job(
                 next_ts = float(retries[0].get("next_retry_ts") or 0.0)
                 waits.append(max(0.0, next_ts - now_ts))
             return min(waits) if waits else None
+
+        def _pending_retry_lanes_count(now_ts: Optional[float] = None) -> int:
+            _ = now_ts
+            return sum(1 for q in provider_retry_chunks.values() if q)
 
         def _pick_retry_ready_sender_domain(now_ts: float) -> Optional[Tuple[int, str]]:
             nonlocal sender_cursor
@@ -16822,6 +16896,11 @@ def smtp_send_job(
 
         while _remaining_total() > 0:
             _tick_accounting_recon(time.time())
+            with JOBS_LOCK:
+                mp = dict(getattr(job, "debug_multi_provider_parallel", {}) or {})
+                mp["pending_retry_lanes_count"] = int(_pending_retry_lanes_count(time.time()))
+                mp["active_inflight_lane_count"] = int(len((getattr(job, "debug_lane_executor", {}) or {}).get("inflight_lanes") or []))
+                job.debug_multi_provider_parallel = mp
             if not _wait_ready():
                 _stop_job("stop requested")
                 return
@@ -17958,6 +18037,8 @@ APP_CONFIG_SCHEMA: List[dict] = [
      "desc": "Maximum domains scanned per sender during LanePickerV2 weighted candidate build."},
     {"key": "SHIVA_LANE_CONCURRENCY", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
      "desc": "Enable concurrent lane executor for inter-lane chunk scheduling (requires lane_v2 mode)."},
+    {"key": "SHIVA_MULTI_PROVIDER_PARALLEL_SENDERS", "type": "bool", "default": "0", "group": "Scheduler", "restart_required": False,
+     "desc": "Enable sender-parallel inter-lane execution only when multiple recipient domains/providers are present."},
     {"key": "SHIVA_MAX_PARALLEL_LANES", "type": "int", "default": "5", "group": "Scheduler", "restart_required": False,
      "desc": "Maximum in-flight lane tasks allowed by concurrent lane executor."},
     {"key": "SHIVA_LANE_TASK_TIMEOUT_S", "type": "int", "default": "900", "group": "Scheduler", "restart_required": False,
@@ -18746,6 +18827,7 @@ def build_scheduler_telemetry_snapshot(job: 'SendJob') -> dict:
     last_caps = getattr(job, "debug_last_caps_resolve", {}) or {}
     probe_status = getattr(job, "debug_probe_status", {}) or {}
     accounting_recon = getattr(job, "debug_lane_accounting", {}) or {}
+    multi_parallel = getattr(job, "debug_multi_provider_parallel", {}) or {}
 
     lane_rows: List[dict] = []
     metrics_lanes = (lane_metrics.get("lanes") if isinstance(lane_metrics, dict) else {}) or {}
@@ -18869,6 +18951,16 @@ def build_scheduler_telemetry_snapshot(job: 'SendJob') -> dict:
             "enabled": bool(lane_executor),
             "inflight_lanes": inflight_list[:max_lanes],
             "recent_completions": recent_completions,
+        },
+        "multi_provider_parallel": {
+            "enabled": bool(multi_parallel.get("enabled") or False),
+            "reason": str(multi_parallel.get("reason") or ""),
+            "sender_count": int(multi_parallel.get("sender_count") or 0),
+            "provider_domain_count": int(multi_parallel.get("provider_domain_count") or 0),
+            "effective_parallel_lanes": int(multi_parallel.get("effective_parallel_lanes") or 1),
+            "fallback_to_sequential": bool(multi_parallel.get("fallback_to_sequential") or False),
+            "active_inflight_lane_count": int(len(inflight_list)),
+            "pending_retry_lanes_count": int(multi_parallel.get("pending_retry_lanes_count") or 0),
         },
         "events": {
             "fallback_reasons": fallback_reasons,
