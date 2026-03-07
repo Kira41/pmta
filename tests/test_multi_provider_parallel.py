@@ -7,6 +7,7 @@ def test_multi_provider_parallel_disabled_by_flag():
         sender_count=5,
         provider_domain_count=3,
         lane_parallel_limit=8,
+        allow_single_provider=False,
         force_disable_concurrency=False,
     )
     assert out["enabled"] is False
@@ -20,6 +21,7 @@ def test_multi_provider_parallel_disabled_for_single_provider():
         sender_count=5,
         provider_domain_count=1,
         lane_parallel_limit=8,
+        allow_single_provider=False,
         force_disable_concurrency=False,
     )
     assert out["enabled"] is False
@@ -32,6 +34,7 @@ def test_multi_provider_parallel_enabled_and_capped_by_lane_limit():
         sender_count=5,
         provider_domain_count=3,
         lane_parallel_limit=2,
+        allow_single_provider=False,
         force_disable_concurrency=False,
     )
     assert out["enabled"] is True
@@ -45,7 +48,23 @@ def test_multi_provider_parallel_force_disabled():
         sender_count=5,
         provider_domain_count=3,
         lane_parallel_limit=8,
+        allow_single_provider=False,
         force_disable_concurrency=True,
     )
     assert out["enabled"] is False
     assert out["reason"] == "force_disable_concurrency"
+
+
+def test_multi_provider_parallel_enabled_for_single_provider_when_allowed():
+    out = shiva._should_enable_multi_provider_parallel(
+        flag_enabled=True,
+        sender_count=4,
+        provider_domain_count=1,
+        lane_parallel_limit=8,
+        allow_single_provider=True,
+        force_disable_concurrency=False,
+    )
+    assert out["enabled"] is True
+    assert out["reason"] == "enabled"
+    assert out["effective_parallel_lanes"] == 4
+    assert out["allow_single_provider"] is True
