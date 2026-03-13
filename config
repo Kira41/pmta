@@ -132,7 +132,7 @@ http-access 0.0.0.0/0 monitor
     domain-key dkim,101crossroadsstudio.com,/root/101crossroadsstudio.com/dkim.pem
     <domain *>
         max-cold-virtual-mta-msg 400/day
-        max-msg-rate 1000/h
+        max-msg-rate 10000/h
     </domain>
 </virtual-mta>
 
@@ -142,7 +142,7 @@ http-access 0.0.0.0/0 monitor
     domain-key dkim,adspoof.com,/root/adspoof.com/dkim.pem
     <domain *>
         max-cold-virtual-mta-msg 400/day
-        max-msg-rate 1000/h
+        max-msg-rate 10000/h
     </domain>
 </virtual-mta>
 
@@ -152,7 +152,7 @@ http-access 0.0.0.0/0 monitor
     domain-key dkim,allsportsads.com,/root/allsportsads.com/dkim.pem
     <domain *>
         max-cold-virtual-mta-msg 400/day
-        max-msg-rate 1000/h
+        max-msg-rate 10000/h
     </domain>
 </virtual-mta>
 
@@ -162,7 +162,7 @@ http-access 0.0.0.0/0 monitor
     domain-key dkim,poorlydrawnheads.com,/root/poorlydrawnheads.com/dkim.pem
     <domain *>
         max-cold-virtual-mta-msg 400/day
-        max-msg-rate 1000/h
+        max-msg-rate 10000/h
     </domain>
 </virtual-mta>
 
@@ -172,7 +172,7 @@ http-access 0.0.0.0/0 monitor
     domain-key dkim,richdadsadvisor.com,/root/richdadsadvisor.com/dkim.pem
     <domain *>
         max-cold-virtual-mta-msg 400/day
-        max-msg-rate 1000/h
+        max-msg-rate 10000/h
     </domain>
 </virtual-mta>
 
@@ -448,7 +448,7 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
     max-smtp-out 2
     max-msg-per-connection 100
     max-errors-per-connection 10
-    max-msg-rate 1000/h
+    max-msg-rate 10000/h
 
     smtp-greeting-timeout 5m
 
