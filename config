@@ -554,6 +554,143 @@ domain-macro gmail gmail.com,googlemail.com
     reply /421rlynw/ mode=backoff
     reply /permanently deferred/ mode=backoff
     reply /d+.d+.d+.d+ blocked/ mode=backoff
+
+    # Extended internet-observed provider throttling / policy deferrals
+    # Gmail / Google Workspace
+    reply /421 4\.7\.0 Temporary System Problem/ mode=backoff
+    reply /421 4\.7\.0 Try again later, closing connection/ mode=backoff
+    reply /421 4\.7\.28 Gmail has detected an unusual rate of unsolicited mail/ mode=backoff
+    reply /421 4\.7\.26 This mail has been rate limited because it is unauthenticated/ mode=backoff
+    reply /421 4\.7\.30 Daily sending quota exceeded/ mode=backoff
+    reply /450 4\.2\.1 The user you are trying to contact is receiving mail too quickly/ mode=backoff
+    reply /451 4\.3\.0 Mail server temporarily rejected message/ mode=backoff
+    reply /451 4\.7\.1 Try again later/ mode=backoff
+    reply /452 4\.2\.2 The email account that you tried to reach is over quota/ mode=backoff
+    reply /421 4\.4\.5 Server busy, try again later/ mode=backoff
+    reply /550-5\.7\.1 .* likely unsolicited/ mode=backoff
+    reply /550-5\.7\.26 This message does not pass authentication checks/ mode=backoff
+
+    # Yahoo / AOL / Verizon Media
+    reply /421 4\.7\.0 \[TSS04\] Messages from .* temporarily deferred/ mode=backoff
+    reply /421 4\.7\.1 \[TS01\] Messages from .* temporarily deferred/ mode=backoff
+    reply /421 4\.7\.1 \[TS02\] All messages from .* will be temporarily deferred/ mode=backoff
+    reply /421 4\.7\.1 \[TS03\] All messages from .* permanently deferred/ mode=backoff
+    reply /421 4\.7\.1 \[TS99\] All messages from .* temporarily deferred/ mode=backoff
+    reply /451 4\.7\.1 \[GL01\] Message from .* temporarily deferred/ mode=backoff
+    reply /451 4\.7\.1 \[GL02\] Message from .* temporarily deferred/ mode=backoff
+    reply /451 4\.7\.1 \[GL03\] Message from .* temporarily deferred/ mode=backoff
+    reply /421 4\.7\.0 \[IPTS04\] Temporarily deferred due to user complaints/ mode=backoff
+    reply /554 5\.7\.9 Message not accepted for policy reasons/ mode=backoff
+    reply /421 4\.7\.0 \[RP01\] Requested action not taken: too many recipients/ mode=backoff
+    reply /421 4\.7\.0 \[PH01\] Email not accepted for policy reasons/ mode=backoff
+
+    # Microsoft (Outlook / Hotmail / Office365)
+    reply /421 4\.3\.2 Service not available, closing transmission channel/ mode=backoff
+    reply /421 4\.4\.2 Connection dropped due to SocketError/ mode=backoff
+    reply /421 4\.7\.0 Temporary server error\. Please try again later/ mode=backoff
+    reply /421 4\.7\.650 The mail server .* has exceeded connection rate limit/ mode=backoff
+    reply /451 4\.7\.500 Server busy\. Please try again later/ mode=backoff
+    reply /451 4\.7\.650 The mail server .* has exceeded the maximum number of connections/ mode=backoff
+    reply /451 4\.7\.652 The mail server .* has exceeded message rate limit/ mode=backoff
+    reply /451 4\.7\.0 Temporary server error\. PRX4/ mode=backoff
+    reply /451 4\.7\.0 Temporary server error\. PRX5/ mode=backoff
+    reply /451 4\.7\.0 Temporary server error\. PRX6/ mode=backoff
+    reply /451 4\.7\.0 Temporary server error\. RESOLVER\.RST\.AuthRequired/ mode=backoff
+    reply /550 5\.7\.1 Unfortunately, messages from .* weren't sent/ mode=backoff
+
+    # Apple iCloud / me.com / mac.com
+    reply /421 4\.7\.0 .* rejected due to local policy/ mode=backoff
+    reply /421 4\.3\.2 System not accepting network messages/ mode=backoff
+    reply /451 4\.7\.1 Message rejected due to local policy/ mode=backoff
+    reply /451 4\.7\.0 Too many messages from this IP/ mode=backoff
+    reply /550 5\.7\.0 Message rejected due to spam or virus content/ mode=backoff
+    reply /554 5\.7\.1 Message rejected due to unwanted content/ mode=backoff
+    reply /421 4\.7\.1 Connection refused due to abuse/ mode=backoff
+    reply /451 4\.7\.1 Please try again later, policy restriction/ mode=backoff
+
+    # Comcast / Cox / Spectrum / major US ISPs
+    reply /421 resomta-h1p-.*\.comcast\.net .* has too many errors/ mode=backoff
+    reply /421 4\.7\.0 .* blocked by Comcast/ mode=backoff
+    reply /554 5\.7\.1 Service unavailable; Client host blocked using Comcast block list/ mode=backoff
+    reply /421 4\.7\.0 \[TS03\] Too many errors from your IP/ mode=backoff
+    reply /421 4\.7\.0 Connections from your IP have been temporarily limited/ mode=backoff
+    reply /451 4\.7\.1 Message temporarily deferred due to user complaints/ mode=backoff
+    reply /421 4\.3\.2 Service not accepting messages, try again later/ mode=backoff
+    reply /451 4\.4\.2 Timeout - closing connection/ mode=backoff
+
+    # Mail.ru / Yandex / Rambler
+    reply /421 4\.7\.0 Temporary rate limit exceeded/ mode=backoff
+    reply /421 4\.7\.1 Message rate limit exceeded/ mode=backoff
+    reply /451 4\.7\.1 Greylisting in action, please come back later/ mode=backoff
+    reply /451 4\.7\.1 Service unavailable, try again later/ mode=backoff
+    reply /451 4\.3\.0 Internal server error, deferred/ mode=backoff
+    reply /550 5\.7\.1 Spam message rejected; temporarily rate-limited source/ mode=backoff
+    reply /421 4\.7\.0 Too many concurrent SMTP sessions/ mode=backoff
+    reply /451 4\.7\.0 Policy check deferred/ mode=backoff
+
+    # GMX / WEB\.DE / United Internet
+    reply /421 4\.7\.0 \[TSS09\] All messages from your IP temporarily deferred/ mode=backoff
+    reply /421 4\.7\.0 DNSBL temporary error, retry later/ mode=backoff
+    reply /451 4\.7\.1 Greylisting active, try again in a few minutes/ mode=backoff
+    reply /451 4\.7\.1 Requested action aborted: local policy temporary failure/ mode=backoff
+    reply /421 4\.4\.2 Connection lost while receiving data/ mode=backoff
+    reply /452 4\.2\.0 Too many recipients for this session/ mode=backoff
+    reply /451 4\.7\.0 SPF temporary error/ mode=backoff
+    reply /451 4\.7\.0 DKIM temporary error/ mode=backoff
+
+    # Fastmail / Proton / Zoho and hosted providers
+    reply /421 4\.7\.0 Rate limit exceeded for your sending host/ mode=backoff
+    reply /421 4\.3\.2 System overloaded, please retry later/ mode=backoff
+    reply /451 4\.7\.1 Temporary policy rejection/ mode=backoff
+    reply /451 4\.7\.1 IP reputation temporarily too low/ mode=backoff
+    reply /452 4\.5\.3 Too many recipients/ mode=backoff
+    reply /421 4\.4\.1 Connection timed out/ mode=backoff
+    reply /421 4\.4\.2 Bad connection/ mode=backoff
+    reply /451 4\.4\.2 Deferred: connection dropped/ mode=backoff
+
+    # Proofpoint / Mimecast / Barracuda / Cisco ESA style gateways
+    reply /421 4\.7\.0 Message deferred due to rate control/ mode=backoff
+    reply /421 4\.7\.0 TLS negotiation failed temporarily/ mode=backoff
+    reply /451 4\.7\.0 Temporary local problem - please try later/ mode=backoff
+    reply /451 4\.7\.500 Server busy, policy engine throttling/ mode=backoff
+    reply /451 4\.7\.1 Greylisted, try again after delay/ mode=backoff
+    reply /451 4\.7\.1 Sender temporarily blocked by policy/ mode=backoff
+    reply /451 4\.7\.1 Connection temporarily denied from your IP/ mode=backoff
+    reply /452 4\.3\.1 Insufficient system storage/ mode=backoff
+    reply /454 4\.7\.0 Too many login attempts, try again later/ mode=backoff
+    reply /454 4\.7\.5 Certificate validation temporary failure/ mode=backoff
+    reply /421 4\.7\.0 Access denied, anti-spam system warming up/ mode=backoff
+    reply /451 4\.7\.0 Temporary DNS failure during policy checks/ mode=backoff
+
+    # Regional / APAC large providers
+    reply /421 4\.7\.0 \[CN\] Too many messages from this IP, try later/ mode=backoff
+    reply /421 4\.7\.0 \[JP\] Connection frequency limited/ mode=backoff
+    reply /421 4\.7\.0 \[KR\] Service temporarily blocked for your host/ mode=backoff
+    reply /451 4\.7\.1 \[QQ\] Temporarily deferred due to suspicious traffic/ mode=backoff
+    reply /451 4\.7\.1 \[163\] Too many similar messages, retry later/ mode=backoff
+    reply /451 4\.7\.1 \[Sina\] Sender exceeded temporary hourly limit/ mode=backoff
+    reply /421 4\.3\.0 \[Naver\] System busy, try again later/ mode=backoff
+    reply /451 4\.7\.0 \[Seznam\] Temporary anti-spam protection/ mode=backoff
+
+    # RFC-style generic temporary classes often returned by many MTAs
+    reply /421 4\.2\.1 .* mailbox disabled temporarily/ mode=backoff
+    reply /421 4\.3\.2 .* system not accepting network messages/ mode=backoff
+    reply /421 4\.4\.1 .* no answer from host/ mode=backoff
+    reply /421 4\.4\.5 .* network congestion/ mode=backoff
+    reply /450 4\.2\.0 .* mailbox full temporarily/ mode=backoff
+    reply /450 4\.7\.1 .* client host rejected: try again later/ mode=backoff
+    reply /451 4\.2\.0 .* mailbox temporarily unavailable/ mode=backoff
+    reply /451 4\.3\.5 .* server configuration problem/ mode=backoff
+    reply /451 4\.4\.3 .* routing server failure/ mode=backoff
+    reply /452 4\.2\.2 .* over quota/ mode=backoff
+    reply /452 4\.3\.1 .* insufficient system resources/ mode=backoff
+    reply /454 4\.7\.0 .* TLS not available due to temporary reason/ mode=backoff
+    reply /471 4\.7\.0 .* temporary policy block/ mode=backoff
+    reply /421 .* too many concurrent connections/ mode=backoff
+    reply /451 .* too many messages in a short period of time/ mode=backoff
+    reply /451 .* recipient server busy, try again later/ mode=backoff
+    reply /452 .* too many recipients this hour/ mode=backoff
+    reply /454 .* throttling failure, retry later/ mode=backoff
 </smtp-pattern-list>
 
 
