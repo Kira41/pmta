@@ -1,29 +1,34 @@
 ############################################################################
-# PowerMTA config - STRICT 1:1 DOMAIN -> IP (MAIL FROM routing)
+# PowerMTA configuration update for strict 1:1 domain/IP routing
 #
-# REQUIRED 1:1 mapping (ONLY send each domain using its linked IP):
-#   llavedecobre.com -> 194.116.172.135   (HELO/PTR: mail.llavedecobre.com)
-#   brasaf-sa.com  -> 194.116.172.136   (HELO/PTR: mail.brasaf-sa.com)
-#   vilabeerrestaurante.com.br  -> 194.116.172.137   (HELO/PTR: mail.vilabeerrestaurante.com.br)
-#   golddrive-in.com.br   -> 194.116.172.138   (HELO/PTR: mail.golddrive-in.com.br)
-#   mediapaypro.work  -> 194.116.172.139   (HELO/PTR: s5.mediapaypro.work)
+# Domain -> dedicated IP (with matching HELO/PTR)
+#   101crossroadsstudio.com -> 209.46.123.49   (PTR: mail.101crossroadsstudio.com)
+#   adspoof.com             -> 209.46.126.171  (PTR: mail.adspoof.com)
+#   allsportsads.com        -> 209.46.127.49   (PTR: mail.allsportsads.com)
+#   poorlydrawnheads.com    -> 66.175.239.11   (PTR: mail.poorlydrawnheads.com)
+#   richdadsadvisor.com     -> 74.208.123.79   (PTR: mail.richdadsadvisor.com)
 #
-# IMPORTANT:
-# - run-as-root no => avoid putting DKIM keys under /root.
-# - Put DKIM keys here:
-#     /root/<domain>/dkim.pem
+# Goal:
+#   Every sender domain uses ONLY its assigned IP.
+#
+# Notes:
+# - This routing is enforced by MAIL FROM (envelope-from) pattern matching.
+# - X-VirtualMTA override is disabled.
+# - If MAIL FROM is not one of the five domains, message is routed to
+#   pmta-richdadsadvisor via default-virtual-mta (safe fallback).
 ############################################################################
 
-postmaster abuse@mediapaypro.work
+postmaster abuse@richdadsadvisor.com
 
 ############################################################################
-# LISTEN (submission)
+# LISTENERS
 ############################################################################
-smtp-listener 0.0.0.0:2525
+smtp-listener 209.46.123.49:8080
+# smtp-listener 0.0.0.0:8080
 
 <source 0/0>
     log-connections yes
-    log-commands    yes      # WARNING: verbose!
+    log-commands yes
     allow-unencrypted-plain-auth no
 </source>
 
@@ -35,15 +40,10 @@ log-file /var/log/pmta/log
 spool /var/spool/pmta
 
 ############################################################################
-# ACCOUNTING / LOGS
+# ACCOUNTING / DIAGNOSTICS
 ############################################################################
 <acct-file /var/log/pmta/acct.csv>
     max-size 50M
-    records d,b,t
-    # Include app trace headers in CSV so Shiva can match outcomes reliably.
-    record-fields d *,header_X-Job-ID,header_X-Campaign-ID,header_Message-Id
-    record-fields b *,header_X-Job-ID,header_X-Campaign-ID,header_Message-Id
-    record-fields t *,header_X-Job-ID,header_X-Campaign-ID,header_Message-Id
 </acct-file>
 
 <acct-file /var/log/pmta/diag.csv>
@@ -53,44 +53,39 @@ spool /var/spool/pmta
 </acct-file>
 
 ############################################################################
-# HTTP MANAGEMENT (SECURE DEFAULT: localhost only)
+# HTTP MANAGEMENT (lock down in production)
 ############################################################################
-http-mgmt-port 8080
+http-mgmt-port 1993
 http-access 0.0.0.0/0 admin
 http-access 0.0.0.0/0 monitor
-# If you need remote access, add ONLY your fixed admin IP:
-# http-access X.X.X.X/32 admin
-# http-access X.X.X.X/32 monitor
 
 ############################################################################
-# STRICT ROUTING: MAIL FROM domain -> specific virtual-mta
-# NOTE: This routes by ENVELOPE FROM (MAIL FROM). Your sending app must use
-#       envelope-from should match one of the domains below.
+# STRICT DOMAIN ROUTING (MAIL FROM -> dedicated virtual-mta)
 ############################################################################
-<pattern-list mpp-mailfrom-routing>
-    # llavedecobre.com -> pmta-mpp-llavedecobre (194.116.172.135)
-    mail-from /@llavedecobre\.com$/        virtual-mta=pmta-mpp-llavedecobre
-    mail-from /@mail\.llavedecobre\.com$/  virtual-mta=pmta-mpp-llavedecobre
+<pattern-list strict-mailfrom-routing>
+    # 101crossroadsstudio.com -> 209.46.123.49
+    mail-from /@101crossroadsstudio\.com$/      virtual-mta=pmta-101crossroadsstudio
+    mail-from /@mail\.101crossroadsstudio\.com$/ virtual-mta=pmta-101crossroadsstudio
 
-    # brasaf-sa.com -> pmta-mpp-brasaf (194.116.172.136)
-    mail-from /@brasaf-sa\.com$/        virtual-mta=pmta-mpp-brasaf
-    mail-from /@mail\.brasaf-sa\.com$/   virtual-mta=pmta-mpp-brasaf
+    # adspoof.com -> 209.46.126.171
+    mail-from /@adspoof\.com$/      virtual-mta=pmta-adspoof
+    mail-from /@mail\.adspoof\.com$/ virtual-mta=pmta-adspoof
 
-    # vilabeerrestaurante.com.br -> pmta-mpp-vilabeerrestaurante (194.116.172.137)
-    mail-from /@vilabeerrestaurante.com\.br$/         virtual-mta=pmta-mpp-vilabeerrestaurante
-    mail-from /@mail\.vilabeerrestaurante.com\.br$/     virtual-mta=pmta-mpp-vilabeerrestaurante
+    # allsportsads.com -> 209.46.127.49
+    mail-from /@allsportsads\.com$/      virtual-mta=pmta-allsportsads
+    mail-from /@mail\.allsportsads\.com$/ virtual-mta=pmta-allsportsads
 
-    # golddrive-in.com.br -> pmta-mpp-golddrive (194.116.172.138)
-    mail-from /@golddrive-in.com\.br$/          virtual-mta=pmta-mpp-golddrive
-    mail-from /@mail\.golddrive-in.com\.br$/      virtual-mta=pmta-mpp-golddrive
+    # poorlydrawnheads.com -> 66.175.239.11
+    mail-from /@poorlydrawnheads\.com$/      virtual-mta=pmta-poorlydrawnheads
+    mail-from /@mail\.poorlydrawnheads\.com$/ virtual-mta=pmta-poorlydrawnheads
 
-    # mediapaypro.work -> pmta-mpp-work (194.116.172.139)
-    mail-from /@mediapaypro\.work$/         virtual-mta=pmta-mpp-work
-    mail-from /@s5\.mediapaypro\.work$/     virtual-mta=pmta-mpp-work
+    # richdadsadvisor.com -> 74.208.123.79
+    mail-from /@richdadsadvisor\.com$/      virtual-mta=pmta-richdadsadvisor
+    mail-from /@mail\.richdadsadvisor\.com$/ virtual-mta=pmta-richdadsadvisor
 </pattern-list>
 
 ############################################################################
-# SMTP USERS / AUTH SOURCE
+# AUTHENTICATED SMTP SUBMISSION SOURCE
 ############################################################################
 <smtp-user scampia>
     password CHANGE_ME_STRONG_PASSWORD
@@ -102,14 +97,10 @@ http-access 0.0.0.0/0 monitor
     require-auth true
     always-allow-relaying yes
 
-    # CRITICAL: block any override like X-VirtualMTA (forces our 1:1 mapping)
+    # Enforce routing from MAIL FROM only
     process-x-virtual-mta no
-
-    # Apply strict MAIL FROM routing
-    pattern-list mpp-mailfrom-routing
-
-    # Fallback if MAIL FROM doesn't match the 5 domains
-    default-virtual-mta pmta-mpp-work
+    pattern-list strict-mailfrom-routing
+    default-virtual-mta pmta-richdadsadvisor
 
     remove-received-headers true
     add-received-header false
@@ -117,7 +108,7 @@ http-access 0.0.0.0/0 monitor
 </source>
 
 ############################################################################
-# LOCAL INJECTION/API SOURCE (also enforced)
+# LOCAL API/INJECTION SOURCE
 ############################################################################
 <source 127.0.0.1>
     always-allow-api-submission yes
@@ -129,56 +120,74 @@ http-access 0.0.0.0/0 monitor
     process-x-job yes
     jobid-header X-Mailer-RecptId
 
-    # CRITICAL: block override
+    # Enforce strict mapping
     process-x-virtual-mta no
-
-    # Enforce strict MAIL FROM routing
-    pattern-list mpp-mailfrom-routing
-    default-virtual-mta pmta-mpp-work
+    pattern-list strict-mailfrom-routing
+    default-virtual-mta pmta-richdadsadvisor
 </source>
 
 ############################################################################
-# VIRTUAL MTAS (1:1) + DKIM per domain
+# VIRTUAL MTAS (dedicated source IP + matching HELO/PTR)
 ############################################################################
 
-# llavedecobre.com -> 194.116.172.135
-<virtual-mta pmta-mpp-llavedecobre>
-    smtp-source-host 194.116.172.135 mail.llavedecobre.com
-    domain-key dkim,llavedecobre.com,/root/llavedecobre.com/dkim.pem
+# 101crossroadsstudio.com -> 209.46.123.49
+<virtual-mta pmta-101crossroadsstudio>
+    smtp-source-host 209.46.123.49 mail.101crossroadsstudio.com
+    domain-key dkim,101crossroadsstudio.com,/root/101crossroadsstudio.com/dkim.pem
+    <domain *>
+        max-cold-virtual-mta-msg 400/day
+        max-msg-rate 1000/h
+    </domain>
 </virtual-mta>
 
-# brasaf-sa.com -> 194.116.172.136
-<virtual-mta pmta-mpp-brasaf>
-    smtp-source-host 194.116.172.136 mail.brasaf-sa.com
-    domain-key dkim,brasaf-sa.com,/root/brasaf-sa.com/dkim.pem
+# adspoof.com -> 209.46.126.171
+<virtual-mta pmta-adspoof>
+    smtp-source-host 209.46.126.171 mail.adspoof.com
+    domain-key dkim,adspoof.com,/root/adspoof.com/dkim.pem
+    <domain *>
+        max-cold-virtual-mta-msg 400/day
+        max-msg-rate 1000/h
+    </domain>
 </virtual-mta>
 
-# vilabeerrestaurante.com.br -> 194.116.172.137
-<virtual-mta pmta-mpp-vilabeerrestaurante>
-    smtp-source-host 194.116.172.137 mail.vilabeerrestaurante.com.br
-    domain-key dkim,vilabeerrestaurante.com.br,/root/vilabeerrestaurante.com.br/dkim.pem
+# allsportsads.com -> 209.46.127.49
+<virtual-mta pmta-allsportsads>
+    smtp-source-host 209.46.127.49 mail.allsportsads.com
+    domain-key dkim,allsportsads.com,/root/allsportsads.com/dkim.pem
+    <domain *>
+        max-cold-virtual-mta-msg 400/day
+        max-msg-rate 1000/h
+    </domain>
 </virtual-mta>
 
-# golddrive-in.com.br -> 194.116.172.138
-<virtual-mta pmta-mpp-golddrive>
-    smtp-source-host 194.116.172.138 mail.golddrive-in.com.br
-    domain-key dkim,golddrive-in.com.br,/root/golddrive-in.com.br/dkim.pem
+# poorlydrawnheads.com -> 66.175.239.11
+<virtual-mta pmta-poorlydrawnheads>
+    smtp-source-host 66.175.239.11 mail.poorlydrawnheads.com
+    domain-key dkim,poorlydrawnheads.com,/root/poorlydrawnheads.com/dkim.pem
+    <domain *>
+        max-cold-virtual-mta-msg 400/day
+        max-msg-rate 1000/h
+    </domain>
 </virtual-mta>
 
-# mediapaypro.work -> 194.116.172.139
-<virtual-mta pmta-mpp-work>
-    smtp-source-host 194.116.172.139 s5.mediapaypro.work
-    domain-key dkim,mediapaypro.work,/root/mediapaypro.work/dkim.pem
+# richdadsadvisor.com -> 74.208.123.79
+<virtual-mta pmta-richdadsadvisor>
+    smtp-source-host 74.208.123.79 mail.richdadsadvisor.com
+    domain-key dkim,richdadsadvisor.com,/root/richdadsadvisor.com/dkim.pem
+    <domain *>
+        max-cold-virtual-mta-msg 400/day
+        max-msg-rate 1000/h
+    </domain>
 </virtual-mta>
 
 ############################################################################
-# DEFAULT DOMAIN DELIVERY / TLS / DKIM
+# DEFAULT DELIVERY RULES
 ############################################################################
 <domain *>
     max-smtp-out 2
-    max-msg-per-connection 50
+    max-msg-per-connection 100
     max-errors-per-connection 10
-    max-msg-rate 200/h
+    max-msg-rate 1000/h
 
     smtp-greeting-timeout 5m
 
@@ -188,6 +197,14 @@ http-access 0.0.0.0/0 monitor
     retry-after 10m
     bounce-after 24h
 
+    smtp-pattern-list blocking-errors
+
+    backoff-max-msg-rate 1/m
+    backoff-retry-after 20m
+    backoff-notify ""
+    backoff-to-normal-after-delivery yes
+    backoff-to-normal-after 1h
+
     dkim-sign yes
     ignore-8bitmime true
 
@@ -196,14 +213,14 @@ http-access 0.0.0.0/0 monitor
 </domain>
 
 ############################################################################
-# BASIC BACKOFF PATTERNS (optional)
+# BASIC BLOCKING/BACKOFF PATTERNS
 ############################################################################
 <smtp-pattern-list blocking-errors>
-    reply /blocked/ mode=backoff
-    reply /spamhaus/ mode=backoff
-    reply /exceeded the rate limit/ mode=backoff
+    reply /blocked.*spamhaus/ mode=backoff
+    reply /451 Rejected/ mode=backoff
+    reply /too many/ mode=backoff
     reply /try again later/ mode=backoff
-    reply /refused your connection/ mode=backoff
+    reply /Connection rate limit exceeded/ mode=backoff
     reply /Service not available/ mode=backoff
 </smtp-pattern-list>
 
