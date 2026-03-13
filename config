@@ -422,11 +422,8 @@ domain-macro gmail gmail.com,googlemail.com
     max-msg-rate 250/h
 </domain>
 
-<domain gmx.net>
-    max-msg-rate 250/h
-</domain>
-
-<domain mail.com>
+domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
+<domain $gmx>
     max-msg-rate 250/h
 </domain>
 
@@ -671,6 +668,21 @@ domain-macro gmail gmail.com,googlemail.com
     reply /451 4\.7\.1 \[Sina\] Sender exceeded temporary hourly limit/ mode=backoff
     reply /421 4\.3\.0 \[Naver\] System busy, try again later/ mode=backoff
     reply /451 4\.7\.0 \[Seznam\] Temporary anti-spam protection/ mode=backoff
+
+    # GMX / mail.com / WEB.DE (United Internet)
+    reply /421 4\.7\.0 .*gmx.*temporarily deferred/ mode=backoff
+    reply /421 4\.7\.0 .*mail\.com.*temporarily deferred/ mode=backoff
+    reply /421 4\.7\.0 .*web\.de.*temporarily deferred/ mode=backoff
+    reply /451 4\.7\.0 .*policy.*gmx/ mode=backoff
+    reply /451 4\.7\.1 .*try again later.*gmx/ mode=backoff
+    reply /451 4\.7\.1 .*Greylisted.*(gmx|mail\.com|web\.de)/ mode=backoff
+    reply /451 Requested action aborted: local error in processing/ mode=backoff
+    reply /451 Requested action aborted: try again later/ mode=backoff
+    reply /550 5\.7\.1 .*blocked.*(gmx|mail\.com|web\.de)/ mode=backoff
+    reply /550 5\.7\.1 .*policy reasons.*(gmx|mail\.com|web\.de)/ mode=backoff
+    reply /554 5\.7\.1 .*policy reasons.*(gmx|mail\.com|web\.de)/ mode=backoff
+    reply /554 .*For policy reasons.*postmaster\.gmx\.(net|com)\/en\/case/ mode=backoff
+    reply /554 .*https?:\/\/postmaster\.gmx\.(net|com)\/en\/case\?/ mode=backoff
 
     # RFC-style generic temporary classes often returned by many MTAs
     reply /421 4\.2\.1 .* mailbox disabled temporarily/ mode=backoff
