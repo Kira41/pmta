@@ -16734,11 +16734,25 @@ def smtp_send_job(
             return ""
         return seq[int(idx or 0) % len(seq)]
 
+    def _email_to_10_digits(email: str) -> str:
+        normalized = str(email or "").strip().lower()
+        digest = hashlib.sha256(normalized.encode("utf-8")).digest()
+        num = int.from_bytes(digest[:8], "big") % 10_000_000_000
+        return str(num).zfill(10)
+
+    def _build_src_url(src_base: str, rcpt: str) -> str:
+        base = str(src_base or "").strip()
+        if not base:
+            return ""
+        token = _email_to_10_digits(rcpt)
+        return f"{base.rstrip('/')}/image/{token}.png"
+
     def _render_with_placeholders(base_text: str, *, url_value: str, src_value: str, rcpt: str) -> str:
         rendered = str(base_text or "")
         name_value = str(rcpt or "").split("@", 1)[0].strip()
+        src_url = _build_src_url(src_value, rcpt)
         rendered = re.sub(r"\[(?:URL)\]", str(url_value or ""), rendered, flags=re.IGNORECASE)
-        rendered = re.sub(r"\[(?:SRC)\]", str(src_value or ""), rendered, flags=re.IGNORECASE)
+        rendered = re.sub(r"\[(?:SRC)\]", str(src_url or ""), rendered, flags=re.IGNORECASE)
         rendered = re.sub(r"\[(?:MAIL|EMAIL)\]", str(rcpt or ""), rendered, flags=re.IGNORECASE)
         rendered = re.sub(r"\[(?:NAME)\]", name_value, rendered, flags=re.IGNORECASE)
         return rendered
