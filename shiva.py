@@ -6248,7 +6248,12 @@ def ai_rewrite_subjects_and_body(
             raw = resp.read().decode("utf-8", errors="ignore")
     except HTTPError as e:
         err = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else str(e)
-        raise RuntimeError(f"OpenRouter HTTPError: {e.code} {err[:500]}")
+        logging.getLogger("shiva").error(
+            "OpenRouter HTTPError (%s) full response: %s",
+            getattr(e, "code", "?"),
+            err,
+        )
+        raise RuntimeError(f"OpenRouter HTTPError: {e.code} {err}")
     except URLError as e:
         raise RuntimeError(f"OpenRouter URLError: {e}")
 
