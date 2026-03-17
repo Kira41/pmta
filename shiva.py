@@ -6253,11 +6253,26 @@ def ai_rewrite_subjects_and_body(
         raise RuntimeError(f"OpenRouter URLError: {e}")
 
     data = json.loads(raw)
-    content = (
-        data.get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "")
-    )
+    choice0 = (data.get("choices") or [{}])[0] if isinstance(data, dict) else {}
+    msg = choice0.get("message", {}) if isinstance(choice0, dict) else {}
+    content = msg.get("content", "") if isinstance(msg, dict) else ""
+
+    # Some OpenRouter models return structured content parts instead of a plain string.
+    # Normalize those variants into one string so JSON extraction keeps working.
+    if isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                txt = part.get("text")
+                if txt is not None:
+                    parts.append(str(txt))
+            elif part is not None:
+                parts.append(str(part))
+        content = "\n".join(parts)
+    elif content is None:
+        content = ""
+    else:
+        content = str(content)
 
     out = _extract_json_object(content)
     if not out:
@@ -21413,10 +21428,13 @@ def api_ai_rewrite():
 
     subjects = [str(x).strip() for x in subjects if str(x).strip()]
 
-    if not subjects:
-        return jsonify({"ok": False, "error": "Missing subjects"}), 400
-    if not body.strip():
-        return jsonify({"ok": False, "error": "Missing body"}), 400
+    # Allow rewriting even when only one side is provided.
+    # The rewrite helper already applies safe fallbacks:
+    # - empty subjects => ["(no subject)"]
+    # - empty body => returns original/empty body
+    # Reject only when BOTH are missing.
+    if not subjects and not body.strip():
+        return jsonify({"ok": False, "error": "Missing content: provide subject and/or body"}), 400
 
     try:
         new_subjects, new_body, backend = ai_rewrite_subjects_and_body(
