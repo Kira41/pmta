@@ -50,6 +50,7 @@ except Exception:
     pass
 
 from flask import Flask, request, redirect, url_for, jsonify, render_template_string, abort, make_response, g
+from werkzeug.serving import WSGIRequestHandler
 
 # =========================
 # Spam score
@@ -3967,6 +3968,31 @@ APP_VERSION = "ShivaMTA 2026-02-23"
 # Accept both /path and /path/ (prevents annoying 404s from trailing slashes in links)
 app.url_map.strict_slashes = False
 app.config["SECRET_KEY"] = "change-me"
+
+
+def _normalize_bad_request_log_message(msg: str) -> Optional[str]:
+    """Compress noisy malformed-request errors produced by internet scanners."""
+    text = str(msg or "")
+    if "Bad request syntax" not in text:
+        return None
+
+    # Common case: HTTPS/TLS ClientHello sent to an HTTP-only port.
+    if "\\x16\\x03" in text:
+        return "Bad request syntax (likely TLS/HTTPS probe on HTTP port)"
+
+    # Keep the original meaning but avoid logging raw control characters.
+    return "Bad request syntax (malformed/non-HTTP bytes)"
+
+
+class ShivaRequestHandler(WSGIRequestHandler):
+    """Sanitize noisy malformed request logs while preserving real errors."""
+
+    def log_error(self, format: str, *args: Any) -> None:  # noqa: A002 - signature from base class
+        if args:
+            normalized = _normalize_bad_request_log_message(str(args[0]))
+            if normalized:
+                args = (normalized, *args[1:])
+        return super().log_error(format, *args)
 
 
 @app.teardown_request
@@ -22082,4 +22108,4 @@ if __name__ == "__main__":
         port = int((os.getenv("SHIVA_PORT", "5000") or "1993").strip())
     except Exception:
         port = 5001
-    app.run(host=host, port=port, debug=True)
+    app.run(host=host, port=port, debug=True, request_handler=ShivaRequestHandler)
