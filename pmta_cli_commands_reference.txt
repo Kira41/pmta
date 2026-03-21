@@ -1,0 +1,385 @@
+PowerMTA CLI Command Reference
+Source basis: UsersGuide.html in this repository.
+Scope: This file consolidates the SSH/CLI commands discussed from the guide and expands their descriptions in plain English for operational use.
+
+====================================================================
+1) STATUS, DASHBOARD, AND SCRIPT-FRIENDLY OUTPUT
+====================================================================
+
+pmta show status
+Description:
+Displays a high-level operational snapshot of PowerMTA. According to the guide, this includes totals, top throughput, queue information, and other general health indicators since the last restart. This is the command-line equivalent of the information visible in the web-based monitoring console, so it is the best starting point for checking current system state over SSH.
+Typical use:
+- Validate that the mailer is up and healthy.
+- Check inbound/outbound traffic totals.
+- Review queue and throughput conditions.
+- Capture a quick support snapshot before deeper troubleshooting.
+
+pmta --xml show status
+Description:
+Requests the same status data in XML form. The guide describes the XML mode as intended for XML-enabled applications. Use this when you want another tool, parser, collector, or automation script to consume the same status information that an operator would otherwise view in the dashboard.
+Typical use:
+- Integrate PowerMTA status into monitoring systems.
+- Parse structured status output in Python, Java, or any XML-capable tooling.
+- Archive repeated snapshots for external reporting.
+
+pmta --dom show status
+Description:
+Requests status output in DOM-style variable form. The guide specifically says this format is intended for non-XML-capable applications and quick Perl or shell scripts. This makes it one of the most practical choices for lightweight SSH automation.
+Typical use:
+- Shell scripts that grep or source key=value style output.
+- Quick cron-based health checks.
+- Fast operational checks without XML parsing overhead.
+
+pmta show settings domain[/vmta]
+Description:
+Displays the effective settings for a destination domain and, optionally, a specific VirtualMTA. This is useful when you need to verify what PowerMTA is currently applying to a domain after inheritance, overrides, or VirtualMTA-specific tuning.
+Typical use:
+- Confirm live queue/domain settings.
+- Audit throttling, retry, or routing behavior.
+- Compare baseline domain settings to a VMTA-specific override.
+
+pmta --dom show settings port25.com
+Description:
+A script-friendly way to retrieve effective settings for a domain using DOM-style output. This is especially useful in automation when you need to verify operational configuration without scraping plain text.
+Typical use:
+- Automated config auditing.
+- Drift detection.
+- External systems that need to compare runtime settings against expected values.
+
+====================================================================
+2) DOMAIN, QUEUE, AND JOB VISIBILITY
+====================================================================
+
+pmta show domains [--vmta=name] [--connected={yes|no}] [--maxitems=n] [--errors] [--sort={name|rcpt|size}] [name]
+Description:
+Shows current information about destination domains. The guide indicates that this command can be filtered by VirtualMTA, connection state, result size, and sort order. The --errors option is especially important because it displays errors recorded for domains.
+Typical use:
+- Find domains with large queued recipient counts.
+- Identify the biggest traffic consumers.
+- Look up the last known error per domain.
+- Narrow domain diagnostics to one VMTA.
+
+pmta show dom
+Description:
+Short-form usage shown in the guide for displaying domain statistics. Useful for an immediate view of recipient counts, queued data volume, connection state, and last-error information.
+
+pmta show dom --conn
+Description:
+Filters domain output to domains with live outbound connections. Helpful when you want to focus only on active traffic rather than all configured or queued domains.
+
+pmta show dom port25.com --errors
+Description:
+Shows recorded errors for a specific domain. The guide notes that only error events are recorded in this in-memory domain event mechanism. This command is one of the most important first-line troubleshooting commands for domain-specific delivery failures.
+Typical use:
+- Investigate why mail to a domain is timing out or bouncing.
+- Capture the last error seen for support or escalation.
+- Validate whether a domain problem is current or historical.
+
+pmta show queues [--connected={yes|no}] [--paused={yes|no}] [--mode={normal|backoff}] [--maxitems=n] [--errors] [--sort={name|rcpt|size}] [queue] [name]
+Description:
+Displays current information about queues. The guide describes this as the queue-level equivalent of the domain display, letting you inspect queue connectivity, paused state, operating mode, errors, and volume.
+Typical use:
+- Identify queues in backoff mode.
+- Check which queues are connected or paused.
+- Find the largest queues by recipient count or size.
+- Detect queue-level errors that explain delivery slowdown.
+
+pmta show queue
+Description:
+Guide example showing queue listing in its default form. Useful for a quick queue overview.
+
+pmta show que --mode=backoff
+Description:
+Guide example of filtering queue output by backoff mode. This is useful when you only want queues currently under reduced delivery posture.
+
+pmta show jobs [--maxitems=n] domain[/vmta]
+Description:
+Displays job-level information. The guide also notes that job information can be obtained in XML from the web monitor directly. Over SSH, this command is the direct way to inspect submission batches or grouped traffic represented by job IDs.
+Typical use:
+- Investigate batch sends.
+- Confirm which jobs are active for a domain or VMTA.
+- Correlate queue activity with submission jobs.
+
+pmta show topdomains [--vmta=name] [--connected={yes|no}]
+Description:
+Displays top domains by recipient volume. The guide says this is effectively equivalent to sorting show domains by recipient count. It is useful when you need the busiest destinations immediately without reviewing the full domain table.
+Typical use:
+- Capacity checks.
+- Traffic hotspot detection.
+- Finding the largest current domain pressure points.
+
+pmta show topqueues [--connected={yes|no}] [--mode={normal|backoff}]
+Description:
+Displays top queues by recipient count. The guide describes it as equivalent to sorting show queues by recipient count. This is a fast way to find the queues creating the most current pressure on the system.
+Typical use:
+- Queue triage.
+- Prioritizing investigations.
+- Finding the largest deferred or backed-up destinations.
+
+pmta show version
+Description:
+Shows the PowerMTA version. Use this when documenting the environment, checking compatibility, preparing support requests, or validating whether an observed behavior might relate to a specific build.
+
+pmta show vmtas [--maxitems=n]
+Description:
+Displays VirtualMTA information. This is useful for seeing which VMTAs are in use and how traffic is distributed across them.
+Typical use:
+- Inspect outbound lane usage.
+- Verify that traffic is flowing through expected VMTAs.
+- Troubleshoot VMTA-specific queueing or routing behavior.
+
+====================================================================
+3) MESSAGE-LEVEL VISIBILITY AND QUEUE CONTENT
+====================================================================
+
+pmta list [--queue=domain[/vmta]] [--orig=addr] [--rcpt=addr]
+Description:
+Lists queued messages using optional filters for queue, originator, and recipient. If your goal is to see which emails are currently waiting in PowerMTA, this is the most directly relevant CLI command from the guide.
+Typical use:
+- Show queued messages for one destination queue.
+- Search for a message by sender.
+- Search for a message by recipient.
+- Narrow investigation to a specific queue/VMTA path.
+
+pmta list --queue=yahoo.com/vmta1
+Description:
+Guide example for listing messages in a specific queue. Use similar filters to isolate problem queues or high-value traffic paths.
+
+====================================================================
+4) ERROR ANALYSIS, DELIVERY TROUBLESHOOTING, AND DNS CHECKS
+====================================================================
+
+pmta trace [--logdata] [--logresolution] [--to-log] domain/vmta
+Description:
+Schedules a traced connection for a domain or queue path. The guide describes this as a quick way to inspect what happens during delivery attempts. Depending on options, you can trace data, name-resolution activity, and log the trace to the main logging path.
+Typical use:
+- Reproduce a failing domain delivery attempt with deeper visibility.
+- Capture SMTP conversation behavior for troubleshooting.
+- Confirm whether the problem is DNS, connection, or SMTP-response related.
+- Generate evidence for escalation to the remote receiver or internal networking teams.
+
+pmta trace yahoo.com
+Description:
+Guide example for tracing delivery to a domain. After scheduling the trace, consult the logging output as directed by the guide.
+
+pmta resolve [--tcp] [--connect] [--dumppackets] [--interactive] [--source=[host,]ip] domainname
+Description:
+Performs DNS resolution checks and, optionally, connection checks. This is one of the best commands for isolating resolver or network path issues before assuming the problem is in queue logic.
+Typical use:
+- Validate MX resolution.
+- Confirm whether a connection can be established to the remote side.
+- Troubleshoot DNS failures, timeouts, or path-specific source-IP issues.
+
+pmta resolve --connect hotmail.com
+Description:
+Guide example that combines DNS work with a connection test. Useful when delivery trouble may be due to connectivity rather than queue behavior.
+
+pmta check mfrom [--tcp] [--dumppackets] mfrom ip
+Description:
+Checks an outbound MAIL FROM / mfrom context against an IP. The guide includes this as a troubleshooting command; it is useful when sender identity or sender-policy-style checks need verification.
+Typical use:
+- Validate envelope sender behavior from a specific source IP.
+- Troubleshoot sender-related policy failures.
+
+pmta check pra [--tcp] [--dumppackets] pra ip
+Description:
+Checks PRA-related behavior against an IP. Use this when investigating authentication or policy issues tied to PRA handling.
+Typical use:
+- Validate identity interpretation.
+- Troubleshoot PRA-related reputation or policy failures.
+
+pmta clear dnscache domain
+Description:
+Clears cached DNS information for a domain or wildcard target. Use this when you suspect stale DNS information is affecting routing or connectivity.
+Typical use:
+- Force fresh MX lookup after DNS changes.
+- Clear stale resolver state during incident response.
+- Re-test a domain after external DNS remediation.
+
+pmta clear dns *
+pmta clear dns port25.com
+Description:
+Guide examples showing cache-clear usage with a wildcard or a specific domain.
+
+====================================================================
+5) QUEUE CONTROL AND OPERATIONAL REMEDIATION
+====================================================================
+
+pmta schedule domain/vmta
+Description:
+Schedules delivery for the specified domain or domain/VMTA queue. This is useful when queued mail exists but has not yet been scheduled, or when you want to force a queue back into immediate delivery processing.
+Typical use:
+- Nudge a queue into action after investigation.
+- Trigger immediate scheduling for queued mail.
+
+pmta schedule "port25.com"
+Description:
+Guide example for scheduling a domain queue.
+
+pmta set queue --mode={normal|backoff} domain/vmta
+Description:
+Changes the queue mode dynamically. This is especially useful when you need to manually move a queue into backoff during trouble or restore it to normal after remediation.
+Typical use:
+- Force backoff to protect reputation or infrastructure.
+- Return a queue to normal after remote acceptance improves.
+- Align a queue with temporary operational policy.
+
+pmta set queue --mode=normal aol.com
+Description:
+Guide example for returning a queue to normal mode.
+
+pmta delete [--dsn] [--queue=domain[/vmta]] [--orig=addr] [--rcpt=addr] [--jobId=id] [--envId=id]
+Description:
+Deletes recipients/messages from the queue using filters. This is a powerful operational command and should be used carefully, because it can remove queued traffic by queue, sender, recipient, job, or envelope ID.
+Typical use:
+- Purge stuck traffic for a specific destination.
+- Remove traffic for a misconfigured sender.
+- Cancel a specific job or envelope when required.
+
+pmta delete --queue=yahoo.com/*
+Description:
+Guide example for deleting queued traffic by queue filter.
+
+pmta pause queue domain[/vmta]
+Description:
+Pauses a queue so PowerMTA stops active delivery attempts for that path. Useful during incidents, content review, or emergency throttling.
+Typical use:
+- Stop mail flow to a troubled receiver.
+- Freeze a customer-specific VMTA lane.
+- Contain impact during active troubleshooting.
+
+pmta pause queue */customer1
+Description:
+Guide example for pausing a queue path.
+
+pmta resume queue domain[/vmta]
+Description:
+Resumes a previously paused queue. Use this after corrective action is complete and you are ready to restart delivery.
+Typical use:
+- Restore traffic after an incident.
+- Re-open a customer lane after approval.
+
+pmta resume queue */customer1
+Description:
+Guide example for resuming a paused queue path.
+
+====================================================================
+6) CONFIGURATION RELOADS, COUNTERS, AND FILE ROTATION
+====================================================================
+
+pmta reload
+Description:
+Reloads PowerMTA configuration for directives that support dynamic reload. The guide references this command repeatedly as the standard way to apply eligible configuration changes without a full restart.
+Typical use:
+- Apply domain, VMTA, or policy changes.
+- Re-read runtime-adjustable configuration safely.
+- Trigger PowerMTA to use revised operational settings.
+
+pmta reset counters
+Description:
+Resets traffic counters while PowerMTA remains running. The guide states that these counters are what feed the web monitor and show status statistics, and that they are saved to the accounting file before reset.
+Typical use:
+- Start a fresh measurement window.
+- Capture period boundaries for traffic analysis.
+- Reset stats after maintenance or incident review.
+
+pmta reset status
+Description:
+Resets status data. Use when you need to clear accumulated status context without fully restarting the application.
+
+pmta rotate acct [file]
+Description:
+Immediately rotates the accounting file. This is useful when you want to force a clean accounting boundary for ingestion, archival, or downstream processing.
+Typical use:
+- Cut a file for immediate ETL/import.
+- Start a new accounting segment for an incident window.
+- Coordinate with external accounting collectors.
+
+pmta rotate acct
+Description:
+Guide example of immediate accounting rotation.
+
+pmta rotate log
+Description:
+Immediately rotates the log file. Useful before collecting logs, before testing, or when you want a clean log window for new evidence.
+Typical use:
+- Isolate log data for a specific test.
+- Start a clean troubleshooting trace window.
+- Prepare log files for support transfer.
+
+pmta rotate log
+Description:
+Guide example of immediate log rotation.
+
+====================================================================
+7) SOURCE PATH CONTROL
+====================================================================
+
+pmta disable source [--reenable-after=interval] ip domain[/vmta]
+Description:
+Disables a source IP for a domain or VMTA route, optionally with an automatic re-enable interval. This is an advanced control that can be used when one source IP is causing repeated trouble for a destination.
+Typical use:
+- Remove a problematic source IP from rotation.
+- Temporarily quarantine a bad path.
+- Let PowerMTA automatically restore it after a cooling-off period.
+
+pmta disable source --reenable-after=1h 1.2.3.4 yahoo.com/vmta1
+Description:
+Guide example of temporarily disabling a source IP for one queue path.
+
+pmta enable source ip domain[/vmta]
+Description:
+Manually re-enables a previously disabled source IP. Use after validation that the path is healthy again.
+
+pmta enable source 1.2.3.4 yahoo.com/vmta1
+Description:
+Guide example of restoring a disabled source IP.
+
+pmta show disabled sources [domain[/vmta]]
+Description:
+Displays currently disabled sources, optionally scoped to a queue path. Useful for operational audits and verifying whether a path remains suppressed.
+
+pmta show disabled sources yahoo.com/vmta1
+Description:
+Guide example of querying disabled sources for a specific queue path.
+
+====================================================================
+8) LICENSE / REGISTRATION COMMANDS (LESS RELEVANT TO DELIVERY TROUBLESHOOTING)
+====================================================================
+
+pmta show license
+Description:
+Displays current license information.
+
+pmta deregister [--user=name] [--local-only]
+Description:
+Removes registration state according to the supplied scope and options.
+
+pmta register [--user=name] [--label=name] [--webmon-ip=ip] ...
+Description:
+Registers the installation with optional user, label, and web monitor IP metadata. The guide output shown in the repository truncates the full option list, so refer back to the guide section if you need every registration option exactly as printed.
+
+pmta show registration
+Description:
+Displays the current registration state.
+
+====================================================================
+9) PRACTICAL OPERATOR SHORTLIST
+====================================================================
+
+If you only keep a small day-to-day toolkit, these are the most operationally valuable commands:
+- pmta show status
+- pmta --xml show status
+- pmta --dom show status
+- pmta show dom --errors
+- pmta show queues
+- pmta show jobs
+- pmta list
+- pmta trace <domain>
+- pmta resolve --connect <domain>
+- pmta reload
+- pmta reset counters
+- pmta rotate acct
+- pmta rotate log
+
