@@ -3,10 +3,69 @@ from __future__ import annotations
 import copy
 import random
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from flask import Flask, jsonify, render_template_string, url_for
 
 app = Flask(__name__)
+BASE_DIR = Path(__file__).resolve().parent
+JOBS_HTML_PATH = BASE_DIR / "jobs.html"
+
+JOBS_PAGE_NAV_STYLE = r"""
+    .shivaMiniNav{
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+      align-items:center;
+      justify-content:space-between;
+      margin-bottom:14px;
+      padding:12px 14px;
+      border:1px solid rgba(255,255,255,.14);
+      border-radius:16px;
+      background:linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.04));
+      box-shadow:var(--shadow);
+      backdrop-filter:blur(10px);
+    }
+    .shivaMiniNavTitle{font-size:13px; color:var(--muted); line-height:1.6;}
+    .shivaMiniNavLinks{display:flex; gap:10px; flex-wrap:wrap; align-items:center;}
+    .shivaMiniNavLinks a{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding:10px 12px;
+      border:1px solid rgba(255,255,255,.14);
+      border-radius:14px;
+      background:rgba(255,255,255,.06);
+      color:rgba(255,255,255,.92);
+      font-weight:800;
+      text-decoration:none;
+    }
+    .shivaMiniNavLinks a.active{background:rgba(122,167,255,.18);}
+"""
+
+JOBS_PAGE_NAV_HTML = r"""
+    <nav class="shivaMiniNav" aria-label="Shivamini navigation">
+      <div>
+        <div style="font-size:18px; font-weight:900;">Shivamini Jobs</div>
+        <div class="shivaMiniNavTitle">The `/jobs` surface now reuses the same full `jobs.html` CSS/layout, with only a lightweight navigation bar added above it.</div>
+      </div>
+      <div class="shivaMiniNavLinks">
+        <a href="{{ url_for('dashboard') }}">📊 Dashboard</a>
+        <a href="{{ url_for('campaigns_page') }}">📌 Campaigns</a>
+        <a href="{{ url_for('send_page') }}">✉️ Send</a>
+        <a href="{{ url_for('jobs_page') }}" class="active">📄 Jobs</a>
+        <a href="{{ url_for('config_page') }}">⚙️ Config</a>
+        <a href="{{ url_for('domains_page') }}">🌐 Domains</a>
+      </div>
+    </nav>
+"""
+
+
+def build_jobs_page_html() -> str:
+    html = JOBS_HTML_PATH.read_text(encoding="utf-8")
+    html = html.replace("</style>", f"{JOBS_PAGE_NAV_STYLE}\n  </style>", 1)
+    html = html.replace('<div class="wrap">', f'<div class="wrap">\n{JOBS_PAGE_NAV_HTML}', 1)
+    return html
 
 SEND_PAGE_BODY = r"""
 <div class="wrap">
@@ -2127,31 +2186,7 @@ def campaigns_page():
 
 @app.get("/jobs")
 def jobs_page():
-    body = render_template_string(
-        """
-        <div class="top">
-          <div>
-            <h1 class="title">Jobs board</h1>
-            <div class="subtitle">Navigation button now opens the full static job layout exactly inside the Jobs surface, with a local section navigation bar on top.</div>
-          </div>
-          <div class="actions">
-            <a class="btn" href="#job-overview">Open job layout</a>
-            <button class="secondary">🎛️ Filters</button>
-          </div>
-        </div>
-
-        <div class="sectionNav">
-          {% for item in nav_items %}
-          <a href="{{ item.href }}">{{ item.label }}</a>
-          {% endfor %}
-        </div>
-
-        {{ job_markup|safe }}
-        """,
-        nav_items=JOBS_NAV_ITEMS,
-        job_markup=JOBS_SHOWCASE_HTML,
-    )
-    return render("jobs", "Shivamini Jobs", body)
+    return render_template_string(build_jobs_page_html())
 
 
 @app.get("/job/<job_id>")
