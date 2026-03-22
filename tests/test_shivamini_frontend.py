@@ -10,7 +10,15 @@ def test_shivamini_routes_render():
     html = client.get("/").get_data(as_text=True)
     assert "Dashboard frontend skeleton" in html
     assert "Excel audience workflow" in html
+    assert "Operations snapshot" in html
+    assert "Dashboard fake notes" in html
     assert "Shivamini" in html
+
+    jobs_html = client.get("/jobs").get_data(as_text=True)
+    assert "Navigation button now opens the full static job layout" in jobs_html
+    assert 'data-jobid="83b5cd63007e"' in jobs_html
+    assert "PMTA Live Panel" in jobs_html
+    assert "Chunk preflight" in jobs_html
 
     send_html = client.get("/send").get_data(as_text=True)
     assert "SMTP Mail Sender" in send_html
