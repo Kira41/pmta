@@ -15,7 +15,8 @@ def test_shivamini_routes_render():
     assert "Shivamini" in html
 
     jobs_html = client.get("/jobs").get_data(as_text=True)
-    assert "Navigation button now opens the full static job layout" in jobs_html
+    assert 'aria-label="Shivamini navigation"' in jobs_html
+    assert "full `jobs.html` CSS/layout" in jobs_html
     assert 'data-jobid="83b5cd63007e"' in jobs_html
     assert "PMTA Live Panel" in jobs_html
     assert "Chunk preflight" in jobs_html
