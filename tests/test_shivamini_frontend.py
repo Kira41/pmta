@@ -13,8 +13,9 @@ def test_shivamini_routes_render():
     assert "Shivamini" in html
 
     send_html = client.get("/send").get_data(as_text=True)
-    assert "Send workspace" in send_html
-    assert "Jobs monitor" in send_html
+    assert "SMTP Mail Sender" in send_html
+    assert "Preflight &amp; Send Controls" in send_html
+    assert "Save Domains" in send_html
 
 
 def test_shivamini_api_payloads():
