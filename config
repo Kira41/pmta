@@ -53,11 +53,12 @@ spool /var/spool/pmta
 </acct-file>
 
 ############################################################################
-# HTTP MANAGEMENT (lock down in production)
+# MANAGEMENT
+# Shiva now queries PowerMTA over SSH/CLI instead of the HTTP monitor/bridge.
+# Keep the admin listener only if you still need local web management.
 ############################################################################
 http-mgmt-port 1993
-http-access 0.0.0.0/0 admin
-http-access 0.0.0.0/0 monitor
+http-access 127.0.0.1 admin
 
 ############################################################################
 # STRICT DOMAIN ROUTING (MAIL FROM -> dedicated virtual-mta)

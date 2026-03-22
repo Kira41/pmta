@@ -1,10 +1,13 @@
 import os
 import json
+import csv
 import hashlib
 import math
 import logging
 import random
 import re
+import shlex
+import shutil
 import socket
 try:
     import ssl
@@ -3264,8 +3267,14 @@ class SendJob:
     pmta_job_id: str = ""
     bridge_mode: str = ""
 
-    # SMTP host used for this job (also used to derive PMTA monitor base URL)
+    # SMTP host used for this job
     smtp_host: str = ""
+    ssh_host: str = ""
+    ssh_port: int = 22
+    ssh_user: str = ""
+    ssh_key_path: str = ""
+    ssh_pass: str = ""
+    ssh_timeout: float = 8.0
 
     # PMTA live panel snapshot (optional)
     pmta_live: dict = field(default_factory=dict)
@@ -4072,6 +4081,13 @@ _ALLOWED_FORM_FIELDS = {
     "smtp_user",
     "smtp_pass",
     "remember_pass",
+    "ssh_host",
+    "ssh_port",
+    "ssh_user",
+    "ssh_key_path",
+    "ssh_pass",
+    "ssh_timeout",
+    "remember_ssh_pass",
     "permission_ok",
     "delay_s",
     "max_rcpt",
@@ -4752,6 +4768,12 @@ def _job_snapshot_dict(job: 'SendJob') -> dict:
         "pmta_job_id": job.pmta_job_id or "",
         "bridge_mode": str(job.bridge_mode or ""),
         "smtp_host": job.smtp_host or "",
+        "ssh_host": job.ssh_host or "",
+        "ssh_port": int(job.ssh_port or 22),
+        "ssh_user": job.ssh_user or "",
+        "ssh_key_path": job.ssh_key_path or "",
+        "ssh_pass": job.ssh_pass or "",
+        "ssh_timeout": float(job.ssh_timeout or 8.0),
         "pmta_live": job.pmta_live or {},
         "pmta_live_ts": job.pmta_live_ts or "",
         "pmta_domains": job.pmta_domains or {},
@@ -5797,6 +5819,12 @@ def _sendjob_from_snapshot(s: dict) -> Optional['SendJob']:
         job.pmta_job_id = str(s.get("pmta_job_id") or jid)
         job.bridge_mode = str(s.get("bridge_mode") or "")
         job.smtp_host = str(s.get("smtp_host") or "")
+        job.ssh_host = str(s.get("ssh_host") or "")
+        job.ssh_port = int(s.get("ssh_port") or 22)
+        job.ssh_user = str(s.get("ssh_user") or "")
+        job.ssh_key_path = str(s.get("ssh_key_path") or "")
+        job.ssh_pass = str(s.get("ssh_pass") or "")
+        job.ssh_timeout = float(s.get("ssh_timeout") or 8.0)
         job.pmta_live = (s.get("pmta_live") if isinstance(s.get("pmta_live"), dict) else {}) or {}
         job.pmta_live_ts = str(s.get("pmta_live_ts") or "")
         job.pmta_domains = (s.get("pmta_domains") if isinstance(s.get("pmta_domains"), dict) else {}) or {}
@@ -6630,6 +6658,60 @@ PAGE_FORM = r"""
       </div>
 
       <div class="card">
+      <h2>SSH Connection</h2>
+
+      <div class="row">
+        <div>
+          <label>SSH Host</label>
+          <input name="ssh_host" placeholder="Example: same PMTA server host/IP">
+        </div>
+        <div>
+          <label>SSH Port</label>
+          <input name="ssh_port" type="number" placeholder="22" value="22">
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>SSH Username</label>
+          <input name="ssh_user" placeholder="Example: root or pmtaops">
+        </div>
+        <div>
+          <label>SSH Key Path (optional)</label>
+          <input name="ssh_key_path" placeholder="/home/app/.ssh/id_rsa">
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>SSH Password (optional)</label>
+          <input name="ssh_pass" type="password" placeholder="Requires sshpass on the Shiva host">
+        </div>
+        <div>
+          <label>SSH Timeout (seconds)</label>
+          <input name="ssh_timeout" type="number" value="8" min="3" max="120">
+        </div>
+      </div>
+
+      <div class="check" style="margin-top:10px">
+        <input type="checkbox" id="remember_ssh_pass" name="remember_ssh_pass">
+        <div>
+          Remember SSH password on this browser (saved in server database (SQLite)). <b style="color: var(--warn)">Not recommended</b> on shared PCs.
+        </div>
+      </div>
+
+      <div class="hint">
+        <b>PMTA monitoring/accounting now uses SSH only.</b> Shiva runs commands such as <code>pmta show status</code> and tails the remote accounting CSV via SSH.
+      </div>
+
+      <div class="actions">
+        <button class="btn secondary" type="button" id="btnSshTest">🖧 Test SSH</button>
+        <div class="mini">Checks SSH access and runs <code>pmta show status</code>.</div>
+      </div>
+      <div class="inline-status" id="sshTestInline"></div>
+      </div>
+
+      <div class="card">
         <h2>Preflight & Send Controls</h2>
 
         <div class="check">
@@ -6953,6 +7035,11 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
           data[name] = rememberPass ? (el.value || '') : '';
           return;
         }
+        if(name === 'ssh_pass'){
+          const rememberSsh = document.getElementById('remember_ssh_pass')?.checked;
+          data[name] = rememberSsh ? (el.value || '') : '';
+          return;
+        }
         if(name === 'ai_token'){
           const rememberAi = document.getElementById('remember_ai')?.checked;
           data[name] = rememberAi ? (el.value || '') : '';
@@ -7061,6 +7148,52 @@ https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
   }
 
   document.getElementById('btnTest').addEventListener('click', doSmtpTest);
+
+  async function doSshTest(){
+    const btn = document.getElementById('btnSshTest');
+    const box = document.getElementById('sshTestInline');
+    const setBox = (html, kind) => {
+      box.classList.add('show');
+      box.style.borderColor = kind === 'good' ? 'rgba(53,228,154,.35)' : (kind === 'bad' ? 'rgba(255,94,115,.35)' : 'rgba(255,193,77,.35)');
+      box.innerHTML = html;
+    };
+
+    btn.disabled = true;
+    const payload = {
+      smtp_host: (q('smtp_host')?.value || '').trim(),
+      ssh_host: (q('ssh_host')?.value || '').trim(),
+      ssh_port: (q('ssh_port')?.value || '22').trim(),
+      ssh_user: (q('ssh_user')?.value || '').trim(),
+      ssh_key_path: (q('ssh_key_path')?.value || '').trim(),
+      ssh_pass: (q('ssh_pass')?.value || '').trim(),
+      ssh_timeout: (q('ssh_timeout')?.value || '8').trim(),
+    };
+
+    try{
+      const r = await fetch('/api/ssh_test', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(payload)
+      });
+      const j = await r.json().catch(()=>({}));
+      if(r.ok && j.ok){
+        toast('✅ SSH OK', j.detail || 'SSH connection successful', 'good');
+        setBox(`<b>SSH OK</b><br>• ${(j.detail || '')}<br>• Target: <b>${escHtml(j.target || '—')}</b>`, 'good');
+      }else{
+        const msg = (j && (j.detail || j.error)) ? (j.detail || j.error) : `HTTP ${r.status}`;
+        toast('❌ SSH Failed', msg, 'bad');
+        setBox(`<b>SSH Failed</b><br>• ${escHtml(msg)}`, 'bad');
+      }
+    }catch(e){
+      const msg = e?.toString?.() || 'Unknown error';
+      toast('❌ SSH Failed', msg, 'bad');
+      setBox(`<b>SSH Failed</b><br>• ${escHtml(msg)}`, 'bad');
+    }finally{
+      btn.disabled = false;
+    }
+  }
+
+  document.getElementById('btnSshTest').addEventListener('click', doSshTest);
 
   async function doAiRewrite(){
     const btn = document.getElementById('btnAiRewrite');
@@ -12917,100 +13050,162 @@ def db_find_job_ids_by_recipient(rcpt: str, limit: int = 8) -> List[str]:
 
 
 # =========================
-# PowerMTA Monitoring (optional)
+# PowerMTA over SSH
 # =========================
-# If you run PowerMTA, you can health-check it via the Web Monitor / HTTP Monitoring API before creating a send job.
-# This prevents starting jobs while PowerMTA is down or overloaded.
-#
-# Enable (recommended explicit):
-#   # Derived from SMTP Host automatically (no need to set PMTA_MONITOR_BASE_URL):
-#   PMTA monitor base = http://<smtp_host>:8080
-# Optional:
-#   PMTA_MONITOR_TIMEOUT_S=3
-#   PMTA_MONITOR_API_KEY=... (if you enabled http-api-key)
-#   PMTA_HEALTH_REQUIRED=1 (block if monitor unreachable) or 0 (warn-only)
 try:
-    PMTA_MONITOR_TIMEOUT_S = float((os.getenv("PMTA_MONITOR_TIMEOUT_S", "3") or "3").strip())
+    PMTA_SSH_TIMEOUT_S = float((os.getenv("PMTA_SSH_TIMEOUT_S", "8") or "8").strip())
 except Exception:
-    PMTA_MONITOR_TIMEOUT_S = 3.0
-
-# PMTA monitor base URL / scheme
-# - Some PMTA builds force HTTPS on :8080 (HTTP returns: "Please use HTTPS instead").
-# - Use PMTA_MONITOR_SCHEME=auto|https|http (auto defaults to https-first).
-# - Or override fully with PMTA_MONITOR_BASE_URL (e.g. https://194.116.172.135:8080)
-PMTA_MONITOR_BASE_URL = (os.getenv("PMTA_MONITOR_BASE_URL", "") or "").strip()
-PMTA_MONITOR_SCHEME = (os.getenv("PMTA_MONITOR_SCHEME", "auto") or "auto").strip().lower()
-if PMTA_MONITOR_SCHEME not in {"auto", "http", "https"}:
-    PMTA_MONITOR_SCHEME = "auto"
-
-PMTA_MONITOR_API_KEY = (os.getenv("PMTA_MONITOR_API_KEY", "") or "").strip()
+    PMTA_SSH_TIMEOUT_S = 8.0
+PMTA_SSH_USER = (os.getenv("PMTA_SSH_USER", "") or "").strip()
+try:
+    PMTA_SSH_PORT = int((os.getenv("PMTA_SSH_PORT", "22") or "22").strip())
+except Exception:
+    PMTA_SSH_PORT = 22
+PMTA_SSH_KEY_PATH = (os.getenv("PMTA_SSH_KEY_PATH", "") or "").strip()
+PMTA_SSH_PASSWORD = (os.getenv("PMTA_SSH_PASSWORD", "") or "").strip()
+PMTA_SSH_COMMAND = (os.getenv("PMTA_SSH_COMMAND", "pmta") or "pmta").strip() or "pmta"
+PMTA_ACCOUNTING_FILE = (os.getenv("PMTA_ACCOUNTING_FILE", "/var/log/pmta/acct.csv") or "/var/log/pmta/acct.csv").strip()
+try:
+    PMTA_ACCOUNTING_TAIL_LINES = int((os.getenv("PMTA_ACCOUNTING_TAIL_LINES", "2500") or "2500").strip())
+except Exception:
+    PMTA_ACCOUNTING_TAIL_LINES = 2500
 PMTA_HEALTH_REQUIRED = (os.getenv("PMTA_HEALTH_REQUIRED", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+PMTA_MONITOR_TIMEOUT_S = PMTA_SSH_TIMEOUT_S
+PMTA_MONITOR_BASE_URL = ""
+PMTA_MONITOR_SCHEME = "ssh"
+PMTA_MONITOR_API_KEY = ""
 
 
-def _pmta_norm_base(base: str) -> str:
-    b = (base or "").strip()
-    if not b:
+def _normalize_ssh_host(raw: str) -> str:
+    host = (raw or "").strip()
+    if not host:
         return ""
-    # Remove UI suffix if someone pasted it
-    for suf in ("/ui", "/ui/", "/ui/index.html"):
-        if b.endswith(suf):
-            b = b[: -len(suf)]
-    return b.rstrip("/")
-
-
-def _pmta_base_from_smtp_host(smtp_host: str) -> str:
-    """Build PMTA monitor base URL from SMTP host.
-
-    Examples:
-      smtp_host="194.116.172.135"       -> http://194.116.172.135:8080
-      smtp_host="mail.example.com"      -> http://mail.example.com:8080
-      smtp_host="http://x.y.z:2525"     -> http://x.y.z:8080
-
-    Notes:
-    - Strips scheme/path/port if user pasted them by mistake.
-    - Removes trailing /ui if present.
-    """
-    h = (smtp_host or "").strip()
-    if not h:
-        return ""
-
-    # If someone pasted a URL, try to parse hostname
-    if "://" in h:
+    if "://" in host:
         try:
-            from urllib.parse import urlparse
-            u = urlparse(h)
-            h = (u.hostname or "").strip()
+            parsed = urlsplit(host)
+            if parsed.hostname:
+                return str(parsed.hostname).strip()
         except Exception:
-            h = h.split("://", 1)[-1]
+            pass
+    if host.count(":") == 1 and not host.startswith("["):
+        return host.split(":", 1)[0].strip()
+    if host.startswith("[") and "]" in host:
+        return host[1:host.index("]")].strip()
+    return host
 
-    # Drop any path
-    h = h.split("/", 1)[0].strip()
 
-    # Drop port if included as host:port (IPv4/hostname)
-    if h and (":" in h) and (not h.startswith("[")):
-        h = h.split(":", 1)[0].strip()
+def _resolve_pmta_ssh_profile(*, smtp_host: str = "", campaign_id: str = "", job: Any = None,
+                              ssh_host: str = "", ssh_port: Optional[int] = None, ssh_user: str = "",
+                              ssh_key_path: str = "", ssh_pass: str = "", ssh_timeout: Optional[float] = None) -> dict:
+    profile = {
+        "host": _normalize_ssh_host(str(ssh_host or "").strip()),
+        "port": int(ssh_port or 0),
+        "user": str(ssh_user or "").strip(),
+        "key_path": str(ssh_key_path or "").strip(),
+        "password": str(ssh_pass or "").strip(),
+        "timeout": float(ssh_timeout or 0.0),
+        "command": str(PMTA_SSH_COMMAND or "pmta").strip() or "pmta",
+        "accounting_file": str(PMTA_ACCOUNTING_FILE or "/var/log/pmta/acct.csv").strip(),
+    }
 
-    if not h:
+    if job is not None:
+        profile["host"] = profile["host"] or _normalize_ssh_host(str(getattr(job, "ssh_host", "") or ""))
+        profile["port"] = int(profile["port"] or getattr(job, "ssh_port", 0) or 0)
+        profile["user"] = profile["user"] or str(getattr(job, "ssh_user", "") or "")
+        profile["key_path"] = profile["key_path"] or str(getattr(job, "ssh_key_path", "") or "")
+        profile["password"] = profile["password"] or str(getattr(job, "ssh_pass", "") or "")
+        profile["timeout"] = float(profile["timeout"] or getattr(job, "ssh_timeout", 0.0) or 0.0)
+        campaign_id = campaign_id or str(getattr(job, "campaign_id", "") or "")
+        smtp_host = smtp_host or str(getattr(job, "smtp_host", "") or "")
+
+    if campaign_id:
+        try:
+            form = db_get_campaign_form_raw(campaign_id) or {}
+        except Exception:
+            form = {}
+        if isinstance(form, dict):
+            profile["host"] = profile["host"] or _normalize_ssh_host(str(form.get("ssh_host") or ""))
+            profile["port"] = int(profile["port"] or form.get("ssh_port") or 0)
+            profile["user"] = profile["user"] or str(form.get("ssh_user") or "")
+            profile["key_path"] = profile["key_path"] or str(form.get("ssh_key_path") or "")
+            profile["password"] = profile["password"] or str(form.get("ssh_pass") or "")
+            try:
+                profile["timeout"] = float(profile["timeout"] or form.get("ssh_timeout") or 0.0)
+            except Exception:
+                pass
+
+    profile["host"] = profile["host"] or _normalize_ssh_host(str(smtp_host or "").strip())
+    profile["port"] = int(profile["port"] or PMTA_SSH_PORT or 22)
+    profile["user"] = profile["user"] or PMTA_SSH_USER
+    profile["key_path"] = profile["key_path"] or PMTA_SSH_KEY_PATH
+    profile["password"] = profile["password"] or PMTA_SSH_PASSWORD
+    profile["timeout"] = float(profile["timeout"] or PMTA_SSH_TIMEOUT_S or 8.0)
+    profile["target"] = ((profile["user"] + "@") if profile["user"] else "") + str(profile["host"] or "")
+    profile["enabled"] = bool(profile["host"])
+    return profile
+
+
+def _mask_ssh_target(profile: dict) -> str:
+    if not isinstance(profile, dict):
         return ""
-
-    # Explicit override (monitor host may differ from smtp_host)
-    if (PMTA_MONITOR_BASE_URL or "").strip():
-        return _pmta_norm_base(PMTA_MONITOR_BASE_URL)
-
-    scheme = (PMTA_MONITOR_SCHEME or "auto").strip().lower()
-    if scheme == "http":
-        return _pmta_norm_base(f"http://{h}:8080")
-
-    # Default: https (works with PMTA builds that refuse plain HTTP)
-    return _pmta_norm_base(f"https://{h}:8080")
+    target = str(profile.get("target") or "").strip()
+    if not target:
+        return ""
+    return f"{target}:{int(profile.get('port') or 22)}"
 
 
-def _pmta_headers() -> dict:
-    h = {"Accept": "application/json"}
-    if PMTA_MONITOR_API_KEY:
-        # Common pattern: pmta uses http-api-key -> header X-API-Key
-        h["X-API-Key"] = PMTA_MONITOR_API_KEY
-    return h
+def _build_ssh_command(profile: dict, remote_cmd: str) -> List[str]:
+    cmd = [
+        "ssh",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", f"ConnectTimeout={max(2, int(profile.get('timeout') or PMTA_SSH_TIMEOUT_S or 8.0))}",
+        "-p", str(int(profile.get("port") or 22)),
+    ]
+    key_path = str(profile.get("key_path") or "").strip()
+    if key_path:
+        cmd.extend(["-i", key_path])
+    elif not str(profile.get("password") or "").strip():
+        cmd.extend(["-o", "BatchMode=yes"])
+    cmd.append(str(profile.get("target") or ""))
+    cmd.append(remote_cmd)
+    return cmd
+
+
+def _run_pmta_ssh(profile: dict, remote_cmd: str, *, timeout_s: Optional[float] = None) -> dict:
+    if not profile.get("enabled"):
+        return {"ok": False, "error": "ssh_not_configured", "stdout": "", "stderr": "", "target": ""}
+    cmd = _build_ssh_command(profile, remote_cmd)
+    password = str(profile.get("password") or "").strip()
+    if password:
+        sshpass = shutil.which("sshpass")
+        if not sshpass:
+            return {"ok": False, "error": "sshpass_not_installed_for_password_auth", "stdout": "", "stderr": "", "target": _mask_ssh_target(profile)}
+        cmd = [sshpass, "-p", password] + cmd
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=max(2.0, float(timeout_s or profile.get("timeout") or PMTA_SSH_TIMEOUT_S or 8.0)),
+            check=False,
+        )
+        return {
+            "ok": proc.returncode == 0,
+            "stdout": str(proc.stdout or ""),
+            "stderr": str(proc.stderr or ""),
+            "error": "" if proc.returncode == 0 else (str(proc.stderr or proc.stdout or "").strip() or f"ssh_exit_{proc.returncode}"),
+            "target": _mask_ssh_target(profile),
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {"ok": False, "stdout": str(getattr(exc, "stdout", "") or ""), "stderr": str(getattr(exc, "stderr", "") or ""), "error": f"timeout after {exc.timeout}s", "target": _mask_ssh_target(profile)}
+    except Exception as exc:
+        return {"ok": False, "stdout": "", "stderr": "", "error": str(exc), "target": _mask_ssh_target(profile)}
+
+
+def _run_pmta_cli(profile: dict, pmta_args: str, *, timeout_s: Optional[float] = None) -> dict:
+    return _run_pmta_ssh(profile, f"{profile.get('command') or PMTA_SSH_COMMAND} {pmta_args}".strip(), timeout_s=timeout_s)
 
 
 def _dict_get_ci(d: Any, *names: str) -> Any:
@@ -13163,51 +13358,39 @@ def _http_get_text(url: str, *, timeout_s: float) -> Tuple[bool, str, str, dict]
     return ok, txt, err, meta
 
 
-def pmta_probe_endpoints(*, smtp_host: str) -> dict:
-    """Probe the common PMTA Web Monitor endpoints and return a quick diagnostic."""
-    base = _pmta_base_from_smtp_host(smtp_host)
-    if not base:
-        return {"ok": False, "error": "missing/invalid smtp_host", "base": ""}
+def pmta_probe_endpoints(*, smtp_host: str, campaign_id: str = "", ssh_host: str = "", ssh_port: Optional[int] = None,
+                         ssh_user: str = "", ssh_key_path: str = "", ssh_pass: str = "", ssh_timeout: Optional[float] = None) -> dict:
+    """Probe PMTA CLI access over SSH and return a quick diagnostic."""
+    profile = _resolve_pmta_ssh_profile(
+        smtp_host=smtp_host,
+        campaign_id=campaign_id,
+        ssh_host=ssh_host,
+        ssh_port=ssh_port,
+        ssh_user=ssh_user,
+        ssh_key_path=ssh_key_path,
+        ssh_pass=ssh_pass,
+        ssh_timeout=ssh_timeout,
+    )
+    if not profile.get("enabled"):
+        return {"ok": False, "error": "missing/invalid ssh host", "target": ""}
 
-    paths = [
-        ("status", "/status?format=json"),
-        ("queues", "/queues?format=json"),
-        ("domains", "/domains?format=json"),
-        ("vmtas", "/vmtas?format=json"),
-        ("jobs", "/jobs?format=json"),
-        ("logs", "/logs?format=json"),
-        ("localips", "/getlocalips"),
-    ]
+    commands = {
+        "status": "show status",
+        "domains": "show domains --errors --maxitems=10",
+        "queues": "show queues --errors --maxitems=10",
+        "topqueues": "show topqueues --mode=backoff",
+        "version": "show version",
+    }
 
-    out = {"ok": True, "base": base, "host": smtp_host, "endpoints": {}}
-
-    for name, p in paths:
-        url = base + p
-        ok, txt, err, meta = _http_get_text(url, timeout_s=min(6.0, max(2.0, PMTA_MONITOR_TIMEOUT_S)))
-        entry: Dict[str, Any] = {"ok": bool(ok), "url": url, "meta": meta}
-        if ok:
-            # try parse JSON keys to understand schema
-            parsed = None
-            try:
-                parsed = json.loads(txt or "{}")
-            except Exception:
-                parsed = None
-            if isinstance(parsed, dict):
-                entry["json_type"] = "dict"
-                entry["keys"] = list(parsed.keys())[:40]
-            elif isinstance(parsed, list):
-                entry["json_type"] = "list"
-                entry["items"] = len(parsed)
-                if parsed and isinstance(parsed[0], dict):
-                    entry["item_keys"] = list(parsed[0].keys())[:40]
-            else:
-                entry["json_type"] = "non_json"
-            entry["snippet"] = (txt or "")[:280]
-        else:
-            entry["error"] = err
-            entry["snippet"] = (txt or "")[:280]
-        out["endpoints"][name] = entry
-
+    out = {"ok": True, "target": _mask_ssh_target(profile), "host": smtp_host or profile.get("host"), "commands": {}}
+    for name, cmd in commands.items():
+        res = _run_pmta_cli(profile, cmd, timeout_s=min(12.0, max(4.0, float(profile.get("timeout") or PMTA_SSH_TIMEOUT_S))))
+        out["commands"][name] = {
+            "ok": bool(res.get("ok")),
+            "command": f"{profile.get('command')} {cmd}",
+            "error": str(res.get("error") or ""),
+            "snippet": str(res.get("stdout") or res.get("stderr") or "")[:320],
+        }
     return out
 
 
@@ -13474,122 +13657,96 @@ def _queues_extract_top(obj: Any, *, top_n: int = 6) -> List[dict]:
     return out[:n]
 
 
-def pmta_health_check(*, smtp_host: str) -> dict:
-    """Health check PowerMTA via Web Monitor.
+def _ssh_extract_metric(text: str, term_groups: List[Tuple[str, ...]]) -> Optional[int]:
+    lines = [str(line or "") for line in str(text or "").splitlines()]
+    for terms in term_groups:
+        for line in lines:
+            low = line.lower()
+            if all(term.lower() in low for term in terms):
+                m = re.search(r"(-?\d+)", line)
+                if m:
+                    try:
+                        return int(m.group(1))
+                    except Exception:
+                        pass
+    return None
 
-    IMPORTANT:
-    - PMTA 5.0r1 (enterprise-plus) returns /status like:
-        {"data":{"mta":{"status":{...}}},"status":"success"}
-      (so counts are under data.mta.status.*)
 
-    Returns:
-      {
-        enabled: bool,
-        ok: bool,
-        required: bool,
-        busy: bool,
-        reason: str,
-        status_url: str,
-        spool_recipients: Optional[int],
-        spool_messages: Optional[int],
-        queued_recipients: Optional[int],
-        queued_messages: Optional[int],
-      }
-    """
+def _pmta_cli_top_queues(text: str, *, top_n: int = 6) -> List[dict]:
+    out: List[dict] = []
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line or line.lower().startswith(("queue", "domain", "name", "--", "total")):
+            continue
+        if "/" not in line and "." not in line:
+            continue
+        nums = [int(x) for x in re.findall(r"\b\d+\b", line)]
+        if not nums:
+            continue
+        qname = line.split()[0]
+        out.append({
+            "queue": qname,
+            "domain": _normalize_pmta_queue_to_domain(qname),
+            "recipients": int(nums[0] if len(nums) > 0 else 0),
+            "messages": int(nums[1] if len(nums) > 1 else (nums[0] if nums else 0)),
+            "deferred": int(nums[2] if len(nums) > 2 else 0),
+            "last_error": line if re.search(r"\b(?:4\d\d|5\d\d|4\.\d\.\d|5\.\d\.\d)\b", line) else "",
+        })
+    out.sort(key=lambda item: int(item.get("recipients") or 0), reverse=True)
+    return out[: max(0, int(top_n or 0))]
 
-    base = _pmta_base_from_smtp_host(smtp_host)
-    if not base:
-        return {"enabled": False, "ok": True, "required": False, "busy": False, "reason": "disabled", "status_url": ""}
 
-    status_url = f"{base}/status?format=json"
+def _pmta_cli_domain_rows(text: str, *, limit: int = 6) -> List[dict]:
+    rows: List[dict] = []
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line or line.lower().startswith(("domain", "name", "--", "total")):
+            continue
+        m = re.match(r"([A-Za-z0-9*._-]+\.[A-Za-z0-9._-]+(?:/[A-Za-z0-9*._-]+)?)\s+(.*)$", line)
+        if not m:
+            continue
+        nums = [int(x) for x in re.findall(r"\b\d+\b", m.group(2))]
+        rows.append({
+            "domain": _normalize_pmta_queue_to_domain(m.group(1)) or m.group(1).split("/", 1)[0].lower(),
+            "recipients": int(nums[0] if len(nums) > 0 else 0),
+            "deferred": int(nums[1] if len(nums) > 1 else 0),
+            "active": int(nums[2] if len(nums) > 2 else 0),
+            "last_error": line if re.search(r"\b(?:4\d\d|5\d\d|4\.\d\.\d|5\.\d\.\d)\b", line) else "",
+        })
+    rows.sort(key=lambda item: int(item.get("recipients") or 0), reverse=True)
+    return rows[: max(0, int(limit or 0))]
 
-    ok, js, err = _http_get_json(status_url, timeout_s=PMTA_MONITOR_TIMEOUT_S)
-    if not ok:
+
+def _pmta_detail_metrics_from_cli(text: str) -> dict:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    errors = [line[:140] for line in lines if re.search(r"\b(?:4\d\d|5\d\d|4\.\d\.\d|5\.\d\.\d)\b", line)]
+    deferrals = len([line for line in lines if re.search(r"\b(?:4\d\d|4\.\d\.\d)\b", line)])
+    return {"deferrals": int(deferrals), "errors_count": len(errors), "errors_sample": errors[:3]}
+
+
+def pmta_health_check(*, smtp_host: str, campaign_id: str = "", job: Any = None) -> dict:
+    live = pmta_live_panel(smtp_host=smtp_host, campaign_id=campaign_id, job=job)
+    if not live.get("enabled"):
+        return {"enabled": False, "ok": True, "required": False, "busy": False, "reason": str(live.get("reason") or "disabled"), "status_url": ""}
+    if not live.get("ok"):
         return {
             "enabled": True,
             "ok": False,
             "required": bool(PMTA_HEALTH_REQUIRED),
             "busy": False,
-            "reason": f"monitor unreachable: {err}",
-            "status_url": status_url,
-            "spool_recipients": None,
-            "spool_messages": None,
-            "queued_recipients": None,
-            "queued_messages": None,
+            "reason": f"ssh unreachable: {live.get('reason', 'unknown')}",
+            "status_url": str(live.get("target") or ""),
+            "spool_recipients": live.get("spool_recipients"),
+            "spool_messages": live.get("spool_messages"),
+            "queued_recipients": live.get("queued_recipients"),
+            "queued_messages": live.get("queued_messages"),
         }
 
-    def _status_node(obj: Any) -> dict:
-        if not isinstance(obj, dict):
-            return {}
-        # Some versions: {"status": { ... }}
-        st = obj.get("status")
-        if isinstance(st, dict):
-            return st
-        # PMTA 5.0r1: {"data": {"mta": {"status": { ... }}}}
-        data = obj.get("data")
-        if isinstance(data, dict):
-            mta = data.get("mta")
-            if isinstance(mta, dict):
-                st2 = mta.get("status")
-                if isinstance(st2, dict):
-                    return st2
-        # Fallback: if someone returns {"mta": {"status": ...}}
-        mta2 = obj.get("mta")
-        if isinstance(mta2, dict) and isinstance(mta2.get("status"), dict):
-            return mta2.get("status")  # type: ignore
-        return {}
+    spool_rcpt = _to_int(live.get("spool_recipients"))
+    spool_msg = _to_int(live.get("spool_messages"))
+    queued_rcpt = _to_int(live.get("queued_recipients"))
+    queued_msg = _to_int(live.get("queued_messages"))
 
-    stn = _status_node(js)
-
-    # Spool counts
-    spool_rcpt: Optional[int] = None
-    spool_msg: Optional[int] = None
-    spool = stn.get("spool") if isinstance(stn.get("spool"), dict) else {}
-    if isinstance(spool, dict) and spool:
-        spool_rcpt = _to_int(spool.get("totalRcp"))
-        files = spool.get("files") if isinstance(spool.get("files"), dict) else {}
-        if isinstance(files, dict) and files:
-            # closest to "messages" in spool: number of spool files in use
-            spool_msg = _to_int(files.get("inUse"))
-            if spool_msg is None:
-                spool_msg = _to_int(files.get("total"))
-
-    # Queue counts from /status (fast, always present on 5.0r1)
-    queued_rcpt_status: Optional[int] = None
-    queue = stn.get("queue") if isinstance(stn.get("queue"), dict) else {}
-    if isinstance(queue, dict) and queue:
-        s = 0
-        got = False
-        for v in queue.values():
-            if isinstance(v, dict):
-                iv = _to_int(v.get("rcp"))
-                if iv is not None:
-                    s += int(iv)
-                    got = True
-        if got:
-            queued_rcpt_status = int(s)
-
-    # Best-effort queued counts from /queues (more detailed if available)
-    queued_rcpt: Optional[int] = None
-    queued_msg: Optional[int] = None
-    queues_url = f"{base}/queues?format=json"
-    ok2, js2, _err2 = _http_get_json(queues_url, timeout_s=min(6.0, max(2.0, PMTA_MONITOR_TIMEOUT_S)))
-    if ok2:
-        queued_rcpt, queued_msg = _sum_queue_counts(js2)
-
-    # Fallback to /status queue sum
-    if queued_rcpt is None:
-        queued_rcpt = queued_rcpt_status
-    if queued_msg is None and queued_rcpt is not None:
-        queued_msg = int(queued_rcpt)
-
-    # If spool not extracted, try last-resort deep search (safe; _to_int ignores dict/list)
-    if spool_rcpt is None:
-        spool_rcpt = _deep_find_first_int(js, {"totalrcp", "spool_totalrcp", "spooltotalrcp", "spoolrecipients", "spool_recipients"})
-    if spool_msg is None:
-        spool_msg = _deep_find_first_int(js, {"inuse", "spoolfiles", "spool_messages", "spoolmessages", "total"})
-
-    # Thresholds
     max_spool_rcpt = cfg_get_int("PMTA_MAX_SPOOL_RECIPIENTS", 200000)
     max_spool_msg = cfg_get_int("PMTA_MAX_SPOOL_MESSAGES", 50000)
     max_q_rcpt = cfg_get_int("PMTA_MAX_QUEUED_RECIPIENTS", 250000)
@@ -13605,15 +13762,13 @@ def pmta_health_check(*, smtp_host: str) -> dict:
     if queued_msg is not None and queued_msg > max_q_msg:
         busy_reasons.append(f"queued_messages={queued_msg}>{max_q_msg}")
 
-    busy = bool(busy_reasons)
-
     return {
         "enabled": True,
         "ok": True,
         "required": bool(PMTA_HEALTH_REQUIRED),
-        "busy": busy,
-        "reason": ("; ".join(busy_reasons) if busy else "ok"),
-        "status_url": status_url,
+        "busy": bool(busy_reasons),
+        "reason": "; ".join(busy_reasons) if busy_reasons else "ok",
+        "status_url": str(live.get("target") or ""),
         "spool_recipients": spool_rcpt,
         "spool_messages": spool_msg,
         "queued_recipients": queued_rcpt,
@@ -13832,89 +13987,18 @@ def pmta_pressure_policy_from_live(live: dict) -> dict:
     }
 
 
-def pmta_domains_overview(*, smtp_host: str) -> dict:
-    """Fetch /domains and build a compact domain -> {queued,deferred,active} map.
+def pmta_domains_overview(*, smtp_host: str, campaign_id: str = "", job: Any = None) -> dict:
+    if not PMTA_DOMAIN_STATS:
+        return {"ok": False, "reason": "disabled", "domains": {}}
+    profile = _resolve_pmta_ssh_profile(smtp_host=smtp_host, campaign_id=campaign_id, job=job)
+    if not profile.get("enabled"):
+        return {"ok": False, "reason": "ssh_not_configured", "domains": {}}
+    res = _run_pmta_cli(profile, f"show domains --errors --maxitems={max(1, int(PMTA_DOMAINS_TOP_N or 6))}")
+    if not res.get("ok"):
+        return {"ok": False, "reason": str(res.get("error") or "ssh_failed"), "target": res.get("target"), "domains": {}}
+    rows = _pmta_cli_domain_rows(str(res.get("stdout") or ""), limit=max(1, int(PMTA_DOMAINS_TOP_N or 6)))
+    return {"ok": True, "reason": "ok", "target": res.get("target"), "domains": {row["domain"]: {"queued": int(row.get("recipients") or 0), "deferred": int(row.get("deferred") or 0), "active": int(row.get("active") or 0)} for row in rows}}
 
-    Many PMTA versions return nested payloads (sometimes under data.*). We therefore:
-    - parse JSON,
-    - then locate a list-of-dicts anywhere inside the payload.
-
-    Output:
-      { ok, reason, url, domains: { "gmail.com": {queued,deferred,active}, ... } }
-    """
-
-    base = _pmta_base_from_smtp_host(smtp_host)
-    if not base:
-        return {"ok": False, "reason": "disabled", "url": "", "domains": {}}
-
-    url = f"{base}/domains?format=json"
-    ok, js, err = _http_get_json(url, timeout_s=min(6.0, max(2.0, PMTA_MONITOR_TIMEOUT_S)))
-    if not ok:
-        return {"ok": False, "reason": err, "url": url, "domains": {}}
-
-    def _find_list_of_dicts(x: Any, *, max_nodes: int = 4500) -> List[dict]:
-        seen = 0
-
-        def walk(v: Any) -> Optional[List[dict]]:
-            nonlocal seen
-            if seen > max_nodes:
-                return None
-            seen += 1
-            if isinstance(v, list) and v and isinstance(v[0], dict):
-                return [i for i in v if isinstance(i, dict)]
-            if isinstance(v, dict):
-                for vv in v.values():
-                    r = walk(vv)
-                    if r is not None:
-                        return r
-            if isinstance(v, list):
-                for vv in v:
-                    r = walk(vv)
-                    if r is not None:
-                        return r
-            return None
-
-        return walk(x) or []
-
-    items = _find_list_of_dicts(js)
-
-    def pick_name(it: dict) -> str:
-        for k in ("domain", "name", "qname", "queue", "id"):
-            v = it.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip().lower().strip(".")
-        return ""
-
-    out: Dict[str, dict] = {}
-    for it in items:
-        raw_name = pick_name(it)
-        dom = _normalize_pmta_queue_to_domain(raw_name)
-        if not dom:
-            continue
-
-        queued = _deep_find_first_int(it, {"queued", "queued_recipients", "queuedrecipients", "recipientqueued", "queue_recipients", "queue", "rcpt", "rcp", "recipients"})
-        active = _deep_find_first_int(it, {"active", "activeconnections", "active_connections", "connections", "activeconns"})
-        deferred = _deep_find_first_int(it, {"deferred", "deferrals", "deferred_recipients", "deferredrecipients"})
-
-        # safer fallback: sum all keys that look like queue/defer
-        if queued is None:
-            queued = _deep_sum_ints_by_key_pred(it, lambda k: ("queue" in k) or ("queued" in k), max_nodes=800)
-        if deferred is None:
-            deferred = _deep_sum_ints_by_key_pred(it, lambda k: "defer" in k, max_nodes=800)
-
-        old = out.get(dom) or {}
-        out[dom] = {
-            # multiple queues/vMTAs can belong to same domain, so aggregate
-            "queued": int(old.get("queued") or 0) + int(queued or 0),
-            "deferred": int(old.get("deferred") or 0) + int(deferred or 0),
-            "active": (
-                (int(old.get("active") or 0) + int(active or 0))
-                if (active is not None or old.get("active") is not None)
-                else None
-            ),
-        }
-
-    return {"ok": True, "reason": "ok", "url": url, "domains": out}
 
 _PMTA_DETAIL_CACHE: Dict[str, Tuple[float, dict]] = {}
 
@@ -13970,240 +14054,23 @@ def _deep_find_first_list(obj: Any, keys: Set[str], *, max_nodes: int = 2500) ->
     return walk(obj)
 
 
-def pmta_live_panel(*, smtp_host: str) -> dict:
-    """Fetch /status + /queues to build a compact live panel.
-
-    Supports PMTA 5.0r1 (enterprise-plus) where /status JSON is under data.mta.status.*.
-
-    Returns:
-      {
-        enabled, ok, reason, ts,
-        spool_recipients, spool_messages,
-        queued_recipients, queued_messages,
-        active_connections, smtp_in_connections, smtp_out_connections,
-        traffic_last_hr_in, traffic_last_hr_out,
-        traffic_last_min_in, traffic_last_min_out,
-        deferred_total,
-        top_queues,
-        status_url, queues_url
-      }
-    """
-
-    base = _pmta_base_from_smtp_host(smtp_host)
-    if not base:
-        host_txt = (smtp_host or "").strip()
-        reason = "disabled: invalid_or_missing_smtp_host" if not host_txt else "disabled: cannot_build_monitor_base"
-        return {"enabled": False, "ok": True, "reason": reason, "ts": now_iso()}
-
-    status_url = f"{base}/status?format=json"
-    ok, js, err = _http_get_json(status_url, timeout_s=PMTA_MONITOR_TIMEOUT_S)
-    if not ok:
-        return {"enabled": True, "ok": False, "reason": f"monitor unreachable: {err}", "status_url": status_url, "ts": now_iso()}
-
-    def _status_node(obj: Any) -> dict:
-        if not isinstance(obj, dict):
-            return {}
-        st = obj.get("status")
-        if isinstance(st, dict):
-            return st
-        data = obj.get("data")
-        if isinstance(data, dict):
-            if isinstance(data.get("status"), dict):
-                return data.get("status")  # type: ignore
-            mta = data.get("mta")
-            if isinstance(mta, dict) and isinstance(mta.get("status"), dict):
-                return mta.get("status")  # type: ignore
-        mta2 = obj.get("mta")
-        if isinstance(mta2, dict) and isinstance(mta2.get("status"), dict):
-            return mta2.get("status")  # type: ignore
-        return {}
-
-    stn = _status_node(js)
-
-    # Spool
-    spool_rcpt: Optional[int] = None
-    spool_msg: Optional[int] = None
-    spool = stn.get("spool") if isinstance(stn.get("spool"), dict) else {}
-    if isinstance(spool, dict) and spool:
-        spool_rcpt = _to_int(spool.get("totalRcp"))
-        files = spool.get("files") if isinstance(spool.get("files"), dict) else {}
-        if isinstance(files, dict) and files:
-            # closest to "messages" in spool: number of spool files in use
-            spool_msg = _to_int(files.get("inUse"))
-            if spool_msg is None:
-                spool_msg = _to_int(files.get("total"))
-
-    # Queue sums from /status (fallback)
-    queued_rcpt_status: Optional[int] = None
-    queue = stn.get("queue") if isinstance(stn.get("queue"), dict) else {}
-    if isinstance(queue, dict) and queue:
-        s = 0
-        got = False
-        for v in queue.values():
-            if isinstance(v, dict):
-                iv = _to_int(v.get("rcp"))
-                if iv is not None:
-                    s += int(iv)
-                    got = True
-        if got:
-            queued_rcpt_status = int(s)
-
-    # Connections (sum in+out)
-    active_conns: Optional[int] = None
-    smtp_in_conns: Optional[int] = None
-    smtp_out_conns: Optional[int] = None
-    conn = stn.get("conn") if isinstance(stn.get("conn"), dict) else {}
-    if isinstance(conn, dict) and conn:
-        smtp_in = conn.get("smtpIn") if isinstance(conn.get("smtpIn"), dict) else {}
-        smtp_out = conn.get("smtpOut") if isinstance(conn.get("smtpOut"), dict) else {}
-        a = 0
-        got = False
-        if isinstance(smtp_in, dict):
-            iv = _to_int(smtp_in.get("cur"))
-            if iv is not None:
-                smtp_in_conns = int(iv)
-                a += int(iv)
-                got = True
-        if isinstance(smtp_out, dict):
-            iv = _to_int(smtp_out.get("cur"))
-            if iv is not None:
-                smtp_out_conns = int(iv)
-                a += int(iv)
-                got = True
-        if got:
-            active_conns = int(a)
-
-    # Traffic stats (recipients): last hour + last minute (in/out)
-    traffic_last_hr_in: Optional[int] = None
-    traffic_last_hr_out: Optional[int] = None
-    traffic_last_min_in: Optional[int] = None
-    traffic_last_min_out: Optional[int] = None
-    traffic = stn.get("traffic") if isinstance(stn.get("traffic"), dict) else {}
-    if isinstance(traffic, dict) and traffic:
-        last_hr = traffic.get("lastHr") if isinstance(traffic.get("lastHr"), dict) else {}
-        if isinstance(last_hr, dict) and last_hr:
-            hr_in = last_hr.get("in") if isinstance(last_hr.get("in"), dict) else {}
-            hr_out = last_hr.get("out") if isinstance(last_hr.get("out"), dict) else {}
-            if isinstance(hr_in, dict):
-                traffic_last_hr_in = _to_int(hr_in.get("rcp"))
-            if isinstance(hr_out, dict):
-                traffic_last_hr_out = _to_int(hr_out.get("rcp"))
-
-        last_min = traffic.get("lastMin") if isinstance(traffic.get("lastMin"), dict) else {}
-        if isinstance(last_min, dict) and last_min:
-            min_in = last_min.get("in") if isinstance(last_min.get("in"), dict) else {}
-            min_out = last_min.get("out") if isinstance(last_min.get("out"), dict) else {}
-            if isinstance(min_in, dict):
-                traffic_last_min_in = _to_int(min_in.get("rcp"))
-            if isinstance(min_out, dict):
-                traffic_last_min_out = _to_int(min_out.get("rcp"))
-
-    # NOTE: Do NOT use deep-int fallback for connections.
-    # Some PMTA nodes are dicts like {'cur':0,'max':1200,'top':2} and naive parsing can produce fake numbers (e.g., 12002).
-
-    # Deferred total (not always present in /status on 5.0r1 → default 0)
-    deferred_total = _deep_sum_ints_by_key_pred(js, lambda k: "defer" in k)
-
-    # /queues (optional) for queued totals + top queues
-    queued_rcpt: Optional[int] = None
-    queued_msg: Optional[int] = None
-    top_queues: List[dict] = []
-
-    queues_url = f"{base}/queues?format=json"
-    ok2, js2, _ = _http_get_json(queues_url, timeout_s=min(6.0, max(2.0, PMTA_MONITOR_TIMEOUT_S)))
-    if ok2:
-        queued_rcpt, queued_msg = _sum_queue_counts(js2)
-        try:
-            top_queues = _queues_extract_top(js2, top_n=PMTA_QUEUE_TOP_N)
-        except Exception:
-            top_queues = []
-
-    # Fallback queued from /status if /queues failed
-    if queued_rcpt is None:
-        queued_rcpt = queued_rcpt_status
-    if queued_msg is None and queued_rcpt is not None:
-        queued_msg = int(queued_rcpt)
-
-    # If /queues didn't provide top queues, build from /status.queue
-    if not top_queues and isinstance(queue, dict) and queue:
-        tmp = []
-        for name, v in queue.items():
-            if not isinstance(v, dict):
-                continue
-            rcp = _to_int(v.get("rcp"))
-            if rcp is None:
-                continue
-            tmp.append({
-                "queue": str(name),
-                "recipients": int(rcp),
-                "messages": int(rcp),
-                "deferred": 0,
-            })
-        tmp.sort(key=lambda x: int(x.get("recipients") or 0), reverse=True)
-        top_queues = tmp[: max(0, int(PMTA_QUEUE_TOP_N or 0))]
-
-    # PMTA 5.0r1 always includes these nodes; prefer 0 (real counter) over None (UI shows “—”).
-    if stn:
-        if spool_rcpt is None:
-            spool_rcpt = 0
-        if spool_msg is None:
-            spool_msg = 0
-        if queued_rcpt is None:
-            queued_rcpt = 0
-        if queued_msg is None:
-            queued_msg = int(queued_rcpt)
-        if active_conns is None:
-            active_conns = 0
-        if smtp_in_conns is None:
-            smtp_in_conns = 0
-        if smtp_out_conns is None:
-            smtp_out_conns = 0
-        if traffic_last_hr_in is None:
-            traffic_last_hr_in = 0
-        if traffic_last_hr_out is None:
-            traffic_last_hr_out = 0
-        if traffic_last_min_in is None:
-            traffic_last_min_in = 0
-        if traffic_last_min_out is None:
-            traffic_last_min_out = 0
-
-    return {
-        "enabled": True,
-        "ok": True,
-        "reason": "ok",
-        "status_url": status_url,
-        "queues_url": queues_url,
-        "spool_recipients": spool_rcpt,
-        "spool_messages": spool_msg,
-        "queued_recipients": queued_rcpt,
-        "queued_messages": queued_msg,
-        "active_connections": active_conns,
-        "smtp_in_connections": smtp_in_conns,
-        "smtp_out_connections": smtp_out_conns,
-        "traffic_last_hr_in": traffic_last_hr_in,
-        "traffic_last_hr_out": traffic_last_hr_out,
-        "traffic_last_min_in": traffic_last_min_in,
-        "traffic_last_min_out": traffic_last_min_out,
-        "deferred_total": int(deferred_total or 0),
-        "top_queues": top_queues,
-        "ts": now_iso(),
-    }
+def pmta_live_panel(*, smtp_host: str, campaign_id: str = "", job: Any = None) -> dict:
+    profile = _resolve_pmta_ssh_profile(smtp_host=smtp_host, campaign_id=campaign_id, job=job)
+    if not profile.get("enabled"):
+        return {"enabled": False, "ok": True, "reason": "disabled: missing_ssh_host", "ts": now_iso()}
+    status_res = _run_pmta_cli(profile, "show status")
+    if not status_res.get("ok"):
+        return {"enabled": True, "ok": False, "reason": str(status_res.get("error") or "ssh_failed"), "target": status_res.get("target"), "ts": now_iso()}
+    status_txt = str(status_res.get("stdout") or "")
+    topq_res = _run_pmta_cli(profile, "show topqueues --mode=backoff")
+    topq_txt = str(topq_res.get("stdout") or "") if topq_res.get("ok") else ""
+    return {"enabled": True, "ok": True, "reason": "ok", "target": status_res.get("target"), "spool_recipients": _ssh_extract_metric(status_txt, [("spool", "recipient"), ("spool", "rcpt")]), "spool_messages": _ssh_extract_metric(status_txt, [("spool", "message")]), "queued_recipients": _ssh_extract_metric(status_txt, [("queued", "recipient"), ("queue", "recipient")]), "queued_messages": _ssh_extract_metric(status_txt, [("queued", "message"), ("queue", "message")]), "active_connections": _ssh_extract_metric(status_txt, [("active", "connection"), ("smtp", "connection")]), "smtp_in_connections": None, "smtp_out_connections": None, "traffic_last_hr_in": _ssh_extract_metric(status_txt, [("last hour", "in"), ("hour", "in")]), "traffic_last_hr_out": _ssh_extract_metric(status_txt, [("last hour", "out"), ("hour", "out")]), "traffic_last_min_in": _ssh_extract_metric(status_txt, [("last minute", "in"), ("minute", "in")]), "traffic_last_min_out": _ssh_extract_metric(status_txt, [("last minute", "out"), ("minute", "out")]), "deferred_total": int(_ssh_extract_metric(topq_txt or status_txt, [("deferred",), ("deferral",)]) or 0), "top_queues": _pmta_cli_top_queues(topq_txt, top_n=PMTA_QUEUE_TOP_N), "ts": now_iso()}
 
 
 
 def _pmta_detail_metrics(js: Any) -> dict:
-    deferrals = _deep_sum_ints_by_key_pred(js, lambda k: "defer" in k)
-    # try to find a list of recent errors / events
-    err_list = _deep_find_first_list(js, {"errors", "lasterrors", "last_errors", "recent_errors", "recipient_events"})
-    errors_count = 0
-    errors_sample: List[str] = []
-    if isinstance(err_list, list):
-        errors_count = len(err_list)
-        for it in err_List[:3]:
-            errors_sample.append(str(it)[:140])
-    else:
-        errors_count = _deep_find_first_int(js, {"errorcount", "errorscount", "last_errors_count"}) or 0
-    return {"deferrals": int(deferrals or 0), "errors_count": int(errors_count or 0), "errors_sample": errors_sample}
+    return _pmta_detail_metrics_from_cli(str(js or ""))
+
 
 
 def _pmta_cached(key: str) -> Optional[dict]:
@@ -14225,57 +14092,42 @@ def _pmta_cache_put(key: str, val: dict) -> None:
         pass
 
 
-def pmta_domain_detail_metrics(*, smtp_host: str, domain: str) -> dict:
-    base = _pmta_base_from_smtp_host(smtp_host)
-    if not base:
-        return {"ok": False, "reason": "disabled"}
-
+def pmta_domain_detail_metrics(*, smtp_host: str, domain: str, campaign_id: str = "", job: Any = None) -> dict:
     d = (domain or "").strip().lower().strip(".")
     if not d:
         return {"ok": False, "reason": "missing domain"}
-
-    ck = f"dom:{base}:{d}"
+    profile = _resolve_pmta_ssh_profile(smtp_host=smtp_host, campaign_id=campaign_id, job=job)
+    ck = f"dom:{profile.get('target')}:{d}"
     cached = _pmta_cached(ck)
     if cached is not None:
         return cached
-
-    url = f"{base}/domainDetail?format=json&domain={quote_plus(d)}"
-    ok, js, err = _http_get_json(url, timeout_s=min(6.0, max(2.0, PMTA_MONITOR_TIMEOUT_S)))
-    if not ok:
-        out = {"ok": False, "reason": err, "url": url, "domain": d}
-        _pmta_cache_put(ck, out)
-        return out
-
-    out = {"ok": True, "url": url, "domain": d, **_pmta_detail_metrics(js)}
+    res = _run_pmta_cli(profile, f"show dom {shlex.quote(d)} --errors")
+    out = {"ok": bool(res.get("ok")), "reason": str(res.get("error") or "ok"), "url": str(res.get("target") or ""), "domain": d}
+    if res.get("ok"):
+        out.update(_pmta_detail_metrics_from_cli(str(res.get("stdout") or "")))
     _pmta_cache_put(ck, out)
     return out
 
 
-def pmta_queue_detail_metrics(*, smtp_host: str, queue: str) -> dict:
-    base = _pmta_base_from_smtp_host(smtp_host)
-    if not base:
-        return {"ok": False, "reason": "disabled"}
 
+def pmta_queue_detail_metrics(*, smtp_host: str, queue: str, campaign_id: str = "", job: Any = None) -> dict:
     q = (queue or "").strip()
     if not q:
         return {"ok": False, "reason": "missing queue"}
-
-    ck = f"q:{base}:{q}"
+    profile = _resolve_pmta_ssh_profile(smtp_host=smtp_host, campaign_id=campaign_id, job=job)
+    ck = f"q:{profile.get('target')}:{q}"
     cached = _pmta_cached(ck)
     if cached is not None:
         return cached
-
-    url = f"{base}/queueDetail?format=json&queue={quote_plus(q)}"
-    ok, js, err = _http_get_json(url, timeout_s=min(6.0, max(2.0, PMTA_MONITOR_TIMEOUT_S)))
-    if not ok:
-        out = {"ok": False, "reason": err, "url": url, "queue": q}
-        _pmta_cache_put(ck, out)
-        return out
-
-    out = {"ok": True, "url": url, "queue": q, **_pmta_detail_metrics(js)}
+    res = _run_pmta_cli(profile, f"show queues {shlex.quote(q)} --errors")
+    out = {"ok": bool(res.get("ok")), "reason": str(res.get("error") or "ok"), "url": str(res.get("target") or ""), "queue": q}
+    if res.get("ok"):
+        out.update(_pmta_detail_metrics_from_cli(str(res.get("stdout") or "")))
     _pmta_cache_put(ck, out)
     return out
 
+# -------------------------
+# PMTA diagnostics helpers
 
 # -------------------------
 # PMTA diagnostics helpers (point 7)
@@ -14300,196 +14152,67 @@ def _classify_send_exception(e: Exception) -> str:
     return "unknown"
 
 
-def pmta_diag_on_error(*, smtp_host: str, rcpt: str, exc: Exception) -> dict:
-    """Best-effort context to help decide: client vs PMTA vs remote-throttling.
-
-    NOTE: send_message() errors are usually *injection-stage* (client<->PMTA).
-    Remote ISP rejections happen later and show up in PMTA queues/domainDetail.
-    """
+def pmta_diag_on_error(*, smtp_host: str, rcpt: str, exc: Exception, campaign_id: str = "", job: Any = None) -> dict:
     if not PMTA_DIAG_ON_ERROR:
         return {"enabled": False, "ok": True, "reason": "disabled"}
-
     dom = _extract_domain_from_email(rcpt)
-    base = _pmta_base_from_smtp_host(smtp_host)
-    if not dom or not base:
-        return {"enabled": True, "ok": False, "reason": "missing domain/pmta"}
-
-    # Simple rate limit per (domain) so we don't slow down sending too much.
-    key = f"{base}:{dom}"
-    now_t = time.time()
-    try:
-        last = float(_PMTA_ERR_DIAG_CACHE.get(key, 0.0) or 0.0)
-        if (now_t - last) < float(PMTA_DIAG_RATE_S or 0.0):
-            return {"enabled": True, "ok": False, "reason": "rate_limited", "domain": dom}
-        _PMTA_ERR_DIAG_CACHE[key] = now_t
-    except Exception:
-        pass
-
-    live = {}
-    try:
-        live = pmta_live_panel(smtp_host=smtp_host)
-    except Exception:
-        live = {"enabled": True, "ok": False, "reason": "live_failed"}
-
-    dd = {}
-    qd = {}
-    try:
-        dd = pmta_domain_detail_metrics(smtp_host=smtp_host, domain=dom)
-    except Exception:
-        dd = {"ok": False, "reason": "domainDetail_failed"}
-    try:
-        qd = pmta_queue_detail_metrics(smtp_host=smtp_host, queue=f"{dom}/*")
-    except Exception:
-        qd = {"ok": False, "reason": "queueDetail_failed"}
-
+    if not dom:
+        return {"enabled": True, "ok": False, "reason": "missing domain"}
+    live = pmta_live_panel(smtp_host=smtp_host, campaign_id=campaign_id, job=job)
+    dd = pmta_domain_detail_metrics(smtp_host=smtp_host, domain=dom, campaign_id=campaign_id, job=job)
+    qd = pmta_queue_detail_metrics(smtp_host=smtp_host, queue=f"{dom}/*", campaign_id=campaign_id, job=job)
     def_max = max(int(dd.get("deferrals") or 0), int(qd.get("deferrals") or 0))
     err_max = max(int(dd.get("errors_count") or 0), int(qd.get("errors_count") or 0))
-    sample = (dd.get("errors_sample") or qd.get("errors_sample") or [])[:2]
-
-    cls = _classify_send_exception(exc)
-
-    remote_hint = ""
-    # If PMTA shows deferrals/errors, it's likely remote throttling/ISP issues (not client injection).
-    if def_max >= int(PMTA_DOMAIN_DEFERRALS_SLOW or 25) or err_max >= int(PMTA_DOMAIN_ERRORS_SLOW or 3):
-        remote_hint = "remote_throttling_or_isp"
-
-    return {
-        "enabled": True,
-        "ok": True,
-        "domain": dom,
-        "class": cls,
-        "remote_hint": remote_hint,
-        "queue_deferrals": def_max,
-        "queue_errors": err_max,
-        "errors_sample": sample,
-        "live": {
-            "queued_recipients": live.get("queued_recipients"),
-            "spool_recipients": live.get("spool_recipients"),
-            "deferred_total": live.get("deferred_total"),
-            "active_connections": live.get("active_connections"),
-            "top_queues": live.get("top_queues") if isinstance(live.get("top_queues"), list) else [],
-        },
-        "ts": now_iso(),
-    }
+    return {"enabled": True, "ok": True, "domain": dom, "class": _classify_send_exception(exc), "remote_hint": "remote_throttling_or_isp" if (def_max >= int(PMTA_DOMAIN_DEFERRALS_SLOW or 25) or err_max >= int(PMTA_DOMAIN_ERRORS_SLOW or 3)) else "", "queue_deferrals": def_max, "queue_errors": err_max, "errors_sample": (dd.get("errors_sample") or qd.get("errors_sample") or [])[:2], "live": {"queued_recipients": live.get("queued_recipients"), "spool_recipients": live.get("spool_recipients"), "deferred_total": live.get("deferred_total"), "active_connections": live.get("active_connections"), "top_queues": live.get("top_queues") if isinstance(live.get("top_queues"), list) else []}, "ts": now_iso()}
 
 
-def pmta_chunk_policy(*, smtp_host: str, chunk_domain_counts: Dict[str, int]) -> dict:
-    """Decide if we should block/backoff or slow down based on PMTA domain/queue errors.
 
-    Returns:
-      {
-        enabled, ok,
-        blocked: bool,
-        slow: {delay_min, workers_max} | None,
-        reason: str,
-        details: [...]  # per-domain metrics (small)
-      }
-    """
+def pmta_chunk_policy(*, smtp_host: str, chunk_domain_counts: Dict[str, int], campaign_id: str = "", job: Any = None) -> dict:
     if not PMTA_QUEUE_BACKOFF:
         return {"enabled": False, "ok": True, "blocked": False, "slow": None, "reason": "disabled", "details": []}
-
     if not chunk_domain_counts:
         return {"enabled": True, "ok": True, "blocked": False, "slow": None, "reason": "no domains", "details": []}
-
-    base = _pmta_base_from_smtp_host(smtp_host)
-    if not base:
-        return {"enabled": False, "ok": True, "blocked": False, "slow": None, "reason": "disabled", "details": []}
-
-    top_n = max(0, int(PMTA_DOMAIN_CHECK_TOP_N or 0))
-    if top_n == 0:
-        return {"enabled": True, "ok": True, "blocked": False, "slow": None, "reason": "top_n=0", "details": []}
-
-    items = sorted(chunk_domain_counts.items(), key=lambda x: int(x[1] or 0), reverse=True)[:top_n]
-
+    items = sorted(chunk_domain_counts.items(), key=lambda x: int(x[1] or 0), reverse=True)[: max(0, int(PMTA_DOMAIN_CHECK_TOP_N or 0))]
     worst_dom, worst_def, worst_err = "", 0, 0
     details = []
     any_ok = False
-
     for dom, cnt in items:
         d = (dom or "").strip().lower().strip(".")
         if not d:
             continue
-
-        dd = pmta_domain_detail_metrics(smtp_host=smtp_host, domain=d)
-        qd = pmta_queue_detail_metrics(smtp_host=smtp_host, queue=f"{d}/*")
-
+        dd = pmta_domain_detail_metrics(smtp_host=smtp_host, domain=d, campaign_id=campaign_id, job=job)
+        qd = pmta_queue_detail_metrics(smtp_host=smtp_host, queue=f"{d}/*", campaign_id=campaign_id, job=job)
         if dd.get("ok") or qd.get("ok"):
             any_ok = True
-
         def_max = max(int(dd.get("deferrals") or 0), int(qd.get("deferrals") or 0))
         err_max = max(int(dd.get("errors_count") or 0), int(qd.get("errors_count") or 0))
-
-        details.append({
-            "domain": d,
-            "count": int(cnt or 0),
-            "deferrals": def_max,
-            "errors": err_max,
-            "domain_url": dd.get("url"),
-            "queue_url": qd.get("url"),
-            "errors_sample": (dd.get("errors_sample") or qd.get("errors_sample") or [])[:2],
-        })
-
+        details.append({"domain": d, "count": int(cnt or 0), "deferrals": def_max, "errors": err_max, "domain_url": dd.get("url"), "queue_url": qd.get("url"), "errors_sample": (dd.get("errors_sample") or qd.get("errors_sample") or [])[:2]})
         if (def_max > worst_def) or (err_max > worst_err):
-            worst_dom = d
-            worst_def = max(worst_def, def_max)
-            worst_err = max(worst_err, err_max)
-
+            worst_dom, worst_def, worst_err = d, max(worst_def, def_max), max(worst_err, err_max)
     if not any_ok:
-        if PMTA_QUEUE_REQUIRED:
-            return {"enabled": True, "ok": False, "blocked": True, "slow": None, "reason": "pmta detail unreachable", "details": details}
-        return {"enabled": True, "ok": False, "blocked": False, "slow": None, "reason": "pmta detail unreachable", "details": details}
-
+        return {"enabled": True, "ok": False, "blocked": bool(PMTA_QUEUE_REQUIRED), "slow": None, "reason": "pmta ssh detail unreachable", "details": details}
     if worst_def >= PMTA_DOMAIN_DEFERRALS_BACKOFF or worst_err >= PMTA_DOMAIN_ERRORS_BACKOFF:
         return {"enabled": True, "ok": True, "blocked": True, "slow": None, "reason": f"{worst_dom} deferrals={worst_def} errors={worst_err}", "details": details}
-
     if worst_def >= PMTA_DOMAIN_DEFERRALS_SLOW or worst_err >= PMTA_DOMAIN_ERRORS_SLOW:
-        slow = {"delay_min": float(PMTA_SLOW_DELAY_S), "workers_max": int(PMTA_SLOW_WORKERS_MAX)}
-        return {"enabled": True, "ok": True, "blocked": False, "slow": slow, "reason": f"{worst_dom} deferrals={worst_def} errors={worst_err}", "details": details}
-
+        return {"enabled": True, "ok": True, "blocked": False, "slow": {"delay_min": float(PMTA_SLOW_DELAY_S), "workers_max": int(PMTA_SLOW_WORKERS_MAX)}, "reason": f"{worst_dom} deferrals={worst_def} errors={worst_err}", "details": details}
     return {"enabled": True, "ok": True, "blocked": False, "slow": None, "reason": "ok", "details": details}
 
 
 # =========================
-# PowerMTA Accounting ingestion (official bounces/deferrals/complaints)
+# PowerMTA Accounting ingestion (SSH tail)
 # =========================
-# Single supported mode:
-# Shiva requests accounting from bridge API, and bridge only serves API responses.
-PMTA_BRIDGE_PULL_ENABLED = (os.getenv("PMTA_BRIDGE_PULL_ENABLED", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
-BRIDGE_MODE = (os.getenv("BRIDGE_MODE", "counts") or "counts").strip().lower()
-if BRIDGE_MODE not in {"counts", "legacy"}:
-    BRIDGE_MODE = "counts"
+PMTA_BRIDGE_PULL_ENABLED = True
+BRIDGE_MODE = "ssh"
+PMTA_BRIDGE_PULL_PORT = int(PMTA_SSH_PORT or 22)
+BRIDGE_BASE_URL = ""
 try:
-    PMTA_BRIDGE_PULL_PORT = int((os.getenv("PMTA_BRIDGE_PULL_PORT", "8090") or "8090").strip())
+    BRIDGE_POLL_INTERVAL_S = float((os.getenv("BRIDGE_POLL_INTERVAL_S", "5") or "5").strip())
 except Exception:
-    PMTA_BRIDGE_PULL_PORT = 8090
-PMTA_BRIDGE_PULL_PATH = "/api/v1/pull"
-PMTA_BRIDGE_JOB_COUNT_PATH = "/api/v1/job/count"
-PMTA_BRIDGE_JOB_OUTCOMES_PATH = "/api/v1/job/outcomes"
-BRIDGE_BASE_URL = (os.getenv("BRIDGE_BASE_URL", "") or "").strip()
-try:
-    BRIDGE_TIMEOUT_S = float((os.getenv("BRIDGE_TIMEOUT_S", "20") or "20").strip())
-except Exception:
-    BRIDGE_TIMEOUT_S = 20.0
-
-
-try:
-    PMTA_BRIDGE_PULL_S = float((os.getenv("PMTA_BRIDGE_PULL_S", "5") or "5").strip())
-except Exception:
-    PMTA_BRIDGE_PULL_S = 5.0
-try:
-    BRIDGE_POLL_INTERVAL_S = float((os.getenv("BRIDGE_POLL_INTERVAL_S", str(PMTA_BRIDGE_PULL_S)) or str(PMTA_BRIDGE_PULL_S)).strip())
-except Exception:
-    BRIDGE_POLL_INTERVAL_S = float(PMTA_BRIDGE_PULL_S or 5.0)
-_OUTCOMES_SYNC_RAW = os.getenv("OUTCOMES_SYNC")
-if _OUTCOMES_SYNC_RAW is None:
-    _OUTCOMES_SYNC_RAW = os.getenv("BRIDGE_POLL_FETCH_OUTCOMES", "1")
-OUTCOMES_SYNC = (_OUTCOMES_SYNC_RAW or "1").strip().lower() in {"1", "true", "yes", "on"}
-BRIDGE_POLL_FETCH_OUTCOMES = bool(OUTCOMES_SYNC)
-try:
-    PMTA_BRIDGE_PULL_MAX_LINES = int((os.getenv("PMTA_BRIDGE_PULL_MAX_LINES", "2000") or "2000").strip())
-except Exception:
-    PMTA_BRIDGE_PULL_MAX_LINES = 2000
-
+    BRIDGE_POLL_INTERVAL_S = 5.0
+PMTA_BRIDGE_PULL_S = float(BRIDGE_POLL_INTERVAL_S)
+PMTA_BRIDGE_PULL_MAX_LINES = int(PMTA_ACCOUNTING_TAIL_LINES or 2500)
+BRIDGE_POLL_FETCH_OUTCOMES = True
+OUTCOMES_SYNC = True
 _BRIDGE_DEBUG_LOCK = threading.Lock()
 _BRIDGE_DEBUG_STATE: Dict[str, Any] = {
     "last_poll_time": "",
@@ -14502,20 +14225,12 @@ _BRIDGE_DEBUG_STATE: Dict[str, Any] = {
     "success_count": 0,
     "failure_count": 0,
     "last_error": "",
-    "last_req_url": "",
-    "last_http_ok": False,
-    "last_http_status": None,
-    "last_duration_ms": 0,
-    "last_latency_ms": 0,
-    "last_ok_ts": "",
     "last_error_message": "",
-    "last_response_keys": [],
+    "last_ok_ts": "",
+    "last_duration_ms": 0,
     "last_bridge_count": 0,
     "last_processed": 0,
     "last_accepted": 0,
-    "last_lines_sample": [],
-    "last_cursor": "",
-    "has_more": False,
     "events_received": 0,
     "events_ingested": 0,
     "duplicates_dropped": 0,
@@ -14524,1239 +14239,100 @@ _BRIDGE_DEBUG_STATE: Dict[str, Any] = {
     "missing_fields": 0,
     "internal_error_samples": [],
     "integrity_samples": [],
+    "ssh_target": "",
+    "ssh_command": "",
 }
-
 _BRIDGE_POLLER_LOCK = threading.Lock()
 _BRIDGE_POLLER_STARTED = False
-_BRIDGE_CURSOR_COMPAT_WARNED = False
 _BRIDGE_POLL_CYCLE_LOCK = threading.Lock()
 
 
-def _bridge_mode_counts_enabled() -> bool:
-    return str(BRIDGE_MODE or "counts").strip().lower() == "counts"
-
-
-def _resolve_bridge_pull_host_from_campaign() -> str:
-    """Resolve bridge host from campaign SMTP host (latest job), not server IP."""
-    with JOBS_LOCK:
-        jobs = [j for j in JOBS.values() if not getattr(j, "deleted", False)]
-
-    if jobs:
-        jobs.sort(key=lambda x: x.created_at, reverse=True)
-        for job in jobs:
-            host = (getattr(job, "smtp_host", "") or "").strip()
-            if host:
-                return host
-
-    host = (os.getenv("SHIVA_HOST", "") or "").strip()
-    if host and host not in {"0.0.0.0", "::"}:
-        return host
-    return "127.0.0.1"
-
-
-def _normalize_bridge_host(raw_host: str) -> str:
-    """Normalize host coming from campaign SMTP setting for HTTP bridge URL building."""
-    host = str(raw_host or "").strip()
-    if not host:
-        return "127.0.0.1"
-
-    # Campaign SMTP host may contain a full URL or host:port; keep only hostname.
-    if "://" in host:
-        try:
-            parsed = urlsplit(host)
-            if parsed.hostname:
-                return str(parsed.hostname).strip()
-        except Exception:
-            pass
-
-    # For "hostname:port" (IPv4/domain) drop the port part.
-    if host.count(":") == 1 and not host.startswith("["):
-        return host.split(":", 1)[0].strip() or "127.0.0.1"
-
-    # For bracketed IPv6 like "[::1]:2525".
-    if host.startswith("[") and "]" in host:
-        return host[1:host.index("]")].strip() or "127.0.0.1"
-
-    return host
-
-
-def _resolve_bridge_pull_url_runtime() -> str:
-    if _bridge_mode_counts_enabled():
-        return ""
-    host = _normalize_bridge_host(_resolve_bridge_pull_host_from_campaign())
-    limit = max(1, int(PMTA_BRIDGE_PULL_MAX_LINES or 2000))
-    return f"http://{host}:{PMTA_BRIDGE_PULL_PORT}{PMTA_BRIDGE_PULL_PATH}?kinds=acct&limit={limit}"
-
-
-def _resolve_bridge_base_url_runtime() -> str:
-    configured = (BRIDGE_BASE_URL or "").strip().rstrip("/")
-    if configured:
-        return configured
-    host = _normalize_bridge_host(_resolve_bridge_pull_host_from_campaign())
-    return f"http://{host}:{PMTA_BRIDGE_PULL_PORT}"
-
-
-def bridge_get_json(path: str, params: dict) -> dict:
-    base = (BRIDGE_BASE_URL or "").strip()
-    if not base:
-        raise ValueError("bridge base url is not configured")
-    if base.lower().startswith("https://"):
-        raise ValueError("https is not allowed for bridge client")
-
-    p = (path or "").strip() or "/"
-    if not p.startswith("/"):
-        p = "/" + p
-    query = urlencode(params or {}, doseq=True)
-    full_url = f"{base.rstrip('/')}{p}"
-    if query:
-        full_url = f"{full_url}?{query}"
-
-    parsed = urlsplit(full_url)
-    if parsed.scheme.lower() != "http":
-        raise ValueError("bridge client supports HTTP only")
-
-    host = (parsed.hostname or "").strip()
-    if not host:
-        raise ValueError("bridge host is missing")
-
-    port = parsed.port or 80
-    target = parsed.path or "/"
-    if parsed.query:
-        target = f"{target}?{parsed.query}"
-
-    conn = http.client.HTTPConnection(host, port=port, timeout=float(BRIDGE_TIMEOUT_S or 20.0))
-    try:
-        conn.request("GET", target, headers={"Accept": "application/json"})
-        resp = conn.getresponse()
-        status = int(getattr(resp, "status", 0) or 0)
-        raw = (resp.read() or b"").decode("utf-8", errors="replace")
-    finally:
-        conn.close()
-
-    if status != 200:
-        snippet = raw[:220].replace("\n", " ").replace("\r", " ")
-        raise RuntimeError(f"bridge_http_status={status} body={snippet!r}")
-
-    try:
-        obj = json.loads(raw or "{}")
-    except Exception as e:
-        raise ValueError(f"invalid_json_response: {e}")
-    if not isinstance(obj, dict):
-        raise ValueError("invalid_bridge_payload")
-    return obj
-
-
-def _bridge_debug_update(**kwargs: Any) -> None:
-    with _BRIDGE_DEBUG_LOCK:
-        _BRIDGE_DEBUG_STATE.update(kwargs)
-
-
-def _bridge_push_sample(key: str, entry: dict, max_keep: int = 24) -> None:
-    if not key or not isinstance(entry, dict):
-        return
-    with _BRIDGE_DEBUG_LOCK:
-        rows = _BRIDGE_DEBUG_STATE.get(key)
-        if not isinstance(rows, list):
-            rows = []
-        rows.append(entry)
-        _BRIDGE_DEBUG_STATE[key] = rows[-max(4, int(max_keep or 24)):]
-
-_OUTCOME_CACHE_LOCK = threading.Lock()
-_OUTCOME_CACHE: Dict[Tuple[str, str], str] = {}
-
-# Extract job id from Message-ID we generate:
-#   <uuid.<job_id>.<campaign_id>.c<chunk>.w<worker>@local>
-_JOBID_RE_1 = re.compile(r"[.][a-f0-9]{8,64}[.]([a-f0-9]{12})[.]([a-f0-9]{8,64}|none)[.]c[0-9]+[.]w[0-9]+@local", re.IGNORECASE)
-_JOBID_RE_2 = re.compile(r"[.][a-f0-9]{8,64}[.]([a-f0-9]{12})[.]c[0-9]+[.]w[0-9]+@local", re.IGNORECASE)
-
-
-def _extract_job_id_from_text(text: str) -> str:
-    t = (text or "").strip()
-    if not t:
-        return ""
-    m = _JOBID_RE_1.search(t)
-    if m:
-        return m.group(1).lower()
-    m = _JOBID_RE_2.search(t)
-    if m:
-        return m.group(1).lower()
-    return ""
-
-
-def _normalize_outcome_type(v: Any) -> str:
-    s = ("" if v is None else str(v)).strip().lower()
-    if not s:
-        return ""
-    s = re.sub(r"\s+", " ", s)
-    # PMTA accounting often uses a 1-letter type.
-    if s in {"d", "delivered", "delivery", "success", "accepted", "ok", "sent"}:
-        return "delivered"
-    if s in {"b", "bounce", "bounced", "hardbounce", "softbounce", "failed", "failure", "reject", "rejected", "error"}:
-        return "bounced"
-    if s in {"t", "defer", "deferred", "deferral", "transient"}:
-        return "deferred"
-    if s in {"c", "complaint", "complained", "fbl"}:
-        return "complained"
-
-    # PMTA accounting CSV often stores status words in longer values,
-    # e.g. dsnStatus="2.0.0 (success)" or dsnAction="relayed".
-    if any(x in s for x in ("success", "2.0.0", "relayed", "delivered", "accepted", "250 ")):
-        return "delivered"
-    if any(x in s for x in ("bounce", "bounced", "failed", "failure", "reject", "5.", " 550", " 551", " 552", " 553", " 554")):
-        return "bounced"
-    if any(x in s for x in ("defer", "deferred", "transient", "4.", " 421", " 450", " 451", " 452")):
-        return "deferred"
-    if any(x in s for x in ("complaint", "fbl", "abuse")):
-        return "complained"
-    return s
-
-
-def _event_value(ev: dict, *names: str) -> str:
-    if not isinstance(ev, dict):
-        return ""
-    aliases = {n.strip().lower().replace("_", "-") for n in names if n and n.strip()}
-    if not aliases:
-        return ""
-
-    for k, v in ev.items():
-        kk = str(k or "").strip().lower().replace("_", "-")
-        if kk in aliases and str(v or "").strip():
-            return str(v).strip()
-
-    for k, v in ev.items():
-        kk = str(k or "").strip().lower().replace("_", "-")
-        if any(a in kk for a in aliases) and str(v or "").strip():
-            return str(v).strip()
-    return ""
-
-
-def _find_job_by_campaign(campaign_id: str) -> Optional[SendJob]:
-    cid = (campaign_id or "").strip()
-    if not cid:
-        return None
-
-    candidates = [j for j in JOBS.values() if (j.campaign_id or "").strip() == cid and not bool(j.deleted)]
-    if not candidates:
-        return None
-
-    running = [j for j in candidates if (j.status or "") in {"running", "backoff", "paused"}]
-    pool = running or candidates
-
-    def _sort_key(j: SendJob) -> Tuple[str, str]:
-        return (str(j.updated_at or ""), str(j.created_at or ""))
-
-    pool.sort(key=_sort_key, reverse=True)
-    return pool[0]
-
-
-def _find_job_by_recipient(rcpt: str) -> Optional[SendJob]:
-    em = (rcpt or "").strip().lower()
-    if not em:
-        return None
-
-    # 1) Prefer persisted recipient->job mapping (most reliable when ids are absent in PMTA CSV).
-    for jid in db_find_job_ids_by_recipient(em, limit=12):
-        job = JOBS.get(jid)
-        if job and not bool(job.deleted):
-            return job
-
-    # 2) Fallback to in-memory recent send results if DB has no hit.
-    candidates: List[SendJob] = []
-    for job in JOBS.values():
-        if bool(job.deleted):
-            continue
-        rr = job.recent_results or []
-        if any(str(it.get("email") or "").strip().lower() == em for it in rr[-250:]):
-            candidates.append(job)
-
-    if not candidates:
-        return None
-
-    running = [j for j in candidates if (j.status or "") in {"running", "backoff", "paused"}]
-    pool = running or candidates
-    pool.sort(key=lambda j: (str(j.updated_at or ""), str(j.created_at or "")), reverse=True)
-    return pool[0]
-
-
-def _parse_bridge_json_row(row: Any) -> Optional[dict]:
-    """Parse one bridge row as JSON-only payload.
-
-    Bridge is the source of truth and already returns normalized JSON.
-    Shiva intentionally ignores legacy CSV/plaintext rows to keep this flow
-    deterministic and to avoid PMTA log parsing on the Shiva side.
-    """
-    if isinstance(row, dict):
-        return row
-
-    s = str(row or "").strip()
-    if not s or not (s.startswith("{") and s.endswith("}")):
-        return None
-
-    try:
-        ev = json.loads(s)
-    except Exception:
-        return None
-    return ev if isinstance(ev, dict) else None
-
-
-def _push_outcome_bucket(job: SendJob, kind: str):
-    try:
-        now_min = int(time.time() // 60)
-        if job.outcome_series and int(job.outcome_series[-1].get("t_min") or 0) == now_min:
-            b = job.outcome_series[-1]
-        else:
-            b = {"t_min": now_min, "delivered": 0, "bounced": 0, "deferred": 0, "complained": 0}
-            job.outcome_series.append(b)
-            if len(job.outcome_series) > 180:
-                job.outcome_series = job.outcome_series[-140:]
-        if kind in b:
-            b[kind] = int(b.get(kind) or 0) + 1
-    except Exception:
-        pass
-
-
-
-
-def _transition_allowed(prev: str, new: str) -> bool:
-    p = (prev or "").strip().lower()
-    n = (new or "").strip().lower()
-    if not p:
-        return True
-    if p == n:
-        return True
-    if p in {"not_yet", "pending", "queued", "unknown"} and n in {"delivered", "deferred", "bounced", "complained"}:
-        return True
-    if p == "deferred" and n in {"delivered", "bounced", "complained"}:
-        return True
-    if p == "delivered" and n == "complained":
-        return True
-    return False
-
-
-def _build_accounting_event_row(ev: dict, typ: str, rcpt: str, job_id: str) -> Dict[str, str]:
-    source_file = _event_value(ev, "source_file", "source", "file", "path", "filename") or "bridge"
-    source_locator = _event_value(ev, "offset", "source_offset", "line", "line_number", "line_no", "lineno")
-    if not source_locator:
-        source_locator = "line:unknown"
-    time_logged = _event_value(ev, "time_logged", "log_time", "logged_at", "timestamp", "ts", "time", "date")
-    message_id = _event_value(ev, "msgid", "message-id", "message_id", "messageid", "header_message-id", "header_message_id")
-    dsn_status = _event_value(ev, "dsnStatus", "dsn_status", "enhanced-status", "enhanced_status")
-    dsn_diag = _event_value(ev, "dsnDiag", "dsn_diag", "diag", "diagnostic", "smtp-diagnostic", "response")
-
-    stable_key = "\x1f".join([
-        str(source_file or ""),
-        str(source_locator or ""),
-        str((rcpt or "").strip().lower()),
-        str((typ or "").strip().lower()),
-        str(time_logged or ""),
-        str(message_id or ""),
-    ])
-    event_id = hashlib.sha256(stable_key.encode("utf-8", "ignore")).hexdigest()
-
-    raw_json = ""
-    try:
-        raw_json = json.dumps(ev, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
-    except Exception:
-        raw_json = str(ev)
-
-    return {
-        "event_id": event_id,
-        "job_id": str(job_id or ""),
-        "rcpt": str((rcpt or "").strip().lower()),
-        "outcome": str((typ or "").strip().lower()),
-        "time_logged": str(time_logged or ""),
-        "message_id": str(message_id or ""),
-        "dsn_status": str(dsn_status or ""),
-        "dsn_diag": str(dsn_diag or ""),
-        "source_file": str(source_file or ""),
-        "source_offset_or_line": str(source_locator or ""),
-        "raw_json": raw_json,
-    }
-
-
-def _apply_outcome_to_job(job: SendJob, rcpt: str, kind: str, ev: Optional[dict] = None) -> None:
-    """Update job counters in a 'unique per recipient' way using SQLite job_outcomes."""
-    r = (rcpt or "").strip().lower()
-    k = (kind or "").strip().lower()
-    if not r or k not in {"delivered", "bounced", "deferred", "complained"}:
-        return
-
-    with _OUTCOME_CACHE_LOCK:
-        prev = str(_OUTCOME_CACHE.get((job.id, r)) or "").strip().lower()
-    if not prev:
-        prev_row = db_get_outcome(job.id, r) or {}
-        prev = str(prev_row.get("status") or "").strip().lower()
-
-    message_id = _event_value(ev or {}, "msgid", "message-id", "message_id", "messageid", "header_message-id", "header_message_id")
-    dsn_status = _event_value(ev or {}, "dsnStatus", "dsn_status", "enhanced-status", "enhanced_status")
-    dsn_diag = _event_value(ev or {}, "dsnDiag", "dsn_diag", "diag", "diagnostic", "smtp-diagnostic", "response")
-
-    if prev and not _transition_allowed(prev, k):
-        with _OUTCOME_CACHE_LOCK:
-            _OUTCOME_CACHE[(job.id, r)] = prev
-        db_set_outcome(job.id, r, prev, message_id=message_id, dsn_status=dsn_status, dsn_diag=dsn_diag)
-        job.accounting_last_ts = now_iso()
-        return
-
-    if prev == k:
-        with _OUTCOME_CACHE_LOCK:
-            _OUTCOME_CACHE[(job.id, r)] = k
-        db_set_outcome(job.id, r, k, message_id=message_id, dsn_status=dsn_status, dsn_diag=dsn_diag)
-        job.accounting_last_ts = now_iso()
-        return
-
-    def dec(st: str):
-        if st == "delivered":
-            job.delivered = max(0, int(job.delivered or 0) - 1)
-        elif st == "bounced":
-            job.bounced = max(0, int(job.bounced or 0) - 1)
-        elif st == "deferred":
-            job.deferred = max(0, int(job.deferred or 0) - 1)
-        elif st == "complained":
-            job.complained = max(0, int(job.complained or 0) - 1)
-
-    def inc(st: str):
-        if st == "delivered":
-            job.delivered = int(job.delivered or 0) + 1
-        elif st == "bounced":
-            job.bounced = int(job.bounced or 0) + 1
-        elif st == "deferred":
-            job.deferred = int(job.deferred or 0) + 1
-        elif st == "complained":
-            job.complained = int(job.complained or 0) + 1
-
-    if prev:
-        dec(prev)
-    inc(k)
-
-    with _OUTCOME_CACHE_LOCK:
-        _OUTCOME_CACHE[(job.id, r)] = k
-    db_set_outcome(job.id, r, k, message_id=message_id, dsn_status=dsn_status, dsn_diag=dsn_diag)
-    _push_outcome_bucket(job, k)
-    job.accounting_last_ts = now_iso()
-
-
-def _classify_accounting_response(ev: dict, typ: str) -> Tuple[str, str]:
-    """Return (kind, full_error_text) using accounting response data.
-
-    kind is one of: accepted, temporary_error, blocked.
-    """
-    bits = [
-        _event_value(ev, "response", "smtp-response", "smtp_response"),
-        _event_value(ev, "dsnStatus", "dsn_status", "enhanced-status", "enhanced_status"),
-        _event_value(ev, "dsnDiag", "dsn_diag", "diag", "diagnostic", "smtp-diagnostic"),
-        _event_value(ev, "status", "result", "state"),
-    ]
-    parts = [str(x).strip() for x in bits if str(x or "").strip()]
-    full = " | ".join(parts)
-
-    probe = " ".join(parts).lower()
-    code_match = re.search(r"\b([245])[0-9]{2}\b", probe)
-    if not code_match:
-        code_match = re.search(r"\b([245])\.[0-9]\.[0-9]\b", probe)
-
-    if code_match:
-        lead = code_match.group(1)
-        if lead == "2":
-            return "accepted", full
-        if lead == "4":
-            return "temporary_error", full
-        if lead == "5":
-            return "blocked", full
-
-    # Fallback from normalized outcome when code is missing.
-    t = (typ or "").strip().lower()
-    if t == "delivered":
-        return "accepted", full
-    if t == "deferred":
-        return "temporary_error", full
-    if t in {"bounced", "complained"}:
-        return "blocked", full
-    return "temporary_error", full
-
-
-def _classify_backoff_failure(*, spam_blocked: bool, blacklist_blocked: bool, pmta_reason: str) -> Tuple[str, str]:
-    """Classify chunk preflight failures for response/backoff policy.
-
-    Returns: (failure_type, intervention)
-      - failure_type: transient_delay | block | reputation
-      - intervention: short operator hint (empty for no extra action)
-    """
-    reason = str(pmta_reason or "").strip().lower()
-
-    if spam_blocked or blacklist_blocked:
-        return "reputation", "review sender reputation (spam score / DNSBL) before retrying"
-
-    reputation_terms = (
-        "reputation",
-        "spam",
-        "blacklist",
-        "policy",
-        "throttled due to complaints",
-    )
-    if any(t in reason for t in reputation_terms):
-        return "reputation", "investigate domain/IP reputation and PMTA policy signals"
-
-    transient_terms = (
-        "timeout",
-        "timed out",
-        "temporary",
-        "temporarily",
-        "defer",
-        "4xx",
-        "try again",
-        "unreachable",
-        "busy",
-    )
-    if any(t in reason for t in transient_terms):
-        return "transient_delay", ""
-
-    return "block", ""
-
-
-def _compute_backoff_wait_seconds(*, attempt: int, base_s: float, max_s: float, failure_type: str) -> float:
-    """Calculate wait using failure-aware backoff strategy."""
-    base_wait = max(1.0, float(base_s or 1.0)) * (2 ** max(0, int(attempt or 0) - 1))
-    if failure_type == "transient_delay":
-        tuned = max(5.0, base_wait * 0.5)
-    elif failure_type == "reputation":
-        tuned = max(base_wait, base_wait * 2.0)
-    else:
-        tuned = base_wait
-    return min(max(float(max_s or tuned), 1.0), tuned)
-
-
-def apply_backoff_jitter(
-    *,
-    wait_s_base: float,
-    mode: str,
-    pct: float,
-    max_jitter_s: float,
-    min_jitter_s: float,
-    max_s: float,
-    partition_seed: str,
-    lane_key: str,
-    attempt: int,
-    failure_type: str,
-) -> Tuple[float, float]:
-    """Apply optional bounded jitter to a computed backoff wait."""
-    mode2 = str(mode or "off").strip().lower()
-    base_wait = max(0.0, float(wait_s_base or 0.0))
-    if mode2 not in {"deterministic", "random"}:
-        return min(base_wait, max(0.0, float(max_s or base_wait))), 0.0
-
-    pct2 = max(0.0, float(pct or 0.0))
-    max_jitter = max(0.0, float(max_jitter_s or 0.0))
-    min_jitter = max(0.0, float(min_jitter_s or 0.0))
-    jitter_amp = min(max_jitter, max(min_jitter, base_wait * pct2))
-
-    if mode2 == "random":
-        jitter_delta = random.uniform(-jitter_amp, jitter_amp)
-    else:
-        seed_material = f"{str(partition_seed or '').strip()}|{str(lane_key or '').strip()}|{int(attempt or 0)}|{str(failure_type or '').strip().lower()}"
-        domain_seed = int(hashlib.sha256(seed_material.encode("utf-8", errors="ignore")).hexdigest()[:16], 16)
-        rng = random.Random(domain_seed)
-        jitter_delta = rng.uniform(-jitter_amp, jitter_amp)
-
-    wait_final = min(max(0.0, base_wait + jitter_delta), max(0.0, float(max_s or base_wait)))
-    return wait_final, jitter_delta
-
-
-def _record_accounting_error(job: SendJob, rcpt: str, typ: str, ev: dict) -> None:
-    kind, detail = _classify_accounting_response(ev, typ)
-    job.accounting_error_counts[kind] = int(job.accounting_error_counts.get(kind, 0) or 0) + 1
-    entry = {
-        "ts": now_iso(),
-        "email": (rcpt or "").strip(),
-        "type": typ,
-        "kind": kind,
-        "detail": detail,
-    }
-    job.accounting_last_errors.append(entry)
-    if len(job.accounting_last_errors) > 80:
-        job.accounting_last_errors = job.accounting_last_errors[-40:]
-
-
-def process_pmta_accounting_event(ev: dict) -> dict:
-    """Process one accounting event dict. Returns small result info."""
-    if not isinstance(ev, dict):
-        return {"ok": False, "reason": "not_dict"}
-
-    typ = _normalize_outcome_type(
-        ev.get("type")
-        or ev.get("event")
-        or ev.get("kind")
-        or ev.get("record")
-        or ev.get("status")
-        or ev.get("result")
-        or ev.get("state")
-    )
-    if typ not in {"delivered", "bounced", "deferred", "complained"}:
-        typ = _normalize_outcome_type(
-            ev.get("dsnAction")
-            or ev.get("dsn_action")
-            or ev.get("dsnStatus")
-            or ev.get("dsn_status")
-            or ev.get("dsnDiag")
-            or ev.get("dsn_diag")
-        )
-
-    rcpt = (
-        ev.get("rcpt")
-        or ev.get("recipient")
-        or ev.get("email")
-        or ev.get("to")
-        or ev.get("rcpt_to")
-        or ""
-    )
-    rcpt = str(rcpt or "").strip()
-
-    job_id = _event_value(ev, "header_x-job-id", "x-job-id", "job-id", "job_id", "jobid").lower()
-    campaign_id = _event_value(ev, "x-campaign-id", "campaign-id", "campaign_id", "cid")
-
-    msgid = _event_value(ev, "msgid", "message-id", "message_id", "messageid", "header_message-id", "header_message_id")
-    if not msgid:
-        # Pick any field that looks like a Message-ID header (different acct-file schemas)
-        for k, v in (ev or {}).items():
-            kk = str(k or "").lower().replace("_", "-")
-            if "message-id" in kk:
-                msgid = v
-                break
-
-    if not job_id:
-        job_id = _extract_job_id_from_text(str(msgid or ""))
-
-    if not job_id:
-        job_id = _extract_job_id_from_text(str(ev.get("raw") or ""))
-
-    event_row = _build_accounting_event_row(ev, typ, rcpt, job_id)
-    if not db_insert_accounting_event(event_row):
-        _bridge_push_sample(
-            "integrity_samples",
-            {
-                "ts": now_iso(),
-                "kind": "duplicates_dropped",
-                "job_id": job_id,
-                "campaign_id": campaign_id,
-                "rcpt": rcpt,
-                "outcome": typ,
-            },
-        )
-        return {"ok": True, "duplicate": True, "event_id": event_row.get("event_id"), "job_id": job_id, "campaign_id": campaign_id, "rcpt": rcpt, "type": typ}
-
-    if not rcpt or typ not in {"delivered", "bounced", "deferred", "complained"}:
-        _bridge_push_sample(
-            "integrity_samples",
-            {
-                "ts": now_iso(),
-                "kind": "missing_fields",
-                "job_id": job_id,
-                "campaign_id": campaign_id,
-                "rcpt": rcpt,
-                "outcome": typ,
-            },
-        )
-        return {"ok": False, "reason": "missing_fields", "job_id": job_id, "campaign_id": campaign_id, "rcpt": rcpt, "type": typ}
-
-    with JOBS_LOCK:
-        job = JOBS.get(job_id) if job_id else None
-        if not job and campaign_id:
-            job = _find_job_by_campaign(campaign_id)
-        if not job and rcpt:
-            job = _find_job_by_recipient(rcpt)
-        if not job:
-            _bridge_push_sample(
-                "integrity_samples",
-                {
-                    "ts": now_iso(),
-                    "kind": "job_not_found",
-                    "job_id": job_id,
-                    "campaign_id": campaign_id,
-                    "rcpt": rcpt,
-                    "outcome": typ,
-                },
-            )
-            return {"ok": False, "reason": "job_not_found", "job_id": job_id, "campaign_id": campaign_id, "rcpt": rcpt}
-
-        _apply_outcome_to_job(job, rcpt, typ, ev)
-        _record_accounting_error(job, rcpt, typ, ev)
-        job.maybe_persist()
-
-    return {"ok": True, "job_id": job.id, "campaign_id": job.campaign_id, "type": typ, "rcpt": rcpt}
-
-
-def process_campaign_accounting_payload(payload: dict) -> dict:
-    """Process middleware payload grouped by campaign_id.
-
-    Expected shape:
-      {
-        "campaign_id": "...",
-        "outcomes": [
-          {"recipient": "a@b.com", "status": "bounced", "job_id": "..."},
-          ...
-        ]
-      }
-    """
-    if not isinstance(payload, dict):
-        return {"ok": False, "error": "invalid_payload", "processed": 0, "accepted": 0}
-
-    campaign_id = str(payload.get("campaign_id") or "").strip()
-    outcomes = payload.get("outcomes")
-    if not campaign_id:
-        return {"ok": False, "error": "missing_campaign_id", "processed": 0, "accepted": 0}
-    if not isinstance(outcomes, list):
-        return {"ok": False, "error": "missing_outcomes", "processed": 0, "accepted": 0}
-
-    processed = 0
-    accepted = 0
-    with JOBS_LOCK:
-        fallback_job = _find_job_by_campaign(campaign_id)
-        for item in outcomes:
-            if not isinstance(item, dict):
-                continue
-            processed += 1
-            rcpt = str(item.get("recipient") or item.get("rcpt") or item.get("email") or "").strip()
-            typ = _normalize_outcome_type(item.get("status") or item.get("type") or item.get("event"))
-            if not rcpt or typ not in {"delivered", "bounced", "deferred", "complained"}:
-                continue
-
-            jid = str(item.get("job_id") or item.get("jobId") or "").strip().lower()
-            ev = dict(item)
-            ev.setdefault("source_file", "campaign_payload")
-            ev.setdefault("line", str(processed))
-            event_row = _build_accounting_event_row(ev, typ, rcpt, jid)
-            if not db_insert_accounting_event(event_row):
-                continue
-
-            job = JOBS.get(jid) if jid else None
-            if not job or (job.campaign_id or "") != campaign_id:
-                job = fallback_job
-            if not job:
-                continue
-
-            _apply_outcome_to_job(job, rcpt, typ, item)
-            _record_accounting_error(job, rcpt, typ, item)
-            job.maybe_persist()
-            accepted += 1
-
-    return {"ok": True, "campaign_id": campaign_id, "processed": processed, "accepted": accepted}
-
-
-def _db_get_bridge_cursor() -> str:
-    if _bridge_mode_counts_enabled():
-        return ""
-    with DB_LOCK:
-        conn = _db_conn()
-        try:
-            row = conn.execute("SELECT value FROM bridge_pull_state WHERE key='accounting_cursor'").fetchone()
-            return str(row[0]).strip() if row and row[0] is not None else ""
-        finally:
-            conn.close()
-
-
-def _db_set_bridge_cursor(cursor: str) -> None:
-    if _bridge_mode_counts_enabled():
-        return
-    cur = (cursor or "").strip()
-    if not cur:
-        return
-    with DB_LOCK:
-        conn = _db_conn()
-        try:
-            ts = now_iso()
-            _exec_upsert_compat(
-                conn,
-                "INSERT INTO bridge_pull_state(key, value, updated_at) VALUES(?, ?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-                ("accounting_cursor", cur, ts),
-                "UPDATE bridge_pull_state SET value=?, updated_at=? WHERE key=?",
-                (cur, ts, "accounting_cursor"),
-                "INSERT INTO bridge_pull_state(key, value, updated_at) VALUES(?, ?, ?)",
-                ("accounting_cursor", cur, ts),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def _normalize_bridge_pull_urls(raw_url: str) -> List[str]:
-    if _bridge_mode_counts_enabled():
+def _parse_remote_accounting_csv(text: str) -> List[dict]:
+    lines = [line for line in str(text or "").splitlines() if line.strip()]
+    if not lines:
         return []
-    url = (raw_url or "").strip()
-    if url and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
-        url = f"http://{url}"
-    if not url:
-        return []
-    if "/api/v1/pull/latest" in url:
-        return [url]
-    if "/api/v1/pull" in url:
-        latest = url.replace("/api/v1/pull", "/api/v1/pull/latest", 1)
-        return [url, latest] if latest != url else [url]
-    base = url.rstrip("/")
-    return [f"{base}/api/v1/pull", f"{base}/api/v1/pull/latest"]
-
-
-def _bridge_fetch_json(req_url: str, headers: Dict[str, str], max_request_attempts: int = 3) -> Tuple[Optional[dict], Optional[Exception]]:
-    request_error: Optional[Exception] = None
-    for attempt in range(1, max_request_attempts + 1):
-        _bridge_debug_update(last_req_url=req_url)
-        req_t0 = time.time()
-        try:
-            parsed = urlsplit(req_url)
-            if parsed.scheme and parsed.scheme.lower() != "http":
-                raise ValueError("bridge client supports HTTP only")
-            if not parsed.hostname:
-                raise ValueError("bridge request URL missing host")
-
-            global BRIDGE_BASE_URL
-            BRIDGE_BASE_URL = "http://{}:{}".format(parsed.hostname, parsed.port or 80)
-            params: Dict[str, Any] = {}
-            for k, v in parse_qsl(parsed.query, keep_blank_values=True):
-                if k in params:
-                    prev = params[k]
-                    if isinstance(prev, list):
-                        prev.append(v)
-                    else:
-                        params[k] = [prev, v]
-                else:
-                    params[k] = v
-            obj = bridge_get_json(parsed.path or "/", params)
-            _bridge_debug_update(
-                last_http_ok=True,
-                last_http_status=200,
-                last_latency_ms=int((time.time() - req_t0) * 1000),
-            )
-            request_error = None
-            return obj, None
-        except Exception as e:
-            request_error = e
-            _bridge_debug_update(
-                last_http_ok=False,
-                last_error_message=str(e),
-                last_error_ts=now_iso(),
-            )
-        if attempt < max_request_attempts:
-            time.sleep(min(1.0 * attempt, 2.0))
-    return None, request_error
-
-
-def _bridge_outcome_emails(obj: dict, key: str) -> List[str]:
-    bucket = obj.get(key)
-    if not isinstance(bucket, dict):
-        return []
-    emails = bucket.get("emails")
-    if not isinstance(emails, list):
-        return []
-    out: List[str] = []
-    for item in emails:
-        email = str(item or "").strip().lower()
-        if email:
-            out.append(email)
-    return out
-
-
-def _bridge_outcome_pairs(obj: dict) -> Dict[str, str]:
-    """Flatten bridge outcomes payload into rcpt->outcome map.
-
-    Supports canonical buckets (`delivered`, `deferred`, `bounced`, `complained`),
-    dotted-key variants (`delivered.emails`, etc), and top-level `emails` entries
-    when they include an explicit outcome/status.
-    """
-    pairs: Dict[str, str] = {}
-
-    def _set_pair(raw_rcpt: Any, outcome: str) -> None:
-        rcpt = str(raw_rcpt or "").strip().lower()
-        status = str(outcome or "").strip().lower()
-        if not rcpt or status not in {"delivered", "deferred", "bounced", "complained"}:
-            return
-        pairs[rcpt] = status
-
-    for status in ("delivered", "deferred", "bounced", "complained"):
-        for email in _bridge_outcome_emails(obj, status):
-            _set_pair(email, status)
-
-        dotted_emails = obj.get(f"{status}.emails")
-        if isinstance(dotted_emails, list):
-            for email in dotted_emails:
-                _set_pair(email, status)
-
-    top_level_emails = obj.get("emails")
-    if isinstance(top_level_emails, list):
-        for item in top_level_emails:
-            if isinstance(item, str):
-                # Top-level strings are ambiguous without an explicit status.
-                continue
-            if not isinstance(item, dict):
-                continue
-            _set_pair(
-                item.get("rcpt") or item.get("email"),
-                item.get("outcome") or item.get("status"),
-            )
-
-    return pairs
-
-
-def _bridge_outcome_records(obj: dict) -> Dict[str, Dict[str, str]]:
-    """Flatten bridge outcomes payload into rcpt -> detailed outcome record."""
-    records: Dict[str, Dict[str, str]] = {}
-
-    def _set_record(item: Any, fallback_status: str = "") -> None:
-        if isinstance(item, str):
-            rcpt = item
-            status = fallback_status
-            payload = {}
-        elif isinstance(item, dict):
-            rcpt = item.get("rcpt") or item.get("email")
-            status = item.get("outcome") or item.get("status") or fallback_status
-            payload = item
-        else:
-            return
-
-        email = str(rcpt or "").strip().lower()
-        norm_status = str(status or "").strip().lower()
-        if not email or norm_status not in {"delivered", "deferred", "bounced", "complained"}:
-            return
-
-        records[email] = {
-            "rcpt": email,
-            "status": norm_status,
-            "message_id": str(payload.get("message_id") or payload.get("msgid") or ""),
-            "dsn_status": str(payload.get("dsn_status") or payload.get("dsnStatus") or ""),
-            "dsn_diag": str(payload.get("dsn_diag") or payload.get("dsnDiag") or payload.get("diag") or ""),
-            "response": str(payload.get("response") or payload.get("smtp_response") or payload.get("smtp-response") or ""),
-        }
-
-    for status in ("delivered", "deferred", "bounced", "complained"):
-        bucket = obj.get(status)
-        emails = []
-        if isinstance(bucket, dict):
-            emails = bucket.get("emails") if isinstance(bucket.get("emails"), list) else []
-        elif isinstance(bucket, list):
-            emails = bucket
-        if isinstance(emails, list):
-            for row in emails:
-                _set_record(row, status)
-
-        dotted_emails = obj.get(f"{status}.emails")
-        if isinstance(dotted_emails, list):
-            for row in dotted_emails:
-                _set_record(row, status)
-
-    top_level_emails = obj.get("emails")
-    if isinstance(top_level_emails, list):
-        for row in top_level_emails:
-            _set_record(row)
-
-    return records
-
-
-def _bridge_sync_job_outcomes(job_id: str, obj: dict) -> Dict[str, int]:
-    counts = {"delivered": 0, "deferred": 0, "bounced": 0, "complained": 0}
-    normalized_job_id = (job_id or "").strip().lower()
-    records = _bridge_outcome_records(obj)
-    pairs = {rcpt: str(item.get("status") or "") for rcpt, item in records.items()}
-    if not pairs:
-        pairs = _bridge_outcome_pairs(obj)
-        records = {rcpt: {"rcpt": rcpt, "status": status} for rcpt, status in pairs.items()}
-
-    for status in pairs.values():
-        if status in counts:
-            counts[status] += 1
-
-    with DB_LOCK:
-        conn = _db_conn()
-        try:
-            for rcpt, status in pairs.items():
-                rec = records.get(rcpt) or {}
-                _db_set_outcome_payload(conn, {
-                    "job_id": normalized_job_id,
-                    "rcpt": rcpt,
-                    "status": status,
-                    "message_id": str(rec.get("message_id") or ""),
-                    "dsn_status": str(rec.get("dsn_status") or ""),
-                    "dsn_diag": str(rec.get("dsn_diag") or rec.get("response") or ""),
-                    "updated_at": now_iso(),
-                })
-            conn.commit()
-        finally:
-            conn.close()
-    return counts
-
-
-def _bridge_apply_accounting_error_samples(job: SendJob, outcomes_obj: dict) -> None:
-    records = _bridge_outcome_records(outcomes_obj)
-    if not records:
-        return
-
-    errors: List[dict] = []
-    for rcpt, row in records.items():
-        status = str(row.get("status") or "").lower()
-        if status not in {"deferred", "bounced", "complained"}:
-            continue
-        parts = [
-            str(row.get("response") or "").strip(),
-            str(row.get("dsn_status") or "").strip(),
-            str(row.get("dsn_diag") or "").strip(),
-        ]
-        detail = " | ".join([p for p in parts if p])
-        if not detail:
-            continue
-        kind = "temporary_error" if status == "deferred" else "blocked"
-        errors.append({
-            "ts": now_iso(),
-            "email": rcpt,
-            "type": status,
-            "kind": kind,
-            "detail": detail,
-        })
-
-    if not errors:
-        return
-
-    errors = errors[-40:]
-    merged = list(job.accounting_last_errors or []) + errors
-    job.accounting_last_errors = merged[-40:]
-
-
-def _replace_job_accounting_from_bridge_count(job: SendJob, count_obj: dict) -> int:
-    """Replace job accounting counters from bridge `/job/count` payload.
-
-    Bridge count response is authoritative for Shiva's aggregate counters, so this
-    method intentionally performs assignment (not increment/decrement) on each
-    successful poll to avoid drift across repeated polls.
-
-    Returns linked_emails_count from payload.
-    """
-    linked_count = int(count_obj.get("linked_emails_count") or 0)
-    job.delivered = int(count_obj.get("delivered_count") or 0)
-    job.deferred = int(count_obj.get("deferred_count") or 0)
-    job.bounced = int(count_obj.get("bounced_count") or 0)
-    job.complained = int(count_obj.get("complained_count") or 0)
-    job.accounting_last_ts = now_iso()
-
-    # Keep a lightweight per-minute snapshot to support trend charts while using
-    # deterministic replacement semantics for the counters.
+    header_idx = 0
+    for i, line in enumerate(lines):
+        low = line.lower()
+        if "timelogged" in low or ("type," in low and "rcpt" in low):
+            header_idx = i
+            break
+    payload = "\n".join(lines[header_idx:])
+    rows: List[dict] = []
     try:
-        now_min = int(time.time() // 60)
-        if job.outcome_series and int(job.outcome_series[-1].get("t_min") or 0) == now_min:
-            bucket = job.outcome_series[-1]
-        else:
-            bucket = {"t_min": now_min}
-            job.outcome_series.append(bucket)
-            if len(job.outcome_series) > 180:
-                job.outcome_series = job.outcome_series[-140:]
-        bucket["delivered"] = int(job.delivered or 0)
-        bucket["deferred"] = int(job.deferred or 0)
-        bucket["bounced"] = int(job.bounced or 0)
-        bucket["complained"] = int(job.complained or 0)
+        reader = csv.DictReader(payload.splitlines())
+        for idx, row in enumerate(reader, start=1):
+            if not isinstance(row, dict):
+                continue
+            item = {str(k or "").strip(): ("" if v is None else str(v).strip()) for k, v in row.items()}
+            item.setdefault("source_file", PMTA_ACCOUNTING_FILE)
+            item.setdefault("line", str(idx))
+            rows.append(item)
     except Exception:
-        pass
-
-    return linked_count
-
-
-def _active_jobs_for_bridge_poll() -> List['SendJob']:
-    active_statuses = {"queued", "running", "backoff", "paused"}
-
-    def _has_not_yet_resolved_recipients(job: 'SendJob') -> bool:
-        total = int(getattr(job, "total", 0) or 0)
-        if total <= 0:
-            return False
-        counts = db_get_job_outcome_counts(str(getattr(job, "id", "") or ""))
-        resolved = (
-            int(counts.get("delivered") or 0)
-            + int(counts.get("deferred") or 0)
-            + int(counts.get("bounced") or 0)
-            + int(counts.get("complained") or 0)
-        )
-        return resolved < total
-
-    with JOBS_LOCK:
-        jobs = [
-            j for j in JOBS.values()
-            if not getattr(j, "deleted", False)
-            and (
-                str(getattr(j, "status", "") or "").strip().lower() in active_statuses
-                or _has_not_yet_resolved_recipients(j)
-            )
-        ]
-    jobs.sort(key=lambda x: str(x.created_at or ""), reverse=True)
-    return jobs
+        return []
+    return rows
 
 
-def _job_pmta_job_id(job: 'SendJob') -> str:
-    pmta_job_id = str(getattr(job, "pmta_job_id", "") or "").strip().lower()
-    if pmta_job_id:
-        return pmta_job_id
-    fallback = str(getattr(job, "id", "") or "").strip().lower()
-    return fallback
+def _tail_remote_accounting(job: 'SendJob') -> dict:
+    profile = _resolve_pmta_ssh_profile(job=job, campaign_id=job.campaign_id, smtp_host=job.smtp_host)
+    if not profile.get("enabled"):
+        return {"ok": False, "error": "ssh_not_configured", "rows": [], "target": ""}
+    acct_path = shlex.quote(str(profile.get("accounting_file") or PMTA_ACCOUNTING_FILE or "/var/log/pmta/acct.csv"))
+    tail_lines = max(50, int(PMTA_ACCOUNTING_TAIL_LINES or 2500))
+    cmd = f"tail -n {tail_lines} {acct_path}"
+    res = _run_pmta_ssh(profile, cmd, timeout_s=max(4.0, float(profile.get("timeout") or PMTA_SSH_TIMEOUT_S or 8.0)))
+    res["rows"] = _parse_remote_accounting_csv(str(res.get("stdout") or "")) if res.get("ok") else []
+    res["ssh_command"] = cmd
+    return res
 
 
 def _poll_accounting_bridge_once() -> dict:
     if not _BRIDGE_POLL_CYCLE_LOCK.acquire(blocking=False):
-        return {
-            "ok": False,
-            "error": "busy",
-            "reason": "busy",
-            "processed": 0,
-            "accepted": 0,
-            "count": 0,
-            "batches": 0,
-            "jobs_total": 0,
-            "jobs_success": 0,
-            "jobs_failed": 0,
-            "jobs": [],
-            "cursor": "",
-        }
-
-    logger = logging.getLogger("shiva")
+        return {"ok": False, "error": "busy", "reason": "busy", "processed": 0, "accepted": 0, "count": 0, "batches": 0, "jobs_total": 0, "jobs_success": 0, "jobs_failed": 0, "jobs": [], "cursor": ""}
     try:
         t0 = time.time()
-        poll_ts = now_iso()
-        _bridge_debug_update(last_poll_time=poll_ts)
-        base_url = _resolve_bridge_base_url_runtime()
-        global BRIDGE_BASE_URL
-        BRIDGE_BASE_URL = base_url
-        if not base_url:
-            _bridge_debug_update(
-                last_attempt_ts=now_iso(),
-                attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
-                last_ok=False,
-                connected=False,
-                failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + 1,
-                last_error_ts=now_iso(),
-                last_error="bridge_base_url_not_configured",
-                last_duration_ms=int((time.time() - t0) * 1000),
-            )
-            return {"ok": False, "error": "bridge_base_url_not_configured", "processed": 0, "accepted": 0}
-
-        headers = {"Accept": "application/json"}
         jobs = _active_jobs_for_bridge_poll()
-
         total_processed = 0
         total_accepted = 0
-        total_count = 0
-        last_obj: Any = {}
-        last_error = ""
-        job_results: List[Dict[str, Any]] = []
         jobs_success = 0
         jobs_failed = 0
-
+        job_results: List[Dict[str, Any]] = []
+        last_error = ""
+        ssh_target = ""
+        ssh_command = ""
         for job in jobs:
+            res = _tail_remote_accounting(job)
+            ssh_target = str(res.get("target") or ssh_target)
+            ssh_command = str(res.get("ssh_command") or ssh_command)
             jid = _job_pmta_job_id(job)
-            if not jid:
-                continue
-
-            total_processed += 1
-            job_result: Dict[str, Any] = {
-                "pmta_job_id": jid,
-                "outcomes_sync_enabled": bool(BRIDGE_POLL_FETCH_OUTCOMES),
-            }
-            count_url = f"{base_url}{PMTA_BRIDGE_JOB_COUNT_PATH}?job_id={quote_plus(jid)}"
-            count_obj, count_error = _bridge_fetch_json(count_url, headers)
-            if count_error is not None or not isinstance(count_obj, dict):
-                err_msg = f"bridge_count_failed job_id={jid} error={count_error}"
-                logger.exception(err_msg) if count_error is not None else logger.error(err_msg)
-                last_error = err_msg
+            if not res.get("ok"):
+                last_error = str(res.get("error") or "ssh_failed")
                 jobs_failed += 1
-                job_result["error"] = str(count_error or "bridge_count_failed")
-                job_results.append(job_result)
+                job_results.append({"pmta_job_id": jid, "error": last_error})
                 continue
-
-            outcomes_obj: Optional[dict] = None
-            outcomes_error: Optional[Exception] = None
-            if BRIDGE_POLL_FETCH_OUTCOMES:
-                outcomes_url = f"{base_url}{PMTA_BRIDGE_JOB_OUTCOMES_PATH}?job_id={quote_plus(jid)}"
-                outcomes_obj, outcomes_error = _bridge_fetch_json(outcomes_url, headers)
-                if outcomes_error is not None:
-                    logger.warning("Bridge outcomes fetch failed for job_id=%s: %s", jid, outcomes_error)
-                    job_result["outcomes_sync_error"] = str(outcomes_error)
-
-            if BRIDGE_POLL_FETCH_OUTCOMES and outcomes_obj and outcomes_error is None:
-                try:
-                    _bridge_sync_job_outcomes(jid, outcomes_obj)
-                except Exception:
-                    logger.exception("Bridge outcome sync failed for job_id=%s", jid)
-
-            linked_count = int(count_obj.get("linked_emails_count") or 0)
-            with JOBS_LOCK:
-                live_job = JOBS.get(str(getattr(job, "id", "") or "").strip().lower())
-                if live_job and not getattr(live_job, "deleted", False):
-                    linked_count = _replace_job_accounting_from_bridge_count(live_job, count_obj)
-                    if BRIDGE_POLL_FETCH_OUTCOMES and outcomes_obj and outcomes_error is None:
-                        _bridge_apply_accounting_error_samples(live_job, outcomes_obj)
-                    live_job.maybe_persist()
-
-            total_accepted += 1
-            total_count += int(linked_count)
-            last_obj = count_obj
+            processed = 0
+            accepted = 0
+            for row in list(res.get("rows") or []):
+                row_jid = str(row.get("header_x-job-id") or row.get("job_id") or row.get("x-job-id") or "").strip().lower()
+                row_cid = str(row.get("header_x-campaign-id") or row.get("campaign_id") or "").strip()
+                rcpt = str(row.get("rcpt") or row.get("recipient") or row.get("email") or "").strip().lower()
+                if row_jid and row_jid != jid:
+                    continue
+                if (not row_jid) and row_cid and row_cid != str(job.campaign_id or ""):
+                    continue
+                if (not row_jid) and (not row_cid) and rcpt and not db_find_job_ids_by_recipient(rcpt):
+                    continue
+                processed += 1
+                out = process_pmta_accounting_event(dict(row))
+                if out.get("ok"):
+                    accepted += 1
+            total_processed += processed
+            total_accepted += accepted
             jobs_success += 1
-            job_result["counts"] = {
-                "linked_emails_count": int(linked_count),
-                "delivered_count": int(count_obj.get("delivered_count") or 0),
-                "deferred_count": int(count_obj.get("deferred_count") or 0),
-                "bounced_count": int(count_obj.get("bounced_count") or 0),
-                "complained_count": int(count_obj.get("complained_count") or 0),
-            }
-            job_result["updated_at"] = now_iso()
-            job_results.append(job_result)
-
+            job_results.append({"pmta_job_id": jid, "counts": {"linked_emails_count": accepted, "delivered_count": int(job.delivered or 0), "deferred_count": int(job.deferred or 0), "bounced_count": int(job.bounced or 0), "complained_count": int(job.complained or 0)}, "updated_at": now_iso()})
         ok = (last_error == "")
-        prev_state = dict(_BRIDGE_DEBUG_STATE)
-        debug_payload: Dict[str, Any] = {
-            "last_attempt_ts": now_iso(),
-            "last_success_ts": now_iso() if ok else str(_BRIDGE_DEBUG_STATE.get("last_success_ts") or ""),
-            "attempts": int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1,
-            "success_count": int(_BRIDGE_DEBUG_STATE.get("success_count", 0)) + (1 if ok else 0),
-            "failure_count": int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + (0 if ok else 1),
-            "last_ok": ok,
-            "connected": ok,
-            "last_error": last_error,
-            "last_error_message": last_error,
-            "last_error_ts": now_iso() if not ok else str(_BRIDGE_DEBUG_STATE.get("last_error_ts") or ""),
-            "last_ok_ts": now_iso() if ok else str(_BRIDGE_DEBUG_STATE.get("last_ok_ts") or ""),
-            "last_lines_sample": [],
-            "last_duration_ms": int((time.time() - t0) * 1000),
-            "last_cursor": "",
-            "has_more": False,
-            "events_received": int(_BRIDGE_DEBUG_STATE.get("events_received", 0) or 0) + total_processed,
-            "events_ingested": int(_BRIDGE_DEBUG_STATE.get("events_ingested", 0) or 0) + total_accepted,
-            "duplicates_dropped": int(_BRIDGE_DEBUG_STATE.get("duplicates_dropped", 0) or 0),
-            "job_not_found": int(_BRIDGE_DEBUG_STATE.get("job_not_found", 0) or 0),
-            "missing_fields": int(_BRIDGE_DEBUG_STATE.get("missing_fields", 0) or 0),
-            "db_write_failures": int(_DB_WRITER_STATUS.get("failed", 0) or 0) + int(_DB_WRITER_STATUS.get("queue_full", 0) or 0),
-            "internal_error_samples": list(_BRIDGE_DEBUG_STATE.get("internal_error_samples") or [])[-24:],
-            "integrity_samples": list(_BRIDGE_DEBUG_STATE.get("integrity_samples") or [])[-24:],
-        }
-        if ok:
-            debug_payload.update(
-                last_bridge_count=total_count,
-                last_processed=total_processed,
-                last_accepted=total_accepted,
-                last_response_keys=list(last_obj.keys()) if isinstance(last_obj, dict) else [],
-            )
-        else:
-            debug_payload.update(
-                last_bridge_count=int(prev_state.get("last_bridge_count", 0) or 0),
-                last_processed=int(prev_state.get("last_processed", 0) or 0),
-                last_accepted=int(prev_state.get("last_accepted", 0) or 0),
-                last_response_keys=list(prev_state.get("last_response_keys") or []),
-            )
-
-        _bridge_debug_update(**debug_payload)
-        return {
-            "ok": ok,
-            "processed": total_processed,
-            "accepted": total_accepted,
-            "count": total_count,
-            "batches": len(jobs),
-            "jobs_total": len(jobs),
-            "jobs_success": jobs_success,
-            "jobs_failed": jobs_failed,
-            "jobs": job_results,
-            "cursor": "",
-            "error": last_error,
-        }
+        _bridge_debug_update(last_poll_time=now_iso(), last_attempt_ts=now_iso(), last_success_ts=now_iso() if ok else str(_BRIDGE_DEBUG_STATE.get("last_success_ts") or ""), last_error_ts=now_iso() if not ok else str(_BRIDGE_DEBUG_STATE.get("last_error_ts") or ""), last_ok=ok, connected=ok, attempts=int(_BRIDGE_DEBUG_STATE.get("attempts", 0)) + 1, success_count=int(_BRIDGE_DEBUG_STATE.get("success_count", 0)) + (1 if ok else 0), failure_count=int(_BRIDGE_DEBUG_STATE.get("failure_count", 0)) + (0 if ok else 1), last_error=last_error, last_error_message=last_error, last_ok_ts=now_iso() if ok else str(_BRIDGE_DEBUG_STATE.get("last_ok_ts") or ""), last_duration_ms=int((time.time() - t0) * 1000), last_bridge_count=total_accepted, last_processed=total_processed, last_accepted=total_accepted, events_received=int(_BRIDGE_DEBUG_STATE.get("events_received", 0) or 0) + total_processed, events_ingested=int(_BRIDGE_DEBUG_STATE.get("events_ingested", 0) or 0) + total_accepted, ssh_target=ssh_target, ssh_command=ssh_command)
+        return {"ok": ok, "processed": total_processed, "accepted": total_accepted, "count": total_accepted, "batches": len(jobs), "jobs_total": len(jobs), "jobs_success": jobs_success, "jobs_failed": jobs_failed, "jobs": job_results, "cursor": "", "error": last_error}
     finally:
         _BRIDGE_POLL_CYCLE_LOCK.release()
 
@@ -15767,14 +14343,12 @@ def _accounting_bridge_poller_thread():
         try:
             _poll_accounting_bridge_once()
         except Exception:
-            logger.exception("Bridge polling loop failed; continuing")
-        time.sleep(max(1.0, float(BRIDGE_POLL_INTERVAL_S or PMTA_BRIDGE_PULL_S or 5.0)))
+            logger.exception("SSH accounting polling loop failed; continuing")
+        time.sleep(max(1.0, float(BRIDGE_POLL_INTERVAL_S or 5.0)))
 
 
 def start_accounting_bridge_poller_if_needed():
     global _BRIDGE_POLLER_STARTED
-    if not PMTA_BRIDGE_PULL_ENABLED:
-        return
     with _BRIDGE_POLLER_LOCK:
         if _BRIDGE_POLLER_STARTED:
             return
@@ -15783,9 +14357,7 @@ def start_accounting_bridge_poller_if_needed():
         _BRIDGE_POLLER_STARTED = True
 
 
-# Start PMTA accounting bridge poller if configured.
 start_accounting_bridge_poller_if_needed()
-
 
 # =========================
 # SMTP Sender
@@ -15836,6 +14408,12 @@ def smtp_send_job(
     smtp_timeout: int,
     smtp_user: str,
     smtp_pass: str,
+    ssh_host: str,
+    ssh_port: int,
+    ssh_user: str,
+    ssh_key_path: str,
+    ssh_pass: str,
+    ssh_timeout: float,
     sender_names: List[str],
     sender_emails: List[str],
     subjects: List[str],
@@ -15872,6 +14450,8 @@ def smtp_send_job(
 
     smtp_port = _coerce_scalar_number(smtp_port, as_type="int", default=2525)
     smtp_timeout = _coerce_scalar_number(smtp_timeout, as_type="int", default=25)
+    ssh_port = _coerce_scalar_number(ssh_port, as_type="int", default=22)
+    ssh_timeout = _coerce_scalar_number(ssh_timeout, as_type="float", default=float(PMTA_SSH_TIMEOUT_S or 8.0))
     delay_s = _coerce_scalar_number(delay_s, as_type="float", default=0.0)
     chunk_size = _coerce_scalar_number(chunk_size, as_type="int", default=50)
     thread_workers = _coerce_scalar_number(thread_workers, as_type="int", default=5)
@@ -15885,6 +14465,12 @@ def smtp_send_job(
         job.status = "running"
         job.started_at = job.started_at or now_iso()
         job.updated_at = now_iso()
+        job.ssh_host = str(ssh_host or job.ssh_host or "")
+        job.ssh_port = int(ssh_port or job.ssh_port or 22)
+        job.ssh_user = str(ssh_user or job.ssh_user or "")
+        job.ssh_key_path = str(ssh_key_path or job.ssh_key_path or "")
+        job.ssh_pass = str(ssh_pass or job.ssh_pass or "")
+        job.ssh_timeout = float(ssh_timeout or job.ssh_timeout or PMTA_SSH_TIMEOUT_S)
         job.log(
             "INFO",
             f"Starting job. total={len(recipients)} host={smtp_host}:{smtp_port} security={smtp_security} chunk_size={chunk_size} workers={thread_workers} sleep_chunks={sleep_chunks}s",
@@ -15894,7 +14480,7 @@ def smtp_send_job(
     # This keeps the UI informative (connected/unreachable/disabled reason) even when
     # PMTA_QUEUE_BACKOFF and PMTA_PRESSURE_CONTROL are both disabled.
     try:
-        initial_live = pmta_live_panel(smtp_host=smtp_host)
+        initial_live = pmta_live_panel(smtp_host=smtp_host, campaign_id=job.campaign_id, job=job)
         with JOBS_LOCK:
             job.pmta_live = initial_live
             job.pmta_live_ts = now_iso()
@@ -16859,7 +15445,7 @@ def smtp_send_job(
                         # Point (7): fast diagnosis (client vs PMTA queue vs remote throttling)
                         diag = {}
                         try:
-                            diag = pmta_diag_on_error(smtp_host=smtp_host, rcpt=rcpt, exc=e)
+                            diag = pmta_diag_on_error(smtp_host=smtp_host, rcpt=rcpt, exc=e, campaign_id=job.campaign_id, job=job)
                         except Exception:
                             diag = {}
 
@@ -18403,7 +16989,7 @@ def smtp_send_job(
                 try:
                     # Refresh PMTA live snapshot (rate-limited)
                     if (time.time() - float(last_pmta_pressure or 0.0)) >= float(PMTA_PRESSURE_POLL_S or 3.0):
-                        live = pmta_live_panel(smtp_host=smtp_host)
+                        live = pmta_live_panel(smtp_host=smtp_host, campaign_id=job.campaign_id, job=job)
                         last_pmta_pressure = time.time()
                         with JOBS_LOCK:
                             job.pmta_live = live
@@ -18732,7 +17318,7 @@ def smtp_send_job(
                         top = sorted(plan_copy.items(), key=lambda x: int(x[1] or 0), reverse=True)[: max(0, int(PMTA_DOMAINS_TOP_N or 0))]
                         want = [d for d, _ in top if d]
 
-                        over = pmta_domains_overview(smtp_host=smtp_host)
+                        over = pmta_domains_overview(smtp_host=smtp_host, campaign_id=job.campaign_id, job=job)
                         small = {
                             "ok": bool(over.get("ok")),
                             "reason": str(over.get("reason") or ""),
@@ -18901,7 +17487,7 @@ def smtp_send_job(
                 # still reflects the real monitor status during sending.
                 try:
                     if (time.time() - float(last_pmta_live or 0.0)) >= float(PMTA_LIVE_POLL_S or 3.0):
-                        live = pmta_live_panel(smtp_host=smtp_host)
+                        live = pmta_live_panel(smtp_host=smtp_host, campaign_id=job.campaign_id, job=job)
                         last_pmta_live = time.time()
                         with JOBS_LOCK:
                             job.pmta_live = live
@@ -18919,7 +17505,7 @@ def smtp_send_job(
 
                 if PMTA_QUEUE_BACKOFF:
                     try:
-                        pmta_sig = pmta_chunk_policy(smtp_host=smtp_host, chunk_domain_counts=dom_counts)
+                        pmta_sig = pmta_chunk_policy(smtp_host=smtp_host, chunk_domain_counts=dom_counts, campaign_id=job.campaign_id, job=job)
                         if pmta_sig.get("blocked"):
                             pmta_reason = str(pmta_sig.get("reason") or "")
                         elif pmta_sig.get("slow"):
@@ -21363,7 +19949,7 @@ def api_pmta_probe():
     host = (request.args.get("host") or request.args.get("smtp_host") or "").strip()
     if not host:
         return jsonify({"ok": False, "error": "missing host (use ?host=...)"}), 400
-    return jsonify(pmta_probe_endpoints(smtp_host=host))
+    return jsonify(pmta_probe_endpoints(smtp_host=host, ssh_host=host))
 
 
 
@@ -21436,6 +20022,54 @@ def api_smtp_test():
         ),
         400,
     )
+
+
+@app.post("/api/ssh_test")
+def api_ssh_test():
+    data = request.get_json(silent=True) or request.form or {}
+
+    def g(k: str, default: str = "") -> str:
+        try:
+            return str(data.get(k, default) or "").strip()
+        except Exception:
+            return default
+
+    smtp_host = g("smtp_host")
+    ssh_host = g("ssh_host")
+    ssh_user = g("ssh_user")
+    ssh_key_path = g("ssh_key_path")
+    ssh_pass = g("ssh_pass")
+    try:
+        ssh_port = int(g("ssh_port", "22"))
+    except Exception:
+        return jsonify({"ok": False, "error": "invalid ssh_port"}), 400
+    try:
+        ssh_timeout = float(g("ssh_timeout", "8"))
+    except Exception:
+        return jsonify({"ok": False, "error": "invalid ssh_timeout"}), 400
+
+    profile = _resolve_pmta_ssh_profile(
+        smtp_host=smtp_host,
+        ssh_host=ssh_host,
+        ssh_port=ssh_port,
+        ssh_user=ssh_user,
+        ssh_key_path=ssh_key_path,
+        ssh_pass=ssh_pass,
+        ssh_timeout=ssh_timeout,
+    )
+    if not profile.get("enabled"):
+        return jsonify({"ok": False, "error": "ssh_host is required"}), 400
+
+    res = _run_pmta_cli(profile, "show status", timeout_s=max(4.0, ssh_timeout))
+    if not res.get("ok"):
+        return jsonify({"ok": False, "error": str(res.get("error") or "ssh_failed"), "target": res.get("target")}), 400
+
+    return jsonify({
+        "ok": True,
+        "detail": "SSH connected and `pmta show status` succeeded.",
+        "target": res.get("target"),
+        "snippet": str(res.get("stdout") or "")[:240],
+    })
 
 
 @app.post("/api/ai_rewrite")
@@ -21741,10 +20375,22 @@ def start():
         return "Invalid SMTP Timeout.", 400
     smtp_user = (request.form.get("smtp_user") or "").strip()
     smtp_pass = (request.form.get("smtp_pass") or "").strip()
+    ssh_host = (request.form.get("ssh_host") or "").strip()
+    try:
+        ssh_port = int((request.form.get("ssh_port") or "22").strip() or "22")
+    except Exception:
+        return "Invalid SSH Port.", 400
+    ssh_user = (request.form.get("ssh_user") or "").strip()
+    ssh_key_path = (request.form.get("ssh_key_path") or "").strip()
+    ssh_pass = (request.form.get("ssh_pass") or "").strip()
+    try:
+        ssh_timeout = float((request.form.get("ssh_timeout") or str(PMTA_SSH_TIMEOUT_S)).strip() or str(PMTA_SSH_TIMEOUT_S))
+    except Exception:
+        return "Invalid SSH Timeout.", 400
 
-    # Optional: PowerMTA health check (Web Monitor / HTTP Monitoring API)
+    # Optional: PowerMTA health check over SSH/CLI
     # Runs BEFORE creating the job/thread (fast fail when PMTA is down/busy).
-    pmta_hc = pmta_health_check(smtp_host=smtp_host)
+    pmta_hc = pmta_health_check(smtp_host=smtp_host, campaign_id=campaign_id)
     if pmta_hc.get("enabled"):
         if (not pmta_hc.get("ok")) and pmta_hc.get("required"):
             return (
@@ -21953,6 +20599,12 @@ def start():
         pmta_job_id=job_id,
         bridge_mode=str(BRIDGE_MODE or "counts"),
         smtp_host=smtp_host,
+        ssh_host=ssh_host,
+        ssh_port=ssh_port,
+        ssh_user=ssh_user,
+        ssh_key_path=ssh_key_path,
+        ssh_pass=ssh_pass,
+        ssh_timeout=ssh_timeout,
         total=len(valid),
         invalid=invalid_total_count,
         skipped=safe_skipped,
@@ -22042,6 +20694,12 @@ def start():
         "smtp_timeout": int(smtp_timeout),
         "smtp_user": smtp_user,
         "smtp_pass": smtp_pass,
+        "ssh_host": ssh_host,
+        "ssh_port": int(ssh_port),
+        "ssh_user": ssh_user,
+        "ssh_key_path": ssh_key_path,
+        "ssh_pass": ssh_pass,
+        "ssh_timeout": float(ssh_timeout),
         "sender_names": list(from_names),
         "sender_emails": list(valid_sender_emails),
         "subjects": list(subjects),
@@ -22079,6 +20737,12 @@ def start():
             smtp_timeout,
             smtp_user,
             smtp_pass,
+            ssh_host,
+            ssh_port,
+            ssh_user,
+            ssh_key_path,
+            ssh_pass,
+            ssh_timeout,
             from_names,
             valid_sender_emails,
             subjects,
