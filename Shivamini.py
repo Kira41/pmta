@@ -28,44 +28,25 @@ JOBS_PAGE_HTML = r"""<html lang="en"><head>
       --radius: 16px;
     }
     *{box-sizing:border-box}
-    body{font-family:system-ui; margin:0; background:var(--bg); color: var(--text); padding:18px 14px;}
+    body{
+      font-family:system-ui;
+      margin:0;
+      background:var(--bg);
+      color: var(--text);
+      min-height:100vh;
+    }
     a{color:var(--accent); text-decoration:none}
 
+    .shell{display:grid; grid-template-columns:280px 1fr; min-height:100vh}
+    .sidebar{padding:22px 18px; border-right:1px solid rgba(255,255,255,.08); background:rgba(5,10,18,.35); position:sticky; top:0; height:100vh}
+    .brand{font-weight:900; font-size:22px; letter-spacing:.3px}
+    .brandSub{margin-top:8px; color:var(--muted); font-size:13px; line-height:1.6}
+    .menu{display:flex; flex-direction:column; gap:10px; margin-top:22px}
+    .menu a{display:flex; align-items:center; gap:10px; padding:12px 14px; border-radius:14px; border:1px solid rgba(255,255,255,.1); background:rgba(255,255,255,.04)}
+    .menu a.active{background:rgba(122,167,255,.18); border-color:rgba(122,167,255,.35); font-weight:800}
+    .sidebarCard{margin-top:18px; padding:14px; border-radius:16px; border:1px solid var(--border); background:linear-gradient(180deg,var(--card),var(--card2)); box-shadow:var(--shadow)}
+    .content{padding:28px 18px 28px 24px}
     .wrap{max-width: 1200px; margin: 0 auto;}
-
-    .jobsNavbar{
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      gap:12px;
-      flex-wrap:wrap;
-      margin-bottom:16px;
-      padding:12px 14px;
-      border:1px solid rgba(255,255,255,.12);
-      border-radius:18px;
-      background:linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.04));
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(10px);
-    }
-    .jobsNavbarBrand{display:flex; flex-direction:column; gap:4px;}
-    .jobsNavbarTitle{font-size:15px; font-weight:900; letter-spacing:.3px;}
-    .jobsNavbarHint{font-size:12px; color:var(--muted);}
-    .jobsNavbarLinks{display:flex; gap:10px; flex-wrap:wrap; align-items:center;}
-    .jobsNavbarLink{
-      display:inline-flex;
-      align-items:center;
-      gap:8px;
-      padding:9px 12px;
-      border-radius:12px;
-      border:1px solid rgba(255,255,255,.14);
-      background: rgba(255,255,255,.05);
-      color: rgba(255,255,255,.9);
-      font-size:13px;
-      font-weight:800;
-      text-decoration:none;
-    }
-    .jobsNavbarLink:hover{filter:brightness(1.08)}
-    .jobsNavbarLink.active{background: rgba(122,167,255,.18); border-color: rgba(122,167,255,.38); color:#fff;}
 
     .top{display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start; justify-content:space-between; margin-bottom:12px;}
     h2{margin:0; font-size: 20px;}
@@ -500,6 +481,7 @@ JOBS_PAGE_HTML = r"""<html lang="en"><head>
     .trendSeg.cmp .lbl, .trendSeg.cmp .spark{ color: #ff8bd6; }
     .outMeta{ margin-top:8px; font-size:11px; color:rgba(255,255,255,.62); }
     @media (max-width: 560px){ .outcomesGrid{ grid-template-columns: 1fr; } }
+    @media (max-width: 920px){ .shell{grid-template-columns:1fr} .sidebar{position:relative; height:auto; border-right:0; border-bottom:1px solid rgba(255,255,255,.08)} .content{padding:18px 14px 24px} }
 
     table{width:100%; border-collapse:collapse; font-size: 12px;}
     th,td{padding:8px; border-bottom:1px solid rgba(255,255,255,.10); text-align:left; vertical-align:top}
@@ -554,27 +536,32 @@ JOBS_PAGE_HTML = r"""<html lang="en"><head>
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <nav class="jobsNavbar" aria-label="Shivamini navigation">
-      <div class="jobsNavbarBrand">
-        <div class="jobsNavbarTitle">Shivamini Navigation</div>
-        <div class="jobsNavbarHint">Quick access across the demo dashboard, campaigns, sending flow, and jobs surfaces.</div>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">Shivamini</div>
+      <div class="brandSub">Unified single-file Flask frontend sandbox with the Shiva Mini Sand styling applied across dashboard, jobs, job details, config, domains, and send surfaces.</div>
+      <nav class="menu" aria-label="Shivamini navigation">
+        <a href="/">📊 Dashboard</a>
+        <a href="/campaigns">📌 Campaigns</a>
+        <a href="/send">✉️ Send</a>
+        <a href="/jobs" class="active">📄 Jobs</a>
+        <a href="/job/job-240301-a">🧩 Job Detail</a>
+        <a href="/config">⚙️ Config</a>
+        <a href="/domains">🌐 Domains</a>
+      </nav>
+      <div class="sidebarCard">
+        <div style="font-weight:800">Demo status</div>
+        <div class="mini" style="margin-top:8px">Campaign: <code>Demo launch</code><br>Status: <b>running</b><br>Updated: 2026-03-22 12:00:00 UTC</div>
       </div>
-      <div class="jobsNavbarLinks">
-        <a class="jobsNavbarLink" href="/">📊 Dashboard</a>
-        <a class="jobsNavbarLink" href="/campaigns">📌 Campaigns</a>
-        <a class="jobsNavbarLink" href="/send">✉️ Send</a>
-        <a class="jobsNavbarLink active" href="/jobs">📄 Jobs</a>
-        <a class="jobsNavbarLink" href="/config">⚙️ Config</a>
-        <a class="jobsNavbarLink" href="/domains">🌐 Domains</a>
-      </div>
-    </nav>
+    </aside>
+    <main class="content">
+      <div class="wrap">
 
     <div class="top">
       <div>
         <h2>Jobs</h2>
         <div class="sub">
-          Live monitoring: summary, current chunk, backoff, progress bars, top domains, counters, error histogram, and chunk preflight history. This page keeps the full `jobs.html` CSS/layout while adding the Shivamini navigation bar.
+          Live monitoring: summary, current chunk, backoff, progress bars, top domains, counters, error histogram, and chunk preflight history. This page keeps the full `jobs.html` CSS/layout while now using the same Shivamini sidebar navigation layout as the other demo surfaces.
         </div>
         <div class="nav">
           
@@ -881,7 +868,9 @@ JOBS_PAGE_HTML = r"""<html lang="en"><head>
           </div>
         </details>
 
-      </div></div>
+      </div>
+    </main>
+  </div>
 
   <div class="toast-wrap" id="toastWrap"></div>
 
