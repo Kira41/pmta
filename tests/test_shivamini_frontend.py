@@ -20,6 +20,14 @@ def test_shivamini_routes_render():
     assert 'data-jobid="83b5cd63007e"' in jobs_html
     assert "PMTA Live Panel" in jobs_html
     assert "Chunk preflight" in jobs_html
+    assert "✉️ Send mailer" in jobs_html
+    assert "← Back to Send mailer" in jobs_html
+
+    job_html = client.get("/job/job-240301-a").get_data(as_text=True)
+    assert "← Back to Send mailer" in job_html
+    assert "Domains progress:" in job_html
+    assert "Scheduler + Lanes Telemetry" in job_html
+    assert "Page 1 / 1 · 100 emails per page" in job_html
 
     send_html = client.get("/send").get_data(as_text=True)
     assert "SMTP Mail Sender" in send_html
