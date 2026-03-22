@@ -33,6 +33,40 @@ JOBS_PAGE_HTML = r"""<html lang="en"><head>
 
     .wrap{max-width: 1200px; margin: 0 auto;}
 
+    .jobsNavbar{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      flex-wrap:wrap;
+      margin-bottom:16px;
+      padding:12px 14px;
+      border:1px solid rgba(255,255,255,.12);
+      border-radius:18px;
+      background:linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.04));
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+    .jobsNavbarBrand{display:flex; flex-direction:column; gap:4px;}
+    .jobsNavbarTitle{font-size:15px; font-weight:900; letter-spacing:.3px;}
+    .jobsNavbarHint{font-size:12px; color:var(--muted);}
+    .jobsNavbarLinks{display:flex; gap:10px; flex-wrap:wrap; align-items:center;}
+    .jobsNavbarLink{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding:9px 12px;
+      border-radius:12px;
+      border:1px solid rgba(255,255,255,.14);
+      background: rgba(255,255,255,.05);
+      color: rgba(255,255,255,.9);
+      font-size:13px;
+      font-weight:800;
+      text-decoration:none;
+    }
+    .jobsNavbarLink:hover{filter:brightness(1.08)}
+    .jobsNavbarLink.active{background: rgba(122,167,255,.18); border-color: rgba(122,167,255,.38); color:#fff;}
+
     .top{display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start; justify-content:space-between; margin-bottom:12px;}
     h2{margin:0; font-size: 20px;}
     .sub{margin-top:6px; color:var(--muted); font-size:12px; line-height:1.6; max-width: 760px;}
@@ -521,12 +555,26 @@ JOBS_PAGE_HTML = r"""<html lang="en"><head>
 </head>
 <body>
   <div class="wrap">
+    <nav class="jobsNavbar" aria-label="Shivamini navigation">
+      <div class="jobsNavbarBrand">
+        <div class="jobsNavbarTitle">Shivamini Navigation</div>
+        <div class="jobsNavbarHint">Quick access across the demo dashboard, campaigns, sending flow, and jobs surfaces.</div>
+      </div>
+      <div class="jobsNavbarLinks">
+        <a class="jobsNavbarLink" href="/">📊 Dashboard</a>
+        <a class="jobsNavbarLink" href="/campaigns">📌 Campaigns</a>
+        <a class="jobsNavbarLink" href="/send">✉️ Send</a>
+        <a class="jobsNavbarLink active" href="/jobs">📄 Jobs</a>
+        <a class="jobsNavbarLink" href="/config">⚙️ Config</a>
+        <a class="jobsNavbarLink" href="/domains">🌐 Domains</a>
+      </div>
+    </nav>
 
     <div class="top">
       <div>
         <h2>Jobs</h2>
         <div class="sub">
-          Live monitoring: summary, current chunk, backoff, progress bars, top domains, counters, error histogram, and chunk preflight history.
+          Live monitoring: summary, current chunk, backoff, progress bars, top domains, counters, error histogram, and chunk preflight history. This page keeps the full `jobs.html` CSS/layout while adding the Shivamini navigation bar.
         </div>
         <div class="nav">
           
