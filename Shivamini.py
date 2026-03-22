@@ -61,6 +61,25 @@ DASHBOARD_DATA = {
             {"domain": "offers-demo.org", "ips": ["203.0.113.110"], "status": "Not listed", "spam_score": 3.0},
         ],
     },
+    "excel_info": {
+        "file_name": "ramadan-demo-recipients.xlsx",
+        "sheet_name": "Audience_Master",
+        "rows_total": "48,250",
+        "validated_rows": "47,901",
+        "suppressed_rows": "349",
+        "columns": [
+            {"name": "email", "description": "Primary recipient email used to build the fake send queue."},
+            {"name": "first_name", "description": "Used with [NAME] and personalization previews inside the HTML body."},
+            {"name": "segment", "description": "Maps each row to a campaign slice such as VIP, warm, or re-engagement."},
+            {"name": "sender_hint", "description": "Optional sender-domain hint used by the routing preview in Mini Shiva."},
+        ],
+        "checks": [
+            "Accepts .xlsx uploads with one audience sheet or multiple segment sheets.",
+            "Normalizes headers automatically before fake preview mapping.",
+            "Flags duplicate emails, missing domains, and suppressed rows before send.",
+            "Exports a cleaned CSV snapshot for operators to review before starting jobs.",
+        ],
+    },
     "message_form": {
         "smtp_host": "pmta.demo.internal",
         "smtp_port": 2525,
@@ -350,6 +369,7 @@ PAGE = r"""
       <nav class="menu">
         <a href="{{ url_for('dashboard') }}" class="{% if page == 'dashboard' %}active{% endif %}">📊 Dashboard</a>
         <a href="{{ url_for('campaigns_page') }}" class="{% if page == 'campaigns' %}active{% endif %}">📌 Campaigns</a>
+        <a href="{{ url_for('send_page') }}" class="{% if page == 'send' %}active{% endif %}">✉️ Send</a>
         <a href="{{ url_for('jobs_page') }}" class="{% if page == 'jobs' %}active{% endif %}">📄 Jobs</a>
         <a href="{{ url_for('job_page', job_id='job-240301-a') }}" class="{% if page == 'job' %}active{% endif %}">🧩 Job Detail</a>
         <a href="{{ url_for('config_page') }}" class="{% if page == 'config' %}active{% endif %}">⚙️ Config</a>
@@ -469,22 +489,37 @@ def dashboard():
 
           <div class="grid two" style="margin-top:14px">
             <div class="card">
-              <h2>Send form preview</h2>
-              <div class="split">
+              <h2>Excel audience workflow</h2>
+              <div class="mini">Mini Shiva now highlights how the Excel import is prepared before operators open the dedicated Send surface.</div>
+              <div style="margin-top:10px; display:flex; gap:10px; flex-wrap:wrap">
+                <span class="tag accent">Workbook {{ data.excel_info.file_name }}</span>
+                <span class="tag good">Sheet {{ data.excel_info.sheet_name }}</span>
+                <span class="tag">Rows {{ data.excel_info.rows_total }}</span>
+                <span class="tag good">Validated {{ data.excel_info.validated_rows }}</span>
+                <span class="tag warn">Suppressed {{ data.excel_info.suppressed_rows }}</span>
+              </div>
+              <div class="grid two" style="margin-top:12px">
                 <div>
-                  <div class="field"><label>SMTP Host</label><input value="{{ data.message_form.smtp_host }}"></div>
-                  <div class="field"><label>SMTP Port</label><input value="{{ data.message_form.smtp_port }}"></div>
-                  <div class="field"><label>Security</label><select><option selected>{{ data.message_form.smtp_security }}</option></select></div>
-                  <div class="field"><label>SMTP User</label><input value="{{ data.message_form.smtp_user }}"></div>
-                  <div class="field"><label>SSH Host</label><input value="{{ data.message_form.ssh_host }}"></div>
-                  <div class="field"><label>SSH User</label><input value="{{ data.message_form.ssh_user }}"></div>
-                  <div class="field"><label>Delay / Chunk / Workers</label><input value="delay={{ data.message_form.delay_s }} · chunk={{ data.message_form.chunk_size }} · workers={{ data.message_form.thread_workers }}"></div>
+                  <h3 style="margin:0 0 10px">Mapped columns</h3>
+                  <table>
+                    <thead><tr><th>Column</th><th>Usage</th></tr></thead>
+                    <tbody>
+                      {% for column in data.excel_info.columns %}
+                      <tr>
+                        <td><code>{{ column.name }}</code></td>
+                        <td>{{ column.description }}</td>
+                      </tr>
+                      {% endfor %}
+                    </tbody>
+                  </table>
                 </div>
                 <div>
-                  <div class="field"><label>From Name</label><textarea>{{ data.message_form.from_name }}</textarea></div>
-                  <div class="field"><label>From Email</label><textarea>{{ data.message_form.from_email }}</textarea></div>
-                  <div class="field"><label>Subject</label><textarea>{{ data.message_form.subject }}</textarea></div>
-                  <div class="field"><label>Body</label><textarea>{{ data.message_form.body }}</textarea></div>
+                  <h3 style="margin:0 0 10px">Preparation checks</h3>
+                  <div class="statsList">
+                    {% for item in data.excel_info.checks %}
+                    <div class="alert accent" style="margin:0">{{ item }}</div>
+                    {% endfor %}
+                  </div>
                 </div>
               </div>
             </div>
@@ -518,6 +553,239 @@ def dashboard():
         data=DASHBOARD_DATA,
     )
     return render("dashboard", "Shivamini Dashboard", body)
+
+
+@app.get("/send")
+def send_page():
+    featured_job = copy.deepcopy(JOB_DETAIL)
+    featured_job["job_id"] = JOBS[0]["id"]
+    body = render_template_string(
+        """
+        <div class="top">
+          <div>
+            <h1 class="title">Send workspace</h1>
+            <div class="subtitle">This Mini Shiva screen mirrors the Shiva Campaign send form and the Monitoring PowerMTA jobs surfaces, but everything here is frontend-only and backed by fake data.</div>
+          </div>
+          <div class="actions">
+            <button>🚀 Start Sending</button>
+            <a class="btn secondary" href="{{ url_for('jobs_page') }}">📄 Open standalone Jobs</a>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Send form</h2>
+          <div class="mini">Copied layout from Shiva Campaign for preview purposes only. Inputs are intentionally non-functional and stay on fake data.</div>
+          <div class="grid two" style="margin-top:12px">
+            <div class="card" style="margin:0">
+              <h3 style="margin-top:0">SMTP Settings</h3>
+              <div class="split">
+                <div>
+                  <div class="field"><label>SMTP Host</label><input value="{{ form.smtp_host }}"></div>
+                </div>
+                <div>
+                  <div class="field"><label>Port</label><input value="{{ form.smtp_port }}"></div>
+                </div>
+              </div>
+              <div class="split">
+                <div><div class="field"><label>Security</label><select><option selected>{{ form.smtp_security }}</option></select></div></div>
+                <div><div class="field"><label>Timeout (seconds)</label><input value="{{ form.smtp_timeout }}"></div></div>
+              </div>
+              <div class="split">
+                <div><div class="field"><label>SMTP Username (optional)</label><input value="{{ form.smtp_user }}"></div></div>
+                <div><div class="field"><label>SMTP Password (optional)</label><input type="password" value="demo-password"></div></div>
+              </div>
+              <div class="alert warn">Remember-password and Test SMTP actions are shown only as fake UI in Mini Shiva.</div>
+            </div>
+            <div class="card" style="margin:0">
+              <h3 style="margin-top:0">SSH Connection</h3>
+              <div class="split">
+                <div><div class="field"><label>SSH Host</label><input value="{{ form.ssh_host }}"></div></div>
+                <div><div class="field"><label>SSH Port</label><input value="{{ form.ssh_port }}"></div></div>
+              </div>
+              <div class="split">
+                <div><div class="field"><label>SSH Username</label><input value="{{ form.ssh_user }}"></div></div>
+                <div><div class="field"><label>SSH Key Path (optional)</label><input value="/home/pmtaops/.ssh/id_rsa"></div></div>
+              </div>
+              <div class="split">
+                <div><div class="field"><label>SSH Password (optional)</label><input type="password" value="demo-ssh-password"></div></div>
+                <div><div class="field"><label>SSH Timeout (seconds)</label><input value="{{ form.ssh_timeout }}"></div></div>
+              </div>
+              <div class="alert accent">PowerMTA monitoring widgets below are copied visually from Monitoring and fed by fake snapshots.</div>
+            </div>
+          </div>
+
+          <div class="grid two" style="margin-top:14px">
+            <div class="card" style="margin:0">
+              <h3 style="margin-top:0">Preflight & Send Controls</h3>
+              <div class="alert good">Permission-based confirmation stays visible, but no real submit or SMTP action happens in Mini Shiva.</div>
+              <div class="split">
+                <div><div class="field"><label>Delay between messages (seconds)</label><input value="{{ form.delay_s }}"></div></div>
+                <div><div class="field"><label>Max Recipients (safety)</label><input value="{{ form.max_rcpt }}"></div></div>
+              </div>
+              <div class="split">
+                <div><div class="field"><label>Thread chunk size</label><input value="{{ form.chunk_size }}"></div></div>
+                <div><div class="field"><label>Thread workers</label><input value="{{ form.thread_workers }}"></div></div>
+              </div>
+              <div class="split">
+                <div><div class="field"><label>Sleep between chunks (seconds)</label><input value="{{ form.sleep_chunks }}"></div></div>
+                <div><div class="field"><label>Spam score limit</label><input value="{{ form.score_range }}"></div></div>
+              </div>
+              <div class="alert accent">Fake Preflight: Spam {{ preflight.spam_score }} / {{ preflight.spam_limit }} · Backend {{ preflight.backend }}</div>
+            </div>
+            <div class="card" style="margin:0">
+              <h3 style="margin-top:0">Message</h3>
+              <div class="split">
+                <div><div class="field"><label>Sender Name</label><textarea>{{ form.from_name }}</textarea></div></div>
+                <div><div class="field"><label>Sender Email</label><textarea>{{ form.from_email }}</textarea></div></div>
+              </div>
+              <div class="field"><label>Subject</label><textarea>{{ form.subject }}</textarea></div>
+              <div class="split">
+                <div><div class="field"><label>Format</label><select><option selected>{{ form.body_format }}</option></select></div></div>
+                <div><div class="field"><label>Reply-To (optional)</label><input value="{{ form.reply_to }}"></div></div>
+              </div>
+              <div class="field"><label>Body</label><textarea>{{ form.body }}</textarea></div>
+              <div class="split">
+                <div><div class="field"><label>URL list (one per line)</label><textarea>{{ form.urls_list }}</textarea></div></div>
+                <div><div class="field"><label>SRC list (one per line)</label><textarea>{{ form.src_list }}</textarea></div></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid two" style="margin-top:14px">
+            <div class="card" style="margin:0">
+              <h3 style="margin-top:0">Recipients</h3>
+              <div class="field"><label>Recipients (newline / comma / semicolon)</label><textarea>{{ form.recipients }}</textarea></div>
+              <div class="field"><label>Uploaded Excel snapshot</label><input value="{{ excel.file_name }} · {{ excel.sheet_name }} · {{ excel.rows_total }} rows"></div>
+              <div class="field"><label>Maillist Safe (optional whitelist)</label><textarea>{{ form.maillist_safe }}</textarea></div>
+              <div class="mini">This section mirrors the Shiva campaign entry points, while the Excel box above explains the fake workbook source in Mini Shiva.</div>
+            </div>
+            <div class="card" style="margin:0">
+              <h3 style="margin-top:0">Send actions</h3>
+              <div class="actions">
+                <button>🔌 Test SMTP</button>
+                <button class="secondary">🖧 Test SSH</button>
+                <button class="secondary">📊 Preflight Check</button>
+                <button class="secondary">🤖 Rewrite Now</button>
+              </div>
+              <div class="actions" style="margin-top:12px">
+                <button>🚀 Start Sending</button>
+                <button class="secondary">📄 Jobs</button>
+                <button class="secondary">⚙️ Config</button>
+              </div>
+              <div class="alert warn" style="margin-top:12px">All buttons in this Send screen are fake preview controls only.</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:14px">
+          <div style="display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:flex-start">
+            <div>
+              <h2>Jobs monitor</h2>
+              <div class="mini">Copied from Monitoring PowerMTA style: status badges, delivery counters, progress, recent activity, and lane telemetry — all from fake data.</div>
+            </div>
+            <div class="actions">
+              <button>🔄 Refresh</button>
+              <button class="secondary">🎛️ Filters</button>
+            </div>
+          </div>
+          <div class="grid">
+            {% for job in jobs %}
+            <div class="card" style="margin-top:12px">
+              <div style="display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap">
+                <div>
+                  <h3>Job <code>{{ job.id }}</code></h3>
+                  <div class="mini">Campaign: {{ job.campaign_id }} · Created: {{ job.created_at }} · Updated: {{ job.updated_at }}</div>
+                </div>
+                <div style="display:flex; gap:8px; flex-wrap:wrap">
+                  <span class="tag {{ 'good' if job.status == 'running' else ('warn' if job.status in ['backoff','paused'] else 'accent') }}">{{ job.status }}</span>
+                  <span class="tag accent">{{ job.bridge_mode }}</span>
+                  <span class="tag {{ 'bad' if job.risk != 'none' else 'good' }}">{{ job.risk }}</span>
+                  <span class="tag">{{ job.provider }}</span>
+                </div>
+              </div>
+              <div class="grid three" style="margin-top:12px">
+                <div><div class="mini">Delivered</div><div style="font-size:24px; font-weight:900; color:var(--good)">{{ '{:,}'.format(job.delivered) }}</div></div>
+                <div><div class="mini">Deferred</div><div style="font-size:24px; font-weight:900; color:var(--warn)">{{ '{:,}'.format(job.deferred) }}</div></div>
+                <div><div class="mini">Queued</div><div style="font-size:24px; font-weight:900; color:var(--accent)">{{ '{:,}'.format(job.queued) }}</div></div>
+              </div>
+              <div class="progressLine">
+                <div style="display:flex; justify-content:space-between; gap:8px; margin-bottom:6px"><span>Progress</span><b>{{ job.progress }}%</b></div>
+                <div class="bar"><div style="width:{{ job.progress }}%"></div></div>
+              </div>
+              <div class="mini" style="margin-top:10px">Top domains: {{ job.top_domains|join(', ') }}</div>
+              <div class="actions" style="margin-top:12px">
+                <button>View details</button>
+                <button class="secondary">Pause</button>
+                <button class="secondary">Resume</button>
+                <button class="secondary">Stop</button>
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+
+        <div class="grid two" style="margin-top:14px">
+          <div class="card">
+            <h2>Monitoring PowerMTA snapshot</h2>
+            <div class="grid three">
+              <div><div class="mini">Total</div><div style="font-size:24px; font-weight:900">{{ featured.totals.total }}</div></div>
+              <div><div class="mini">Sent</div><div style="font-size:24px; font-weight:900; color:var(--good)">{{ featured.totals.sent }}</div></div>
+              <div><div class="mini">Failed</div><div style="font-size:24px; font-weight:900; color:var(--bad)">{{ featured.totals.failed }}</div></div>
+            </div>
+            <table style="margin-top:12px">
+              <thead><tr><th>Domain</th><th>Planned</th><th>Sent</th><th>Failed</th><th>Progress</th></tr></thead>
+              <tbody>
+                {% for row in featured.domain_state %}
+                <tr>
+                  <td>{{ row.domain }}</td>
+                  <td>{{ row.planned }}</td>
+                  <td>{{ row.sent }}</td>
+                  <td>{{ row.failed }}</td>
+                  <td style="min-width:180px"><div class="bar"><div style="width:{{ row.pct }}%"></div></div><div class="mini">{{ row.pct }}%</div></td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          <div class="card">
+            <h2>Chunk state & lane telemetry</h2>
+            <table>
+              <thead><tr><th>Chunk</th><th>Status</th><th>Size</th><th>Sender</th><th>Spam</th><th>BL</th><th>Attempt</th><th>Next retry</th></tr></thead>
+              <tbody>
+                {% for row in featured.chunks %}
+                <tr>
+                  <td>{{ row.chunk }}</td>
+                  <td><span class="tag {{ 'warn' if row.status == 'backoff' else ('good' if row.status == 'running' else 'accent') }}">{{ row.status }}</span></td>
+                  <td>{{ row.size }}</td>
+                  <td>{{ row.sender }}</td>
+                  <td>{{ row.spam }}</td>
+                  <td>{{ row.blacklist }}</td>
+                  <td>{{ row.attempt }}</td>
+                  <td>{{ row.next_retry }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+            <div class="telemetryRow" style="margin-top:12px">
+              {% for lane in featured.telemetry.parallel_lanes %}
+              <div class="laneBox">
+                <div style="font-weight:800">{{ lane.lane }}</div>
+                <div class="mini">{{ lane.sender }} → {{ lane.provider }}</div>
+                <div style="margin-top:8px"><span class="tag {{ 'warn' if lane.state == 'backoff' else 'good' }}">{{ lane.state }}</span></div>
+                <div class="mini" style="margin-top:8px">Processed {{ lane.processed }} · Success {{ lane.success }} · Temp {{ lane.temp_fail }} · Hard {{ lane.hard_fail }} · Workers {{ lane.workers }}</div>
+              </div>
+              {% endfor %}
+            </div>
+          </div>
+        </div>
+        """,
+        form=DASHBOARD_DATA["message_form"],
+        preflight=DASHBOARD_DATA["preflight"],
+        excel=DASHBOARD_DATA["excel_info"],
+        jobs=JOBS,
+        featured=featured_job,
+    )
+    return render("send", "Shivamini Send", body)
 
 
 @app.get("/campaigns")
