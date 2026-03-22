@@ -3,14 +3,1131 @@ from __future__ import annotations
 import copy
 import random
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
-from flask import Flask, Response, jsonify, render_template_string, url_for
+from flask import Flask, jsonify, render_template_string, url_for
 
 app = Flask(__name__)
 
-BASE_DIR = Path(__file__).resolve().parent
-SEND_PAGE_HTML = (BASE_DIR / "shivamini_send_dashboard.html").read_text(encoding="utf-8")
+SEND_PAGE_BODY = r"""
+<div class="wrap">
+  <div class="top">
+    <div>
+      <h1>SMTP Mail Sender · <span style="color: var(--muted)">Campaign {{ campaign_ts }}</span></h1>
+      <div class="sub">
+        A simple, clean UI to send email via SMTP with a progress bar and logs.
+        <br>
+        <b style="color: var(--warn)">⚠️ Legal use only:</b> send to opt-in/permission-based recipients.
+      </div>
+    </div>
+    <div class="topActions">
+      <a class="badge" href="/campaigns">📌 Campaigns</a>
+    </div>
+  </div>
+
+  <form class="grid send-layout" method="post" action="/start" enctype="multipart/form-data" id="mainForm">
+    <input type="hidden" name="campaign_id" value="abac50d078ae">
+    <div class="stack">
+      <div class="card">
+      <h2>SMTP Settings</h2>
+
+      <div class="row">
+        <div>
+          <label>SMTP Host</label>
+          <input name="smtp_host" placeholder="Example: mail.example.com or an IP" required="">
+        </div>
+        <div>
+          <label>Port</label>
+          <input name="smtp_port" type="number" placeholder="Example: 25 / 2525 / 587 / 465" required="" value="2525">
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>Security</label>
+          <select name="smtp_security">
+            <option value="starttls">STARTTLS (587)</option>
+            <option value="ssl">SSL/TLS (465)</option>
+            <option value="none" selected="">None (not recommended)</option>
+          </select>
+        </div>
+        <div>
+          <label>Timeout (seconds)</label>
+          <input name="smtp_timeout" type="number" value="25" min="5" max="120">
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>SMTP Username (optional)</label>
+          <input name="smtp_user" placeholder="Example: user@example.com">
+        </div>
+        <div>
+          <label>SMTP Password (optional)</label>
+          <input name="smtp_pass" type="password" placeholder="••••••••">
+        </div>
+      </div>
+
+      <div class="check" style="margin-top:10px">
+        <input type="checkbox" id="remember_pass" name="remember_pass">
+        <div>
+          Remember SMTP password on this browser (saved in server database (SQLite)). <b style="color: var(--warn)">Not recommended</b> on shared PCs.
+        </div>
+      </div>
+
+      <div class="hint">
+        <b>Note:</b> If you use PowerMTA or a custom SMTP server, set the correct host and port.
+        Usually: <code>587 + STARTTLS</code> or <code>465 + SSL/TLS</code>.
+        <br>
+        ✅ <b>Test SMTP</b> only connects (and authenticates if provided) — <b>it does not send any email</b>.
+      </div>
+
+      <div class="actions">
+        <button class="btn secondary" type="button" id="btnTest">🔌 Test SMTP</button>
+        <div class="mini" id="testMini">Test the connection before sending.</div>
+      </div>
+      <div class="inline-status" id="smtpTestInline"></div>
+      </div>
+
+      <div class="card">
+      <h2>SSH Connection</h2>
+
+      <div class="row">
+        <div>
+          <label>SSH Host</label>
+          <input name="ssh_host" placeholder="Example: same PMTA server host/IP">
+        </div>
+        <div>
+          <label>SSH Port</label>
+          <input name="ssh_port" type="number" placeholder="22" value="22">
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>SSH Username</label>
+          <input name="ssh_user" placeholder="Example: root or pmtaops">
+        </div>
+        <div>
+          <label>SSH Key Path (optional)</label>
+          <input name="ssh_key_path" placeholder="/home/app/.ssh/id_rsa">
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>SSH Password (optional)</label>
+          <input name="ssh_pass" type="password" placeholder="Password auth supported directly by Shiva">
+        </div>
+        <div>
+          <label>SSH Timeout (seconds)</label>
+          <input name="ssh_timeout" type="number" value="8" min="3" max="120">
+        </div>
+      </div>
+
+      <div class="check" style="margin-top:10px">
+        <input type="checkbox" id="remember_ssh_pass" name="remember_ssh_pass">
+        <div>
+          Remember SSH password on this browser (saved in server database (SQLite)). <b style="color: var(--warn)">Not recommended</b> on shared PCs.
+        </div>
+      </div>
+
+      <div class="hint">
+        <b>PMTA monitoring/accounting now uses SSH only.</b> Shiva runs commands such as <code>pmta show status</code> and tails the remote accounting CSV via SSH.
+      </div>
+
+      <div class="actions">
+        <button class="btn secondary" type="button" id="btnSshTest">🖧 Test SSH</button>
+        <div class="mini">Checks SSH access and runs <code>pmta show status</code>.</div>
+      </div>
+      <div class="inline-status" id="sshTestInline"></div>
+      </div>
+
+      <div class="card">
+        <h2>Preflight &amp; Send Controls</h2>
+
+        <div class="check">
+        <input type="checkbox" name="permission_ok" required="">
+        <div>
+          I confirm this recipient list is <b>permission-based (opt-in)</b> and this usage is lawful.
+          (Sending is blocked without this confirmation.)
+        </div>
+      </div>
+
+      <div class="hint" id="preflightBox" style="margin-top:12px">
+        <b>Preflight stats (optional):</b> get the <b>Spam score</b> + check if the <b>sender domain / SMTP IP</b> is blacklisted.
+        <div class="row" style="margin-top:10px">
+          <div>
+            <div class="mini"><b>Spam score:</b> <span id="pfSpam">—</span></div>
+            <div class="mini" id="pfSpamMore" style="display:none"></div>
+          </div>
+          <div>
+            <div class="mini"><b>Blacklist:</b> <span id="pfBl">—</span></div>
+            <div class="mini" id="pfBlMore" style="display:none"></div>
+          </div>
+        </div>
+        <div class="mini" style="margin-top:10px"><b>Sender domains status:</b> Domain → IP(s) → Listed/Not listed</div>
+        <div style="overflow:auto; margin-top:8px">
+          <table style="width:100%; border-collapse:collapse; font-size:12px">
+            <thead>
+              <tr>
+                <th style="text-align:left; padding:6px; border-bottom:1px solid rgba(255,255,255,.10)">Domain</th>
+                <th style="text-align:left; padding:6px; border-bottom:1px solid rgba(255,255,255,.10)">IP(s)</th>
+                <th style="text-align:left; padding:6px; border-bottom:1px solid rgba(255,255,255,.10)">Status</th>
+                <th style="text-align:left; padding:6px; border-bottom:1px solid rgba(255,255,255,.10)">Spam score (per domain)</th>
+              </tr>
+            </thead>
+            <tbody id="pfDomains">
+              <tr><td colspan="4" class="muted" style="padding:6px">Run Preflight to see sender domains.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="actions" style="margin-top:10px">
+          <button class="btn secondary" type="button" id="btnPreflight">📊 Preflight Check</button>
+          <div class="mini">Uses SpamAssassin backend (if available) + DNSBL checks (server-side).</div>
+        </div>
+
+        <div class="hint" style="margin-top:10px">
+          <b>Sending controls:</b> these settings affect the real sending job.
+          <div class="mini">Rule: <b>one chunk uses one sender email</b> (rotated by chunk index). Each chunk can use many workers.</div>
+
+          <div class="row" style="margin-top:10px">
+            <div>
+              <label>Delay between messages (seconds)</label>
+              <input name="delay_s" type="number" value="0.0" step="0.1" min="0" max="10">
+            </div>
+            <div>
+              <label>Max Recipients (safety)</label>
+              <input name="max_rcpt" type="number" value="300" min="1" max="200000">
+            </div>
+          </div>
+
+          <div class="row" style="margin-top:10px">
+            <div>
+              <label>Thread chunk size</label>
+              <input name="chunk_size" type="number" value="50" min="1" max="50000">
+              <div class="mini">Recipients are split into chunks of this size. Each chunk picks one sender email.</div>
+            </div>
+            <div>
+              <label>Thread workers</label>
+              <input name="thread_workers" type="number" value="5" min="1" max="200">
+              <div class="mini">Workers send in parallel inside the same chunk (one SMTP connection per worker).</div>
+            </div>
+          </div>
+
+          <div class="row" style="margin-top:10px">
+            <div>
+              <label>Sleep between chunks (seconds)</label>
+              <input name="sleep_chunks" type="number" value="0.0" step="0.1" min="0" max="120">
+            </div>
+            <div>
+              <div class="mini" style="margin-top:26px">Tip: start with <b>chunk size 20–100</b> and <b>workers 2–10</b>.</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="hint" style="margin-top:10px">
+            <b>AI rewrite (optional):</b> rewrite subject/body for clarity (requires OpenRouter token).
+            <div class="row" style="margin-top:10px">
+              <div>
+                <label>AI Token (OpenRouter)</label>
+                <input name="ai_token" type="password" placeholder="sk-or-..." autocomplete="off">
+                <div class="mini">Token is not saved unless you enable the checkbox below.</div>
+              </div>
+              <div>
+                <label>&nbsp;</label>
+                <div class="check" style="margin-top:0">
+                  <input type="checkbox" name="use_ai" id="use_ai">
+                  <div>
+                    Use AI rewrite before sending (applies once per job).
+                  </div>
+                </div>
+                <div class="check" style="margin-top:10px">
+                  <input type="checkbox" id="remember_ai" name="remember_ai">
+                  <div>
+                    Remember AI token on this browser (server database / SQLite). <b style="color: var(--warn)">Not recommended</b> on shared PCs.
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="actions" style="margin-top:10px">
+              <button class="btn secondary" type="button" id="btnAiRewrite">🤖 Rewrite Now</button>
+              <div class="mini" id="aiMini">Rewrites the current Subject lines + Body and fills the fields (review before sending).</div>
+            </div>
+          </div>
+
+        
+      </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Message</h2>
+
+      <div class="row">
+        <div>
+          <label>Sender Name</label>
+          <textarea name="from_name" placeholder="Example: Ahmed (one per line)" required="" style="min-height:48px"></textarea>
+        </div>
+        <div>
+          <label>Sender Email</label>
+          <textarea name="from_email" placeholder="Example: sender@domain.com (one per line)" required="" style="min-height:48px"></textarea>
+        </div>
+      </div>
+
+      <label>Subject</label>
+      <textarea name="subject" placeholder="Email subject (one per line)" required="" style="min-height:48px"></textarea>
+
+      <div class="row">
+        <div>
+          <label>Format</label>
+          <select name="body_format">
+            <option value="text" selected="">Text</option>
+            <option value="html">HTML</option>
+          </select>
+          <div class="mini">If you choose HTML, the email will be sent as HTML.</div>
+        </div>
+        <div>
+          <label>Reply-To (optional)</label>
+          <input name="reply_to" placeholder="reply@domain.com">
+        </div>
+      </div>
+
+      <label>Spam score limit</label>
+      <input type="range" class="form-range" min="1" max="10" value="4" step="0.5" style="width: 100%;" name="score_range" id="score_range">
+      <div class="mini">Current limit: <b id="score_range_val">4.0</b> (sending is blocked if spam score is higher)</div>
+
+      <label>Body</label>
+      <textarea name="body" placeholder="Write your message here..." required=""></textarea>
+
+      <div class="row" style="margin-top:10px">
+        <div>
+          <label>URL list (one per line)</label>
+          <textarea name="urls_list" placeholder="https://example.com/a
+https://example.com/b" style="min-height:90px"></textarea>
+          <div class="mini">Use <code>[URL]</code> in subject/body. Replaced per chunk in line order (cycles back to first line after the last).</div>
+        </div>
+        <div>
+          <label>SRC list (one per line)</label>
+          <textarea name="src_list" placeholder="https://cdn.example.com/img1.png
+https://cdn.example.com/img2.png" style="min-height:90px"></textarea>
+          <div class="mini">Use <code>[SRC]</code> in subject/body. Replaced per chunk in line order (cycles back to first line after the last). Use <code>[MAIL]</code> or <code>[EMAIL]</code> for recipient email, and <code>[NAME]</code> for the part before @.</div>
+        </div>
+      </div>
+
+      <h2 style="margin-top:14px">Recipients</h2>
+
+      <label>Recipients (newline / comma / semicolon)</label>
+      <textarea name="recipients" placeholder="a@x.com
+b@y.com
+c@z.com"></textarea>
+
+      <label>Or upload a .txt or .csv file (single column or multiple columns)</label>
+      <input type="file" name="recipients_file" accept=".txt,.csv">
+
+      <label>Maillist Safe (optional whitelist)</label>
+      <textarea name="maillist_safe" placeholder="If set, ONLY these emails will receive (newline / comma / semicolon)"></textarea>
+      <div class="mini">If this field is filled, recipients not in this list will be skipped.</div>
+
+      <div class="hint">
+        ✅ This tool will:
+        <ul style="margin:8px 0 0; padding:0 18px; color: rgba(255,255,255,.62)">
+          <li>Clean &amp; deduplicate recipients</li>
+          <li>Filter invalid emails</li>
+          <li>Show progress + logs</li>
+        </ul>
+      </div>
+
+      <div class="actions">
+        <button class="btn" type="submit" id="btnStart">🚀 Start Sending</button>
+        <a class="btn secondary" href="/jobs?c=abac50d078ae" style="text-decoration:none; display:inline-block;">📄 Jobs</a>
+        <a class="btn secondary" href="/campaign/abac50d078ae/config" style="text-decoration:none; display:inline-block;">⚙️ Config</a>
+      </div>
+
+      <div class="foot">
+        Tip: test first with 2–5 emails to confirm SMTP settings before sending large batches.
+      </div>
+    </div>
+  </form>
+
+  <div class="card" id="domainsCard" style="margin-top:14px">
+    <h2>Save Domains</h2>
+
+    <div class="actions" style="margin-top:12px">
+      <input id="domQ" placeholder="Search domain..." style="max-width:320px">
+      <button class="btn secondary" type="button" id="btnDomains" disabled="">🌐 Refresh</button>
+      <div class="mini" id="domStatus">Loading...</div>
+    </div>
+
+    <div class="hint" style="margin-top:12px">
+      <div class="mini"><b>Safe domains:</b> <span id="domSafeTotals">—</span></div>
+    </div>
+
+    <div style="overflow:auto; margin-top:12px">
+      <table>
+        <thead>
+          <tr>
+            <th>Sender domain</th>
+            <th>Emails</th>
+            <th>MX</th>
+            <th>MX hosts</th>
+            <th>Mail IP(s)</th>
+            <th>Listed</th>
+            <th>SPF</th>
+            <th>DKIM</th>
+            <th>DMARC</th>
+          </tr>
+        </thead>
+        <tbody id="domTblSafe">
+          <tr><td colspan="9" class="muted">—</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toastWrap"></div>
+"""
+
+SEND_PAGE_SCRIPT = r"""
+function q(name){ return document.querySelector(`[name="${name}"]`); }
+
+  function labelForElement(el){
+    if(!el) return '';
+    const raw = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    return raw.replace(/^[-•\s]+/, '');
+  }
+
+  // -------------------------
+  // Persist form values (SQLite via server API)
+  // -------------------------
+
+  const CAMPAIGN_ID = "abac50d078ae";
+  let __sendSubmitting = false;  // prevent double-submit while a job is being created
+
+  async function apiGetForm(){
+    try{
+      const r = await fetch(`/api/campaign/${CAMPAIGN_ID}/form`);
+      const j = await r.json().catch(()=>({}));
+      if(r.ok && j && j.ok && j.data && typeof j.data === 'object'){
+        return j.data;
+      }
+    }catch(e){ /* ignore */ }
+    return {};
+  }
+
+  async function apiSaveForm(data){
+    try{
+      await fetch(`/api/campaign/${CAMPAIGN_ID}/form`, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({data: data || {}})
+      });
+    }catch(e){ /* ignore */ }
+  }
+
+  async function apiClearForm(scope){
+    try{
+      await fetch(`/api/campaign/${CAMPAIGN_ID}/clear`, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({scope: scope || 'mine'})
+      });
+    }catch(e){ /* ignore */ }
+  }
+
+  function formFields(){
+    return document.querySelectorAll('#mainForm input, #mainForm textarea, #mainForm select');
+  }
+
+  async function loadSavedForm(){
+    const data = await apiGetForm();
+    for(const [k,v] of Object.entries(data || {})){
+      const el = q(k);
+      if(!el) continue;
+      if(el.type === 'file') continue;
+      if(el.type === 'checkbox'){
+        el.checked = !!v;
+      }else{
+        el.value = (v ?? '').toString();
+      }
+    }
+  }
+
+  async function saveFormNow(){
+    const data = {};
+    const rememberPass = document.getElementById('remember_pass')?.checked;
+
+    formFields().forEach(el => {
+      const name = el.name;
+      if(!name) return;
+      if(el.type === 'file') return;
+
+      if(el.type === 'password'){
+        // Only store secrets if user explicitly opts in.
+        if(name === 'smtp_pass'){
+          data[name] = rememberPass ? (el.value || '') : '';
+          return;
+        }
+        if(name === 'ssh_pass'){
+          const rememberSsh = document.getElementById('remember_ssh_pass')?.checked;
+          data[name] = rememberSsh ? (el.value || '') : '';
+          return;
+        }
+        if(name === 'ai_token'){
+          const rememberAi = document.getElementById('remember_ai')?.checked;
+          data[name] = rememberAi ? (el.value || '') : '';
+          return;
+        }
+        data[name] = '';
+        return;
+      }
+
+      if(el.type === 'checkbox'){
+        data[name] = !!el.checked;
+        return;
+      }
+
+      data[name] = (el.value ?? '').toString();
+    });
+
+    data.__ts = Date.now();
+    await apiSaveForm(data);
+  }
+
+  let _saveTimer = null;
+  function scheduleSave(){
+    if(_saveTimer) clearTimeout(_saveTimer);
+    _saveTimer = setTimeout(() => { saveFormNow(); }, 250);
+  }
+
+  function escHtml(s){
+    return (s ?? '').toString()
+      .replaceAll('&','&amp;')
+      .replaceAll('<','&lt;')
+      .replaceAll('>','&gt;')
+      .replaceAll('"','&quot;')
+      .replaceAll("'",'&#39;');
+  }
+
+  function toast(title, msg, kind){
+    const wrap = document.getElementById('toastWrap');
+    const div = document.createElement('div');
+    div.className = `toast ${kind || 'warn'}`;
+    const safeTitle = escHtml(title);
+    const safeMsg = escHtml(msg).split(/\r?\n/).join("<br>");
+    div.innerHTML = `<div class="t">${safeTitle}</div><div>${safeMsg}</div>`;
+    wrap.appendChild(div);
+    setTimeout(() => {
+      div.style.opacity = '0';
+      div.style.transform = 'translateY(6px)';
+      div.style.transition = 'all .22s ease';
+      setTimeout(()=>div.remove(), 260);
+    }, 3600);
+  }
+
+  function setInline(html, kind){
+    const box = document.getElementById('smtpTestInline');
+    box.classList.add('show');
+    box.style.borderColor = kind === 'good' ? 'rgba(53,228,154,.35)' : (kind === 'bad' ? 'rgba(255,94,115,.35)' : 'rgba(255,193,77,.35)');
+    box.innerHTML = html;
+  }
+
+  async function doSmtpTest(){
+    const btn = document.getElementById('btnTest');
+    btn.disabled = true;
+
+    const payload = {
+      smtp_host: (q('smtp_host')?.value || '').trim(),
+      smtp_port: (q('smtp_port')?.value || '').trim(),
+      smtp_security: (q('smtp_security')?.value || 'none').trim(),
+      smtp_timeout: (q('smtp_timeout')?.value || '25').trim(),
+      smtp_user: (q('smtp_user')?.value || '').trim(),
+      smtp_pass: (q('smtp_pass')?.value || '').trim(),
+    };
+
+    if(!payload.smtp_host || !payload.smtp_port){
+      toast('SMTP Test', 'Please enter Host and Port first.', 'warn');
+      setInline('<b>SMTP Test:</b> Please enter Host and Port first.', 'warn');
+      btn.disabled = false;
+      return;
+    }
+
+    toast('SMTP Test', 'Testing connection...', 'warn');
+    setInline('<b>SMTP Test:</b> Testing connection...', 'warn');
+
+    try{
+      const r = await fetch('/api/smtp_test', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(payload)
+      });
+      const j = await r.json().catch(()=>({}));
+
+      if(r.ok && j.ok){
+        toast('✅ SMTP OK', j.detail || 'Connection successful', 'good');
+        setInline(`<b>SMTP OK</b><br>• ${j.detail || ''}<br>• Time: <b>${j.time_ms || 0}ms</b>`, 'good');
+      } else {
+        const msg = (j && (j.detail || j.error)) ? (j.detail || j.error) : `HTTP ${r.status}`;
+        toast('❌ SMTP Failed', msg, 'bad');
+        setInline(`<b>SMTP Failed</b><br>• ${msg}`, 'bad');
+      }
+
+    }catch(e){
+      toast('❌ SMTP Failed', e?.toString?.() || 'Unknown error', 'bad');
+      setInline(`<b>SMTP Failed</b><br>• ${(e?.toString?.() || 'Unknown error')}`, 'bad');
+    }finally{
+      btn.disabled = false;
+    }
+  }
+
+  document.getElementById('btnTest').addEventListener('click', doSmtpTest);
+
+  async function doSshTest(){
+    const btn = document.getElementById('btnSshTest');
+    const box = document.getElementById('sshTestInline');
+    const setBox = (html, kind) => {
+      box.classList.add('show');
+      box.style.borderColor = kind === 'good' ? 'rgba(53,228,154,.35)' : (kind === 'bad' ? 'rgba(255,94,115,.35)' : 'rgba(255,193,77,.35)');
+      box.innerHTML = html;
+    };
+
+    btn.disabled = true;
+    const payload = {
+      smtp_host: (q('smtp_host')?.value || '').trim(),
+      ssh_host: (q('ssh_host')?.value || '').trim(),
+      ssh_port: (q('ssh_port')?.value || '22').trim(),
+      ssh_user: (q('ssh_user')?.value || '').trim(),
+      ssh_key_path: (q('ssh_key_path')?.value || '').trim(),
+      ssh_pass: (q('ssh_pass')?.value || '').trim(),
+      ssh_timeout: (q('ssh_timeout')?.value || '8').trim(),
+    };
+
+    try{
+      const r = await fetch('/api/ssh_test', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(payload)
+      });
+      const j = await r.json().catch(()=>({}));
+      if(r.ok && j.ok){
+        toast('✅ SSH OK', j.detail || 'SSH connection successful', 'good');
+        setBox(`<b>SSH OK</b><br>• ${(j.detail || '')}<br>• Target: <b>${escHtml(j.target || '—')}</b>`, 'good');
+      }else{
+        const msg = (j && (j.detail || j.error)) ? (j.detail || j.error) : `HTTP ${r.status}`;
+        toast('❌ SSH Failed', msg, 'bad');
+        setBox(`<b>SSH Failed</b><br>• ${escHtml(msg)}`, 'bad');
+      }
+    }catch(e){
+      const msg = e?.toString?.() || 'Unknown error';
+      toast('❌ SSH Failed', msg, 'bad');
+      setBox(`<b>SSH Failed</b><br>• ${escHtml(msg)}`, 'bad');
+    }finally{
+      btn.disabled = false;
+    }
+  }
+
+  document.getElementById('btnSshTest').addEventListener('click', doSshTest);
+
+  async function doAiRewrite(){
+    const btn = document.getElementById('btnAiRewrite');
+    if(btn) btn.disabled = true;
+
+    const token = (q('ai_token')?.value || '').trim();
+
+    if(!token){
+      toast('AI rewrite', 'Please paste your OpenRouter token first.', 'warn');
+      if(btn) btn.disabled = false;
+      return;
+    }
+
+    const subjText = (q('subject')?.value || '');
+    const body = (q('body')?.value || '');
+    const body_format = (q('body_format')?.value || 'text');
+
+    toast('AI rewrite', 'Rewriting subject/body...', 'warn');
+
+    try{
+      const r = await fetch('/api/ai_rewrite', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          token,
+          subjects: subjText.split('\n').map(x=>x.trim()).filter(Boolean),
+          body,
+          body_format
+        })
+      });
+      const j = await r.json().catch(()=>({}));
+      if(r.ok && j.ok){
+        const subjEl = q('subject');
+        const bodyEl = q('body');
+
+        // Subjects: accept array or string, sanitize, fallback to current text
+        const subjArr = Array.isArray(j.subjects)
+          ? j.subjects
+          : (typeof j.subjects === 'string' ? [j.subjects] : []);
+
+        const cleaned = subjArr
+          .map(x => (x ?? '').toString().trim())
+          .filter(x => x && !['undefined','null','none'].includes(x.toLowerCase()));
+
+        if(subjEl){
+          if(cleaned.length){
+            subjEl.value = cleaned.join('\n');
+          } else {
+            // keep existing subject if AI didn't return subjects
+            subjEl.value = subjText;
+          }
+        }
+
+        if(bodyEl && typeof j.body === 'string'){
+          bodyEl.value = j.body;
+        }
+
+        scheduleSave();
+        toast('✅ AI rewrite', 'Updated Subject + Body. Review, then send.', 'good');
+      } else {
+        const msg = (j && (j.error || j.detail)) ? (j.error || j.detail) : ('HTTP ' + r.status);
+        toast('❌ AI rewrite failed', msg, 'bad');
+      }
+    }catch(e){
+      toast('❌ AI rewrite failed', (e?.toString?.() || 'Unknown error'), 'bad');
+    }finally{
+      if(btn) btn.disabled = false;
+    }
+  }
+
+  const _aiBtn = document.getElementById('btnAiRewrite');
+  if(_aiBtn){ _aiBtn.addEventListener('click', doAiRewrite); }
+
+  async function doPreflight(){
+    const btn = document.getElementById('btnPreflight');
+    if(btn) btn.disabled = true;
+
+    const payload = {
+      smtp_host: (q('smtp_host')?.value || '').trim(),
+      from_email: (q('from_email')?.value || ''),
+      subject: (q('subject')?.value || ''),
+      body_format: (q('body_format')?.value || 'text'),
+      body: (q('body')?.value || ''),
+      spam_limit: (q('score_range')?.value || '4')
+    };
+
+    toast('Preflight', 'Checking spam score + blacklist...', 'warn');
+
+    try{
+      const r = await fetch('/api/preflight', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(payload)
+      });
+      const j = await r.json().catch(()=>({}));
+
+      const spamEl = document.getElementById('pfSpam');
+      const spamMore = document.getElementById('pfSpamMore');
+      const blEl = document.getElementById('pfBl');
+      const blMore = document.getElementById('pfBlMore');
+
+      if(!spamEl || !blEl){
+        toast('Preflight UI error', 'Missing elements: pfSpam/pfBl. Please refresh the page.', 'bad');
+        return;
+      }
+
+      if(r.ok && j.ok){
+        // spam
+        if(j.spam_score !== null && j.spam_score !== undefined){
+          const s = Number(j.spam_score);
+          const lim = Number(j.spam_threshold);
+          spamEl.textContent = s.toFixed(2) + ' (limit ' + lim.toFixed(1) + ')';
+          spamEl.style.color = (s <= lim) ? 'var(--good)' : 'var(--bad)';
+        }else{
+          spamEl.textContent = 'unavailable';
+          spamEl.style.color = 'var(--warn)';
+        }
+
+        if(j.spam_backend){
+          spamMore.style.display = 'block';
+          spamMore.textContent = 'Backend: ' + j.spam_backend;
+        }else{
+          spamMore.style.display = 'none';
+        }
+
+        // blacklist summary
+        const ipListings = j.ip_listings || {};
+        const domListings = j.domain_listings || [];
+
+        // IPs from SMTP host
+        const listedIpLines = [];
+        for(const [ip, arr] of Object.entries(ipListings)){
+          if(arr && arr.length){
+            listedIpLines.push(ip + ': ' + arr.map(x=>x.zone).join(', '));
+          }
+        }
+
+        // Domain DBL (domain-level)
+        const domZones = (domListings || []).map(x=>x.zone).filter(Boolean);
+
+        // NEW: Sender domains -> resolve IPs -> check IP DNSBL
+        const senderDomainIps = j.sender_domain_ips || {};
+        const senderDomainIpListings = j.sender_domain_ip_listings || {};
+        const senderDomainDblListings = j.sender_domain_dbl_listings || {};
+        const senderDomainSpamScores = j.sender_domain_spam_scores || {};
+        const senderDomainSpamBackends = j.sender_domain_spam_backends || {};
+
+        // DBL listings for ALL sender domains
+        const senderDblListedLines = [];
+        for(const [dom, arr] of Object.entries(senderDomainDblListings)){
+          if(arr && arr.length){
+            const zones = arr.map(x => (x && x.zone) ? x.zone : '').filter(Boolean);
+            if(zones.length){
+              senderDblListedLines.push(dom + ': ' + zones.join(', '));
+            } else {
+              senderDblListedLines.push(dom + ': listed');
+            }
+          }
+        }
+
+        const senderListedLines = [];
+        const senderAllLines = [];
+
+        for(const [dom, ips] of Object.entries(senderDomainIps)){
+          const ipArr = Array.isArray(ips) ? ips : [];
+          if(ipArr.length){
+            senderAllLines.push(dom + ' => ' + ipArr.join(', '));
+          }
+        }
+
+        for(const [dom, ipmap] of Object.entries(senderDomainIpListings)){
+          const m = ipmap || {};
+          for(const [ip, arr] of Object.entries(m)){
+            if(arr && arr.length){
+              senderListedLines.push(dom + ' / ' + ip + ': ' + arr.map(x=>x.zone).join(', '));
+            }
+          }
+        }
+
+        // Render table: all sender domains -> resolved IPs -> blacklist status + spam score
+        const tb = document.getElementById('pfDomains');
+        let anyDomainSpamHigh = false;
+
+        if(tb){
+          const domains = Array.isArray(j.sender_domains) ? j.sender_domains : [];
+          if(!domains.length){
+            tb.innerHTML = `<tr><td colspan="4" class="muted" style="padding:6px">No sender domains found.</td></tr>`;
+          } else {
+            const rows = [];
+            for(const dom of domains){
+              const ips = Array.isArray(senderDomainIps[dom]) ? senderDomainIps[dom] : [];
+              const ipMap = senderDomainIpListings[dom] || {};
+              const dblArr = Array.isArray(senderDomainDblListings[dom]) ? senderDomainDblListings[dom] : [];
+
+              // Blacklist status (Listed/Not listed/Unknown)
+              let listed = false;
+              if(dblArr && dblArr.length){
+                listed = true;
+              }
+              for(const [ip, arr] of Object.entries(ipMap)){
+                if(arr && arr.length){
+                  listed = true;
+                }
+              }
+
+              const status = listed ? 'Listed' : (ips.length ? 'Not listed' : 'Unknown');
+              const color = listed ? 'var(--bad)' : (ips.length ? 'var(--good)' : 'var(--warn)');
+              const ipText = ips.length ? ips.join(', ') : '—';
+
+              // Spam score per domain
+              const scRaw = senderDomainSpamScores[dom];
+              let spamText = '—';
+              let spamColor = 'var(--warn)';
+              if(scRaw !== null && scRaw !== undefined && scRaw !== ''){
+                const sc = Number(scRaw);
+                const lim = Number(j.spam_threshold);
+                if(!Number.isNaN(sc)){
+                  spamText = sc.toFixed(2);
+                  spamColor = (sc <= lim) ? 'var(--good)' : 'var(--bad)';
+                  if(sc > lim) anyDomainSpamHigh = true;
+                }
+              }
+
+              rows.push(
+                `<tr>`+
+                  `<td style="padding:6px; border-bottom:1px solid rgba(255,255,255,.10)">${escHtml(dom)}</td>`+
+                  `<td style="padding:6px; border-bottom:1px solid rgba(255,255,255,.10)">${escHtml(ipText)}</td>`+
+                  `<td style="padding:6px; border-bottom:1px solid rgba(255,255,255,.10); color:${color}; font-weight:800">${escHtml(status)}</td>`+
+                  `<td style="padding:6px; border-bottom:1px solid rgba(255,255,255,.10); color:${spamColor}; font-weight:800">${escHtml(spamText)}</td>`+
+                `</tr>`
+              );
+            }
+            tb.innerHTML = rows.join('');
+          }
+        }
+
+        const anyListed = (listedIpLines.length > 0) || (domZones.length > 0) || (senderListedLines.length > 0) || (senderDblListedLines.length > 0);
+
+        if(!anyListed){
+          blEl.textContent = 'Not listed';
+          blEl.style.color = 'var(--good)';
+          // Still show resolved domain IPs if available
+          if(senderAllLines.length){
+            blMore.style.display = 'block';
+            blMore.textContent = 'Resolved sender domain IPs: ' + senderAllLines.join(' | ');
+          } else {
+            blMore.style.display = 'none';
+          }
+        } else {
+          blEl.textContent = 'Listed';
+          blEl.style.color = 'var(--bad)';
+          const parts = [];
+          if(listedIpLines.length){ parts.push('SMTP Host IP: ' + listedIpLines.join(' | ')); }
+          if(domZones.length){ parts.push('Sender Domain (DBL): ' + domZones.join(', ')); }
+          if(senderDblListedLines.length){ parts.push('All sender domains (DBL): ' + senderDblListedLines.join(' | ')); }
+          if(senderListedLines.length){ parts.push('Sender Domain IP (DNSBL): ' + senderListedLines.join(' | ')); }
+          if(!senderListedLines.length && senderAllLines.length){ parts.push('Resolved sender domain IPs: ' + senderAllLines.join(' | ')); }
+          blMore.style.display = 'block';
+          blMore.textContent = parts.join(' · ');
+        }
+
+        // toast
+        const warn = (j.spam_score !== null && j.spam_score !== undefined && Number(j.spam_score) > Number(j.spam_threshold))
+          || anyDomainSpamHigh
+          || (listedIpLines.length > 0) || (domZones.length > 0) || (senderListedLines.length > 0) || (senderDblListedLines.length > 0);
+        toast('Preflight done', warn ? 'Issues detected. See stats below.' : 'Looks good.', warn ? 'warn' : 'good');
+
+      } else {
+        const msg = (j && (j.error || j.detail)) ? (j.error || j.detail) : ('HTTP ' + r.status);
+        toast('Preflight failed', msg, 'bad');
+      }
+
+    }catch(e){
+      toast('Preflight failed', (e?.toString?.() || 'Unknown error'), 'bad');
+    }finally{
+      if(btn) btn.disabled = false;
+    }
+  }
+
+  const _pf = document.getElementById('btnPreflight');
+  if(_pf){ _pf.addEventListener('click', doPreflight); }
+
+  // Load saved values on page open
+  loadSavedForm().then(() => {
+    // One quick save after initial load (helps keep DB in sync with defaults)
+    setTimeout(()=>{ saveFormNow(); }, 200);
+  });
+
+  // Auto-save on change/input + AJAX submit (stay on page, show toast on errors)
+  const form = document.getElementById('mainForm');
+  if(form){
+    form.addEventListener('input', scheduleSave);
+    form.addEventListener('change', scheduleSave);
+
+    form.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+
+      // Hard guard: if we are already submitting, do NOTHING.
+      if(__sendSubmitting){
+        toast('Please wait', 'A send request is already in progress. Wait until the job is created.', 'warn');
+        return;
+      }
+
+      const btn = document.getElementById('btnStart');
+      __sendSubmitting = true;
+      if(btn) btn.disabled = true;
+
+      try{
+        await saveFormNow();
+
+        // If campaign already has jobs (stopped/running/etc), confirm with the user.
+        let latest = null;
+        try{
+          const r0 = await fetch(`/api/campaign/${CAMPAIGN_ID}/latest_job`);
+          const j0 = await r0.json().catch(()=>({}));
+          if(r0.ok && j0 && j0.ok && j0.job){ latest = j0.job; }
+        }catch(e){ /* ignore */ }
+
+        let forceNew = false;
+        if(latest){
+          const st = (latest.status || '').toString().toLowerCase();
+          const active = (st === 'queued' || st === 'running' || st === 'backoff' || st === 'paused');
+          const msg = active
+            ? (`This campaign already has a job in progress:\n`+
+               `- ID: ${latest.id}\n`+
+               `- Status: ${latest.status}\n\n`+
+               `Do you want another job?`)
+            : (`This campaign already has job history (latest):\n`+
+               `- ID: ${latest.id}\n`+
+               `- Status: ${latest.status}\n\n`+
+               `Do you want to start a new job?`);
+
+          const yes = confirm(msg);
+          if(!yes){
+            toast('Cancelled', 'Start sending cancelled.', 'warn');
+            return;
+          }
+          if(active){ forceNew = true; }
+        }
+
+        // Start recipient pre-send filter before submitting.
+        toast('Maillist filter', 'The filter started verifying addresses before sending....', 'warn');
+
+        // Only NOW show submitting toast (and lock start button) — job creation in progress.
+        toast('Sending', 'Submitting... please wait', 'warn');
+
+        const fd = new FormData(form);
+        // Mark as ajax so server-side can differentiate if needed.
+        fd.append('_ajax', '1');
+        if(forceNew){ fd.append('force_new_job', '1'); }
+
+        const r = await fetch('/start', {
+          method: 'POST',
+          body: fd,
+          headers: { 'X-Requested-With': 'fetch' }
+        });
+
+        const txt = await r.text();
+
+        if(r.ok){
+          // Success: /start redirects to /job/<id>. fetch follows redirects, so r.url becomes the job URL.
+          if(r.url && r.url.includes('/job/')){
+            window.location.href = r.url;
+            return;
+          }
+          toast('✅ Started', 'Job started successfully.', 'good');
+          return;
+        }
+
+        // If server blocked due to active job, show a clearer message.
+        if(r.status === 409){
+          toast('Blocked', txt || 'Active job already running. Please confirm to create another job.', 'warn');
+        } else {
+          // Error: show toast, stay on the form
+          toast('❌ Blocked', txt || ('HTTP ' + r.status), 'bad');
+        }
+
+      }catch(e){
+        toast('❌ Error', (e?.toString?.() || 'Unknown error'), 'bad');
+      }finally{
+        __sendSubmitting = false;
+        if(btn) btn.disabled = false;
+      }
+    });
+  }
+
+  // Clear-saved button removed (campaign data is auto-saved in SQLite).
+
+  // -------------------------
+  // Save domains stats (in-page)
+  // -------------------------
+  let _domCache = null;
+
+  function domStatusBadge(mx){
+    if(mx === 'mx') return '<span style="color:var(--good); font-weight:800">MX</span>';
+    if(mx === 'a_fallback') return '<span style="color:var(--warn); font-weight:800">A</span>';
+    if(mx === 'none') return '<span style="color:var(--bad); font-weight:800">NONE</span>';
+    return '<span style="color:var(--warn); font-weight:800">UNKNOWN</span>';
+  }
+
+  function domListedBadge(v){
+    return v ? '<span style="color:var(--bad); font-weight:800">Listed</span>' : '<span style="color:var(--good); font-weight:800">Not listed</span>';
+  }
+
+  function domPolicyBadge(v){
+    const st = (v || '').toString().toLowerCase();
+    if(st === 'pass') return '<span style="color:var(--good); font-weight:800">PASS</span>';
+    if(st === 'missing') return '<span style="color:var(--warn); font-weight:800">MISSING</span>';
+    if(st === 'unknown_selector') return '<span style="color:var(--warn); font-weight:800">UNKNOWN SELECTOR</span>';
+    return '<span style="color:var(--warn); font-weight:800">UNKNOWN</span>';
+  }
+
+  function renderDomainsTables(){
+    const qv = (document.getElementById('domQ')?.value || '').trim().toLowerCase();
+    const safeBody = document.getElementById('domTblSafe');
+    const safeTotals = document.getElementById('domSafeTotals');
+
+    if(!_domCache || !_domCache.ok){
+      if(safeBody) safeBody.innerHTML = `<tr><td colspan="9" class="muted">—</td></tr>`;
+      if(safeTotals) safeTotals.textContent = '—';
+      return;
+    }
+
+    const safe = _domCache.safe || {};
+    if(safeTotals){
+      safeTotals.textContent = `${safe.total_emails || 0} emails · ${safe.unique_domains || 0} domains · invalid=${safe.invalid_emails || 0}`;
+    }
+    function safeRows(items){
+      const arr = Array.isArray(items) ? items : [];
+      const out = [];
+      for(const it of arr){
+        const dom = (it.domain || '').toString();
+        if(qv && !dom.toLowerCase().includes(qv)) continue;
+        const mxHosts = (it.mx_hosts || []).slice(0,4).join(', ');
+        const ips = (it.mail_ips || []).join(', ');
+        out.push(
+          `<tr>`+
+            `<td><code>${escHtml(dom)}</code></td>`+
+            `<td style="font-weight:800">${Number(it.count || 0)}</td>`+
+            `<td>${domStatusBadge(it.mx_status)}</td>`+
+            `<td class="muted">${escHtml(mxHosts || '—')}</td>`+
+            `<td class="muted">${escHtml(ips || '—')}</td>`+
+            `<td>${domListedBadge(!!(it.listed ?? it.any_listed))}</td>`+
+            `<td>${domPolicyBadge((it.spf || {}).status)}</td>`+
+            `<td>${domPolicyBadge((it.dkim || {}).status)}</td>`+
+            `<td>${domPolicyBadge((it.dmarc || {}).status)}</td>`+
+          `</tr>`
+        );
+      }
+      return out.join('') || `<tr><td colspan="9" class="muted">No results.</td></tr>`;
+    }
+
+    if(safeBody) safeBody.innerHTML = safeRows(safe.domains);
+  }
+
+  async function refreshDomainsStats(){
+    const btn = document.getElementById('btnDomains');
+    const status = document.getElementById('domStatus');
+
+    if(btn) btn.disabled = true;
+    if(status) status.textContent = 'Loading...';
+
+    try{
+      const r = await fetch(`/api/campaign/${CAMPAIGN_ID}/domains_stats`);
+      const j = await r.json().catch(()=>({}));
+      if(r.ok && j && j.ok){
+        _domCache = j;
+        if(status) status.textContent = `OK · ${new Date().toLocaleTimeString()}`;
+        renderDomainsTables();
+        toast('Save Domains', 'Updated safe domains.', 'good');
+      } else {
+        const msg = (j && (j.error || j.detail)) ? (j.error || j.detail) : ('HTTP ' + r.status);
+        if(status) status.textContent = 'Failed';
+        toast('Save Domains failed', msg, 'bad');
+      }
+    }catch(e){
+      if(status) status.textContent = 'Failed';
+      toast('Domains stats failed', (e?.toString?.() || 'Unknown error'), 'bad');
+    }finally{
+      if(btn) btn.disabled = false;
+    }
+  }
+
+  const domBtn = document.getElementById('btnDomains');
+  if(domBtn){ domBtn.addEventListener('click', refreshDomainsStats); }
+  const domQ = document.getElementById('domQ');
+  if(domQ){ domQ.addEventListener('input', renderDomainsTables); }
+
+  // auto-load safe domains stats once
+  refreshDomainsStats();
+
+  // Range value UI
+  const scoreEl = document.getElementById('score_range');
+  const scoreVal = document.getElementById('score_range_val');
+  if(scoreEl && scoreVal){
+    const sync = () => { scoreVal.textContent = Number(scoreEl.value).toFixed(1); };
+    sync();
+    scoreEl.addEventListener('input', sync);
+  }
+"""
 
 # ---------------------------------------------------------------------------
 # Fake data seed
@@ -293,17 +1410,28 @@ PAGE = r"""
   <title>{{ title }}</title>
   <style>
     :root{
-      --bg1:#07111f; --bg2:#0d2138; --panel:rgba(255,255,255,.08); --panel2:rgba(255,255,255,.04);
-      --border:rgba(255,255,255,.14); --text:#f4f8ff; --muted:rgba(244,248,255,.68); --accent:#7aa7ff;
-      --good:#35e49a; --bad:#ff6b7f; --warn:#ffc85a; --shadow:0 20px 60px rgba(0,0,0,.35); --radius:18px;
+      --bg1:#0b1020; --bg2:#0a1a2b;
+      --card: rgba(255,255,255,.08);
+      --card2: rgba(255,255,255,.06);
+      --border: rgba(255,255,255,.14);
+      --text: rgba(255,255,255,.92);
+      --muted: rgba(255,255,255,.65);
+      --good: #35e49a;
+      --bad: #ff5e73;
+      --warn: #ffc14d;
+      --accent:#7aa7ff;
+      --shadow: 0 20px 60px rgba(0,0,0,.35);
+      --radius: 18px;
     }
     *{box-sizing:border-box}
     body{
-      margin:0; color:var(--text); font-family:system-ui,-apple-system,Segoe UI,Tahoma,Arial;
+      margin:0;
+      font-family: system-ui, -apple-system, "Segoe UI", Tahoma, Arial;
+      color: var(--text);
       background:
-        radial-gradient(1000px 640px at 90% 5%, rgba(122,167,255,.16), transparent 55%),
-        radial-gradient(920px 680px at 5% 10%, rgba(53,228,154,.10), transparent 55%),
-        linear-gradient(180deg,var(--bg1),var(--bg2));
+        radial-gradient(1000px 700px at 80% 20%, rgba(122,167,255,.22), transparent 60%),
+        radial-gradient(900px 700px at 20% 30%, rgba(53,228,154,.16), transparent 60%),
+        linear-gradient(180deg, var(--bg1), var(--bg2));
       min-height:100vh;
     }
     a{color:var(--accent); text-decoration:none}
@@ -314,61 +1442,138 @@ PAGE = r"""
     .menu{display:flex; flex-direction:column; gap:10px; margin-top:22px}
     .menu a{display:flex; align-items:center; gap:10px; padding:12px 14px; border-radius:14px; border:1px solid rgba(255,255,255,.1); background:rgba(255,255,255,.04)}
     .menu a.active{background:rgba(122,167,255,.18); border-color:rgba(122,167,255,.35); font-weight:800}
-    .sidebarCard{margin-top:18px; padding:14px; border-radius:16px; border:1px solid var(--border); background:linear-gradient(180deg,var(--panel),var(--panel2)); box-shadow:var(--shadow)}
-    .content{padding:24px}
-    .top{display:flex; gap:16px; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; margin-bottom:18px}
-    .title{font-size:28px; margin:0}
-    .subtitle{margin-top:8px; color:var(--muted); font-size:14px; line-height:1.7; max-width:980px}
-    .actions{display:flex; gap:10px; flex-wrap:wrap}
-    .btn, button{border:1px solid rgba(255,255,255,.16); background:rgba(122,167,255,.18); color:var(--text); padding:11px 14px; border-radius:14px; cursor:pointer; font:inherit; font-weight:700}
-    .btn.secondary, button.secondary{background:rgba(255,255,255,.08)}
-    .pill{display:inline-flex; align-items:center; gap:8px; padding:8px 12px; border-radius:999px; border:1px solid rgba(255,255,255,.14); background:rgba(255,255,255,.06); font-size:12px}
-    .grid{display:grid; gap:14px}
+    .sidebarCard{margin-top:18px; padding:14px; border-radius:16px; border:1px solid var(--border); background:linear-gradient(180deg,var(--card),var(--card2)); box-shadow:var(--shadow)}
+    .content{padding:28px 18px 28px 24px}
+    .wrap{max-width: 1100px; margin: 0 auto;}
+    .top{
+      display:flex; gap:14px; align-items:flex-start; justify-content:space-between;
+      flex-wrap:wrap; margin-bottom: 18px;
+    }
+    h1,.title{ margin:0; font-size: 22px; letter-spacing: .2px; }
+    .title{font-size:28px}
+    .sub,.subtitle{
+      margin-top:6px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+      max-width: 980px;
+    }
+    .subtitle{font-size:14px; line-height:1.7}
+    .badge,.pill,.tag{
+      display:inline-flex; align-items:center; gap:8px;
+      padding: 10px 12px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      box-shadow: var(--shadow);
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+      text-decoration:none;
+    }
+    .tag{padding:5px 10px; font-weight:800; box-shadow:none; background:rgba(255,255,255,.06)}
+    .tag.good,.tone-good{color:var(--good); border-color:rgba(53,228,154,.35)}
+    .tag.bad,.tone-bad{color:var(--bad); border-color:rgba(255,94,115,.35)}
+    .tag.warn,.tone-warn{color:var(--warn); border-color:rgba(255,193,77,.35)}
+    .tag.accent,.tone-accent{color:var(--accent); border-color:rgba(122,167,255,.35)}
+    .topActions{ display:flex; flex-direction:column; gap:10px; align-items:flex-end; }
+    .topLinks{ display:flex; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
+    .grid{ display:grid; gap: 14px; }
     .grid.kpis{grid-template-columns:repeat(4,minmax(0,1fr))}
     .grid.two{grid-template-columns:1.2fr .8fr}
     .grid.three{grid-template-columns:repeat(3,minmax(0,1fr))}
-    .card{background:linear-gradient(180deg,var(--panel),var(--panel2)); border:1px solid var(--border); border-radius:var(--radius); padding:16px; box-shadow:var(--shadow); backdrop-filter:blur(10px)}
-    .card h2,.card h3,.card h4{margin:0 0 10px}
-    .muted{color:var(--muted)}
-    .mini{font-size:12px; color:var(--muted); line-height:1.6}
+    .grid.send-layout{grid-template-columns: minmax(0, 1.05fr) minmax(340px, .95fr)}
+    .stack{ display:flex; flex-direction:column; gap:14px; }
+    .card{
+      background: linear-gradient(180deg, var(--card), var(--card2));
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 16px;
+      backdrop-filter: blur(10px);
+    }
+    .card h2,.card h3,.card h4{ margin:0 0 10px; font-size: 16px; color: rgba(255,255,255,.88); }
+    label{ display:block; margin: 10px 0 6px; color: var(--muted); font-size: 12px; font-weight:700; }
+    input, select, textarea{
+      width:100%;
+      padding: 11px 12px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,.16);
+      background: rgba(0,0,0,.18);
+      color: var(--text);
+      outline: none;
+      font: inherit;
+    }
+    input::placeholder, textarea::placeholder{color: rgba(255,255,255,.35)}
+    textarea{min-height: 130px; resize: vertical}
+    .row,.split,.telemetryRow{ display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .hint,.alert,.laneBox,.emptyState,.check{
+      padding: 10px 12px;
+      border-radius: 14px;
+      border: 1px solid rgba(255,255,255,.14);
+      background: rgba(255,255,255,.06);
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.6;
+    }
+    .alert{margin-bottom:10px}
+    .alert.good{ border-color: rgba(53,228,154,.35); background: rgba(53,228,154,.08); }
+    .alert.warn{ border-color: rgba(255,193,77,.35); background: rgba(255,193,77,.08); }
+    .alert.bad{ border-color: rgba(255,94,115,.35); background: rgba(255,94,115,.08); }
+    .alert.accent{ border-color: rgba(122,167,255,.35); background: rgba(122,167,255,.08); }
+    .actions{display:flex; gap:10px; align-items:center; justify-content:flex-start; flex-wrap: wrap; margin-top: 14px;}
+    .btn, button{
+      border: 1px solid rgba(255,255,255,.18);
+      background: rgba(122,167,255,.18);
+      color: var(--text);
+      padding: 12px 14px;
+      border-radius: 14px;
+      cursor:pointer;
+      font-weight: 600;
+      letter-spacing:.2px;
+      font:inherit;
+    }
+    .btn:hover, button:hover{filter: brightness(1.06)}
+    .btn.secondary, button.secondary{ background: rgba(255,255,255,.08); }
+    .btn:disabled, button:disabled{ opacity:.55; cursor:not-allowed; }
+    .check{display:flex; gap: 8px; align-items:flex-start; margin-top: 12px; background: rgba(0,0,0,.12)}
+    .check input{width:auto; margin-top: 2px;}
+    .foot,.footerNote{ margin-top: 16px; color: rgba(255,255,255,.45); font-size: 12px; line-height: 1.7; }
+    .mini,.muted{ font-size: 12px; color: var(--muted); margin-top: 8px; }
+    code{background:rgba(255,255,255,.08); padding:2px 6px; border-radius:8px;}
+    .smallBar,.bar{height:10px; border-radius:999px; background:rgba(255,255,255,.10); border:1px solid rgba(255,255,255,.12); overflow:hidden}
+    .smallBar > div,.bar > div{height:100%; width:0%; background: linear-gradient(90deg, var(--accent), rgba(53,228,154,.75));}
+    .nav{display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:8px 0 14px;}
+    .nav a, .nav button{display:inline-flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid rgba(255,255,255,.14); background: rgba(255,255,255,.06); border-radius: 12px; text-decoration:none;}
+    .nav a:hover{filter:brightness(1.06)}
+    .nav a.primary{ background: rgba(122,167,255,.14); font-weight:800; }
+    table{width:100%; border-collapse:collapse; font-size: 12px;}
+    th,td{padding:8px; border-bottom:1px solid rgba(255,255,255,.10); text-align:left; vertical-align:top}
+    .statsList{display:grid; gap:10px}
     .kpi .label{font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.4px}
     .kpi .value{font-size:28px; font-weight:900; margin-top:6px}
-    .tone-good{color:var(--good)} .tone-bad{color:var(--bad)} .tone-warn{color:var(--warn)} .tone-accent{color:var(--accent)}
     .progressLine{margin-top:10px}
-    .bar{height:10px; border-radius:999px; border:1px solid rgba(255,255,255,.12); background:rgba(255,255,255,.09); overflow:hidden}
-    .bar > div{height:100%; background:linear-gradient(90deg,var(--accent),var(--good)); width:0}
-    .alert{padding:12px 14px; border-radius:14px; border:1px solid rgba(255,255,255,.14); margin-bottom:10px}
-    .alert.good{border-color:rgba(53,228,154,.35); background:rgba(53,228,154,.08)}
-    .alert.warn{border-color:rgba(255,200,90,.35); background:rgba(255,200,90,.08)}
-    .alert.bad{border-color:rgba(255,107,127,.35); background:rgba(255,107,127,.08)}
-    table{width:100%; border-collapse:collapse; font-size:13px}
-    th,td{padding:10px 8px; border-bottom:1px solid rgba(255,255,255,.1); text-align:left; vertical-align:top}
-    th{color:rgba(255,255,255,.88)}
-    .tag{display:inline-flex; padding:5px 10px; border-radius:999px; border:1px solid rgba(255,255,255,.12); background:rgba(255,255,255,.06); font-size:11px; font-weight:800}
-    .tag.good{color:var(--good); border-color:rgba(53,228,154,.35)}
-    .tag.bad{color:var(--bad); border-color:rgba(255,107,127,.35)}
-    .tag.warn{color:var(--warn); border-color:rgba(255,200,90,.35)}
-    .tag.accent{color:var(--accent); border-color:rgba(122,167,255,.35)}
-    .statsList{display:grid; gap:10px}
-    .split{display:grid; grid-template-columns:1fr 1fr; gap:14px}
     .field{margin-bottom:12px}
-    label{display:block; margin-bottom:6px; color:var(--muted); font-size:12px; font-weight:700}
-    input,select,textarea{width:100%; background:rgba(0,0,0,.18); color:var(--text); border:1px solid rgba(255,255,255,.16); border-radius:12px; padding:11px 12px; font:inherit}
-    textarea{min-height:110px; resize:vertical}
-    code{background:rgba(255,255,255,.08); padding:2px 6px; border-radius:8px}
-    .telemetryRow{display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px}
-    .laneBox{padding:12px; border-radius:14px; border:1px solid rgba(255,255,255,.12); background:rgba(255,255,255,.03)}
-    .emptyState{padding:18px; text-align:center; color:var(--muted); border:1px dashed rgba(255,255,255,.16); border-radius:14px}
-    .footerNote{margin-top:18px; color:rgba(255,255,255,.5); font-size:12px}
-    @media (max-width: 1200px){ .grid.kpis{grid-template-columns:repeat(2,minmax(0,1fr))} .grid.two,.split,.telemetryRow{grid-template-columns:1fr} }
+    .toast-wrap{ position: fixed; right: 16px; bottom: 16px; z-index: 9999; display:flex; flex-direction:column; gap:10px; }
+    .toast{ min-width: 280px; max-width: 420px; background: rgba(0,0,0,.55); border: 1px solid rgba(255,255,255,.18); box-shadow: 0 18px 55px rgba(0,0,0,.35); backdrop-filter: blur(10px); border-radius: 14px; padding: 12px 14px; color: rgba(255,255,255,.92); font-size: 13px; line-height: 1.5; animation: pop .18s ease-out; }
+    @keyframes pop{ from{ transform: translateY(6px); opacity: .2; } to{ transform: translateY(0); opacity: 1; } }
+    .toast .t{font-weight:800; margin-bottom:4px}
+    .toast.good{ border-color: rgba(53,228,154,.35); }
+    .toast.bad{ border-color: rgba(255,94,115,.35); }
+    .toast.warn{ border-color: rgba(255,193,77,.35); }
+    .inline-status{ margin-top: 10px; padding: 10px 12px; border-radius: 14px; border: 1px solid rgba(255,255,255,.14); background: rgba(0,0,0,.12); color: var(--muted); font-size: 12px; line-height: 1.6; display:none; }
+    .inline-status.show{ display:block; }
+    .inline-status b{ color: rgba(255,255,255,.88); }
+    @media (max-width: 1200px){ .grid.kpis{grid-template-columns:repeat(2,minmax(0,1fr))} .grid.two,.grid.send-layout,.split,.telemetryRow{grid-template-columns:1fr} }
     @media (max-width: 920px){ .shell{grid-template-columns:1fr} .sidebar{position:relative; height:auto; border-right:0; border-bottom:1px solid rgba(255,255,255,.08)} .grid.three{grid-template-columns:1fr} }
+    @media (max-width: 520px){ .row{grid-template-columns: 1fr;} .topActions{ align-items:stretch; width:100%; } .topLinks{ justify-content:flex-start; } .content{padding:18px 14px 24px} }
   </style>
 </head>
 <body>
   <div class="shell">
     <aside class="sidebar">
       <div class="brand">Shivamini</div>
-      <div class="brandSub">Standalone Flask frontend sandbox with fake data only. No database, no models, and no real SMTP or PMTA actions.</div>
+      <div class="brandSub">Unified single-file Flask frontend sandbox with the Shiva Mini Sand styling applied across dashboard, jobs, job details, config, domains, and send surfaces.</div>
       <nav class="menu">
         <a href="{{ url_for('dashboard') }}" class="{% if page == 'dashboard' %}active{% endif %}">📊 Dashboard</a>
         <a href="{{ url_for('campaigns_page') }}" class="{% if page == 'campaigns' %}active{% endif %}">📌 Campaigns</a>
@@ -385,7 +1590,7 @@ PAGE = r"""
     </aside>
     <main class="content">
       {{ body|safe }}
-      <div class="footerNote">This file is intentionally frontend-heavy so you can replace the fake content later with your own real implementation.</div>
+      <div class="footerNote">All frontend surfaces now inherit the same Shiva Mini Sand dashboard visual language from this single Python file.</div>
     </main>
   </div>
 <script>
@@ -414,17 +1619,20 @@ async function hydrateDashboard(){
 setInterval(hydrateDashboard, 4000);
 hydrateDashboard();
 </script>
+{{ page_script|safe }}
 </body>
 </html>
 """
 
 
-def render(page: str, title: str, body: str):
+def render(page: str, title: str, body: str, page_script: str = ""):
+
     return render_template_string(
         PAGE,
         page=page,
         title=title,
         body=body,
+        page_script=page_script,
         sidebar_campaign=DASHBOARD_DATA["campaign"],
     )
 
@@ -560,7 +1768,9 @@ def dashboard():
 
 @app.get("/send")
 def send_page():
-    return Response(SEND_PAGE_HTML, mimetype="text/html")
+    body = render_template_string(SEND_PAGE_BODY, campaign_ts=NOW.strftime("%Y-%m-%d %H:%M:%S"))
+    page_script = "<script>\n" + SEND_PAGE_SCRIPT + "\n</script>"
+    return render("send", "Shivamini Send", body, page_script=page_script)
 
 
 @app.get("/campaigns")
