@@ -102,6 +102,12 @@ try:
 except Exception:
     dns = None  # type: ignore
 
+# Optional SSH client for password/key auth without shelling out to sshpass.
+try:
+    import paramiko  # type: ignore
+except Exception:
+    paramiko = None  # type: ignore
+
 DNS_RESOLVER = None
 if dns is not None:
     try:
@@ -6685,7 +6691,7 @@ PAGE_FORM = r"""
       <div class="row">
         <div>
           <label>SSH Password (optional)</label>
-          <input name="ssh_pass" type="password" placeholder="Requires sshpass on the Shiva host">
+          <input name="ssh_pass" type="password" placeholder="Password auth supported directly by Shiva">
         </div>
         <div>
           <label>SSH Timeout (seconds)</label>
@@ -10354,7 +10360,7 @@ This will remove it from Jobs history.`);
 
   async function bridgeDebugTick(){
     try{
-      const r = await fetch('/api/accounting/bridge/status');
+      const r = await fetch('/api/accounting/ssh/status');
       const j = await r.json().catch(()=>({}));
       if(r.ok && j && j.ok && j.bridge){
         const b = j.bridge || {};
@@ -13172,15 +13178,63 @@ def _build_ssh_command(profile: dict, remote_cmd: str) -> List[str]:
     return cmd
 
 
-def _run_pmta_ssh(profile: dict, remote_cmd: str, *, timeout_s: Optional[float] = None) -> dict:
-    if not profile.get("enabled"):
-        return {"ok": False, "error": "ssh_not_configured", "stdout": "", "stderr": "", "target": ""}
+def _run_pmta_ssh_with_paramiko(profile: dict, remote_cmd: str, *, timeout_s: float) -> dict:
+    if paramiko is None:
+        return {"ok": False, "stdout": "", "stderr": "", "error": "paramiko_not_installed", "target": _mask_ssh_target(profile)}
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        connect_kwargs = {
+            "hostname": str(profile.get("host") or "").strip(),
+            "port": int(profile.get("port") or 22),
+            "username": str(profile.get("user") or "").strip() or None,
+            "timeout": timeout_s,
+            "banner_timeout": timeout_s,
+            "auth_timeout": timeout_s,
+            "look_for_keys": False,
+            "allow_agent": False,
+        }
+        key_path = str(profile.get("key_path") or "").strip()
+        password = str(profile.get("password") or "").strip()
+        if key_path:
+            connect_kwargs["key_filename"] = key_path
+            connect_kwargs["look_for_keys"] = False
+        elif not password:
+            connect_kwargs["look_for_keys"] = True
+            connect_kwargs["allow_agent"] = True
+        if password:
+            connect_kwargs["password"] = password
+
+        client.connect(**connect_kwargs)
+        stdin, stdout, stderr = client.exec_command(remote_cmd, timeout=timeout_s)
+        out = stdout.read().decode("utf-8", errors="ignore")
+        err = stderr.read().decode("utf-8", errors="ignore")
+        code = stdout.channel.recv_exit_status()
+        return {
+            "ok": code == 0,
+            "stdout": out,
+            "stderr": err,
+            "error": "" if code == 0 else (str(err or out or "").strip() or f"ssh_exit_{code}"),
+            "target": _mask_ssh_target(profile),
+            "transport": "paramiko",
+        }
+    except Exception as exc:
+        return {"ok": False, "stdout": "", "stderr": "", "error": str(exc), "target": _mask_ssh_target(profile), "transport": "paramiko"}
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _run_pmta_ssh_with_subprocess(profile: dict, remote_cmd: str, *, timeout_s: float) -> dict:
     cmd = _build_ssh_command(profile, remote_cmd)
     password = str(profile.get("password") or "").strip()
     if password:
         sshpass = shutil.which("sshpass")
         if not sshpass:
-            return {"ok": False, "error": "sshpass_not_installed_for_password_auth", "stdout": "", "stderr": "", "target": _mask_ssh_target(profile)}
+            return {"ok": False, "error": "sshpass_not_installed_for_password_auth", "stdout": "", "stderr": "", "target": _mask_ssh_target(profile), "transport": "subprocess"}
         cmd = [sshpass, "-p", password] + cmd
     try:
         proc = subprocess.run(
@@ -13188,7 +13242,7 @@ def _run_pmta_ssh(profile: dict, remote_cmd: str, *, timeout_s: Optional[float] 
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=max(2.0, float(timeout_s or profile.get("timeout") or PMTA_SSH_TIMEOUT_S or 8.0)),
+            timeout=timeout_s,
             check=False,
         )
         return {
@@ -13197,11 +13251,33 @@ def _run_pmta_ssh(profile: dict, remote_cmd: str, *, timeout_s: Optional[float] 
             "stderr": str(proc.stderr or ""),
             "error": "" if proc.returncode == 0 else (str(proc.stderr or proc.stdout or "").strip() or f"ssh_exit_{proc.returncode}"),
             "target": _mask_ssh_target(profile),
+            "transport": "subprocess",
         }
     except subprocess.TimeoutExpired as exc:
-        return {"ok": False, "stdout": str(getattr(exc, "stdout", "") or ""), "stderr": str(getattr(exc, "stderr", "") or ""), "error": f"timeout after {exc.timeout}s", "target": _mask_ssh_target(profile)}
+        return {"ok": False, "stdout": str(getattr(exc, "stdout", "") or ""), "stderr": str(getattr(exc, "stderr", "") or ""), "error": f"timeout after {exc.timeout}s", "target": _mask_ssh_target(profile), "transport": "subprocess"}
     except Exception as exc:
-        return {"ok": False, "stdout": "", "stderr": "", "error": str(exc), "target": _mask_ssh_target(profile)}
+        return {"ok": False, "stdout": "", "stderr": "", "error": str(exc), "target": _mask_ssh_target(profile), "transport": "subprocess"}
+
+
+def _run_pmta_ssh(profile: dict, remote_cmd: str, *, timeout_s: Optional[float] = None) -> dict:
+    if not profile.get("enabled"):
+        return {"ok": False, "error": "ssh_not_configured", "stdout": "", "stderr": "", "target": ""}
+    effective_timeout = max(2.0, float(timeout_s or profile.get("timeout") or PMTA_SSH_TIMEOUT_S or 8.0))
+
+    password = str(profile.get("password") or "").strip()
+    key_path = str(profile.get("key_path") or "").strip()
+    if password:
+        if paramiko is None:
+            return {"ok": False, "error": "paramiko_not_installed_for_password_auth", "stdout": "", "stderr": "", "target": _mask_ssh_target(profile)}
+        return _run_pmta_ssh_with_paramiko(profile, remote_cmd, timeout_s=effective_timeout)
+
+    prefer_paramiko = bool(paramiko is not None and (key_path or os.name == "nt"))
+    if prefer_paramiko:
+        res = _run_pmta_ssh_with_paramiko(profile, remote_cmd, timeout_s=effective_timeout)
+        if res.get("ok"):
+            return res
+
+    return _run_pmta_ssh_with_subprocess(profile, remote_cmd, timeout_s=effective_timeout)
 
 
 def _run_pmta_cli(profile: dict, pmta_args: str, *, timeout_s: Optional[float] = None) -> dict:
@@ -14247,6 +14323,13 @@ _BRIDGE_POLLER_STARTED = False
 _BRIDGE_POLL_CYCLE_LOCK = threading.Lock()
 
 
+def _bridge_debug_update(**updates: Any) -> Dict[str, Any]:
+    with _BRIDGE_DEBUG_LOCK:
+        for key, value in updates.items():
+            _BRIDGE_DEBUG_STATE[key] = value
+        return dict(_BRIDGE_DEBUG_STATE)
+
+
 def _parse_remote_accounting_csv(text: str) -> List[dict]:
     lines = [line for line in str(text or "").splitlines() if line.strip()]
     if not lines:
@@ -14271,6 +14354,23 @@ def _parse_remote_accounting_csv(text: str) -> List[dict]:
     except Exception:
         return []
     return rows
+
+
+def _active_jobs_for_bridge_poll() -> List['SendJob']:
+    active_statuses = {"queued", "running", "backoff", "paused"}
+    jobs: List['SendJob'] = []
+    with JOBS_LOCK:
+        for job in JOBS.values():
+            if not job or getattr(job, "deleted", False):
+                continue
+            if str(getattr(job, "status", "") or "").strip().lower() not in active_statuses:
+                continue
+            profile = _resolve_pmta_ssh_profile(job=job, campaign_id=getattr(job, "campaign_id", ""), smtp_host=getattr(job, "smtp_host", ""))
+            if not profile.get("enabled"):
+                continue
+            jobs.append(job)
+    jobs.sort(key=lambda j: str(getattr(j, "updated_at", "") or getattr(j, "created_at", "")), reverse=True)
+    return jobs
 
 
 def _tail_remote_accounting(job: 'SendJob') -> dict:
@@ -18117,15 +18217,15 @@ APP_CONFIG_SCHEMA: List[dict] = [
 
     # Accounting bridge pull mode (Shiva pull request -> bridge API response)
     {"key": "PMTA_BRIDGE_PULL_ENABLED", "type": "bool", "default": "1", "group": "Accounting", "restart_required": True,
-     "desc": "Enable the only accounting flow: Shiva pulls accounting from bridge API."},
+     "desc": "Enable SSH accounting polling so Shiva tails the remote PowerMTA accounting file over SSH."},
     {"key": "BRIDGE_MODE", "type": "str", "default": "counts", "group": "Accounting", "restart_required": False,
      "desc": "Bridge ingestion mode. Use 'counts' to enforce /api/v1/job/count (+ optional /job/outcomes) and disable legacy cursor /pull ingestion."},
     {"key": "BRIDGE_BASE_URL", "type": "str", "default": "", "group": "Accounting", "restart_required": False,
-     "desc": "Optional explicit Bridge base URL (example: http://bridge-host:8090). If empty, Shiva derives host from campaign SMTP host."},
+     "desc": "Deprecated legacy bridge URL setting. SSH accounting ignores this value."},
     {"key": "PMTA_BRIDGE_PULL_PORT", "type": "int", "default": "8090", "group": "Accounting", "restart_required": False,
      "desc": "Bridge port used by Shiva when building count/outcomes API URLs from campaign SMTP host."},
     {"key": "PMTA_BRIDGE_PULL_S", "type": "float", "default": "5", "group": "Accounting", "restart_required": False,
-     "desc": "Legacy polling interval (seconds) for Shiva bridge pull thread."},
+     "desc": "Polling interval (seconds) for Shiva's SSH accounting poller thread."},
     {"key": "BRIDGE_POLL_INTERVAL_S", "type": "float", "default": "5", "group": "Accounting", "restart_required": False,
      "desc": "Polling interval (seconds) for Shiva bridge job poller loop."},
     {"key": "OUTCOMES_SYNC", "type": "bool", "default": "1", "group": "Accounting", "restart_required": False,
@@ -18133,7 +18233,7 @@ APP_CONFIG_SCHEMA: List[dict] = [
     {"key": "BRIDGE_POLL_FETCH_OUTCOMES", "type": "bool", "default": "1", "group": "Accounting", "restart_required": False,
      "desc": "Legacy alias for OUTCOMES_SYNC. If enabled, Shiva also fetches /api/v1/job/outcomes for each active job poll cycle."},
     {"key": "PMTA_BRIDGE_PULL_MAX_LINES", "type": "int", "default": "2000", "group": "Accounting", "restart_required": False,
-     "desc": "max_lines query used when Shiva pulls from bridge endpoint."},
+     "desc": "Maximum accounting CSV lines Shiva tails per SSH polling cycle."},
 
     # Scheduler lane scaffolding (baseline/debug only in this phase)
     {"key": "SHIVA_SCHEDULER_MODE", "type": "str", "default": "legacy", "group": "Scheduler", "restart_required": False,
@@ -18774,14 +18874,13 @@ def reload_runtime_config() -> dict:
         OPENROUTER_MODEL = (cfg_get_str("OPENROUTER_MODEL", OPENROUTER_MODEL) or OPENROUTER_MODEL).strip()
         OPENROUTER_TIMEOUT_S = float(cfg_get_float("OPENROUTER_TIMEOUT_S", OPENROUTER_TIMEOUT_S))
 
-        # Bridge pull mode (Shiva -> Bridge)
+        # SSH accounting pull mode
         PMTA_BRIDGE_PULL_ENABLED = bool(cfg_get_bool("PMTA_BRIDGE_PULL_ENABLED", bool(PMTA_BRIDGE_PULL_ENABLED)))
-        BRIDGE_MODE = (cfg_get_str("BRIDGE_MODE", BRIDGE_MODE) or BRIDGE_MODE).strip().lower()
-        if BRIDGE_MODE not in {"counts", "legacy"}:
-            BRIDGE_MODE = "counts"
-        PMTA_BRIDGE_PULL_PORT = int(cfg_get_int("PMTA_BRIDGE_PULL_PORT", int(PMTA_BRIDGE_PULL_PORT or 8090)))
+        _configured_bridge_mode = (cfg_get_str("BRIDGE_MODE", BRIDGE_MODE) or BRIDGE_MODE).strip().lower()
+        BRIDGE_MODE = "ssh" if _configured_bridge_mode != "disabled" else "ssh"
+        PMTA_BRIDGE_PULL_PORT = int(cfg_get_int("PMTA_BRIDGE_PULL_PORT", int(PMTA_BRIDGE_PULL_PORT or PMTA_SSH_PORT or 22)))
         PMTA_BRIDGE_PULL_S = float(cfg_get_float("PMTA_BRIDGE_PULL_S", float(PMTA_BRIDGE_PULL_S or 5.0)))
-        BRIDGE_BASE_URL = (cfg_get_str("BRIDGE_BASE_URL", BRIDGE_BASE_URL) or BRIDGE_BASE_URL).strip()
+        BRIDGE_BASE_URL = ""
         BRIDGE_POLL_INTERVAL_S = float(cfg_get_float("BRIDGE_POLL_INTERVAL_S", float(PMTA_BRIDGE_PULL_S or BRIDGE_POLL_INTERVAL_S or 5.0)))
         OUTCOMES_SYNC = bool(cfg_get_bool("OUTCOMES_SYNC", bool(OUTCOMES_SYNC)))
         BRIDGE_POLL_FETCH_OUTCOMES = bool(cfg_get_bool("BRIDGE_POLL_FETCH_OUTCOMES", bool(OUTCOMES_SYNC)))
@@ -20258,14 +20357,14 @@ def api_preflight():
     )
 
 
+@app.get("/api/accounting/ssh/status")
 @app.get("/api/accounting/bridge/status")
 def api_accounting_bridge_status():
-    """Expose lightweight bridge polling health and per-job accounting snapshots."""
+    """Expose lightweight SSH accounting polling health and per-job snapshots."""
     with _BRIDGE_DEBUG_LOCK:
         state = dict(_BRIDGE_DEBUG_STATE)
-    base_url = _resolve_bridge_base_url_runtime()
     poll_interval = float(BRIDGE_POLL_INTERVAL_S or PMTA_BRIDGE_PULL_S or 0)
-    timeout = float(BRIDGE_TIMEOUT_S or 0)
+    timeout = float(PMTA_SSH_TIMEOUT_S or 0)
 
     jobs: List[Dict[str, Any]] = []
     active_jobs = _active_jobs_for_bridge_poll()
@@ -20274,9 +20373,11 @@ def api_accounting_bridge_status():
         deferred = int(getattr(job, "deferred", 0) or 0)
         bounced = int(getattr(job, "bounced", 0) or 0)
         complained = int(getattr(job, "complained", 0) or 0)
+        profile = _resolve_pmta_ssh_profile(job=job, campaign_id=getattr(job, "campaign_id", ""), smtp_host=getattr(job, "smtp_host", ""))
         jobs.append(
             {
                 "pmta_job_id": _job_pmta_job_id(job),
+                "ssh_target": _mask_ssh_target(profile),
                 "counts": {
                     "linked_emails_count": delivered + deferred + bounced + complained,
                     "delivered_count": delivered,
@@ -20290,7 +20391,7 @@ def api_accounting_bridge_status():
         )
 
     status = {
-        "bridge_base_url": base_url,
+        "ssh_target": str(state.get("ssh_target") or ""),
         "poll_interval": poll_interval,
         "timeout": timeout,
         "last_ok_ts": str(state.get("last_ok_ts") or ""),
@@ -20301,17 +20402,16 @@ def api_accounting_bridge_status():
 
     state.update(status)
     state["pull_enabled"] = bool(PMTA_BRIDGE_PULL_ENABLED)
-    state["bridge_mode"] = str(BRIDGE_MODE or "counts")
+    state["bridge_mode"] = str(BRIDGE_MODE or "ssh")
     state["pull_interval_s"] = poll_interval
     state["pull_max_lines"] = int(PMTA_BRIDGE_PULL_MAX_LINES or 0)
     return jsonify({"ok": True, **status, "bridge": state})
 
 
+@app.post("/api/accounting/ssh/pull")
 @app.post("/api/accounting/bridge/pull")
 def api_accounting_bridge_pull_once():
-    """Manual pull from bridge endpoint (same processing path as periodic poller)."""
-    if not _resolve_bridge_base_url_runtime():
-        return jsonify({"ok": False, "error": "bridge base URL is not configured"}), 400
+    """Manual SSH accounting pull using the same processing path as the periodic poller."""
     result = _poll_accounting_bridge_once()
     if not result.get("ok") and str(result.get("reason") or "") == "busy":
         return jsonify(result), 409
