@@ -1170,6 +1170,17 @@ DASHBOARD_DATA = {
         {"title": "Bridge connected", "body": "Accounting bridge last synced 22 seconds ago.", "tone": "good"},
         {"title": "Two sender domains listed", "body": "mail-demo.net appears in a fake DNSBL sample.", "tone": "bad"},
     ],
+    "ops_snapshot": [
+        {"label": "Active operators", "value": "4", "tone": "accent", "hint": "Fake dashboard staffing info for the current shift."},
+        {"label": "Bridge poll", "value": "5s", "tone": "good", "hint": "Preview-only bridge polling interval."},
+        {"label": "Warmup profile", "value": "Tier B", "tone": "warn", "hint": "Demo sender warmup cohort for this campaign."},
+        {"label": "Inbox seed tests", "value": "18/20", "tone": "good", "hint": "Sample seed inbox placement result."},
+    ],
+    "dashboard_notes": [
+        {"title": "Shift owner", "body": "Maya (deliverability) is monitoring Gmail and Outlook lanes for this demo job.", "tone": "accent"},
+        {"title": "Next milestone", "body": "The board switches to reconciliation mode after the live queue drops below 1,000 recipients.", "tone": "good"},
+        {"title": "Demo caveat", "body": "All numbers on this dashboard are fake placeholders for frontend preview only.", "tone": "warn"},
+    ],
     "preflight": {
         "spam_score": 2.6,
         "spam_limit": 4.0,
@@ -1382,6 +1393,234 @@ DOMAINS_DATA = {
     ],
 }
 
+JOBS_NAV_ITEMS = [
+    {"label": "Overview", "href": "#job-overview"},
+    {"label": "PMTA Live", "href": "#job-pmta-live"},
+    {"label": "Outcomes", "href": "#job-outcomes"},
+    {"label": "Providers", "href": "#job-providers"},
+    {"label": "Chunk preflight", "href": "#job-chunk-preflight"},
+]
+
+JOBS_SHOWCASE_HTML = r"""
+<div class="job" id="job-overview" data-jobid="83b5cd63007e" data-created="2026-03-22T10:19:10Z">
+  <div class="jobTop">
+    <div>
+      <div class="titleRow">
+        <div style="font-weight:900">Job <code>83b5cd63007e</code></div>
+        <div class="pill bad" data-k="status">Status: error</div>
+        <div class="pill" data-k="speed">0 epm</div>
+        <div class="pill" data-k="eta">ETA —</div>
+      </div>
+      <div class="triageRow">
+        <div class="triageBadge" data-k="badgeMode"><span class="badgeLabel">—</span><span class="tip" data-tip="Bridge mode not available yet for this job.">ⓘ</span></div>
+        <div class="triageBadge" data-k="badgeFreshness"><span class="badgeLabel">—</span><span class="tip" data-tip="Freshness signal: how recent accounting or legacy ingestion updates are for this job.">ⓘ</span></div>
+        <div class="triageBadge good" data-k="badgeHealth"><span class="badgeLabel">OK (0)</span><span class="tip" data-tip="Internal health checks are clean (no bridge/runtime failure counters).">ⓘ</span></div>
+        <div class="triageBadge" data-k="badgeRisk"><span class="badgeLabel">RISK —</span><span class="tip" data-tip="Deliverability risk derived from bounce, complaint, and deferred rates.">ⓘ</span></div>
+        <div class="triageBadge bridgeConnBadge bad" data-k="badgeBridgeConn" title="Bridge↔Shiva disconnected"><span class="statusDot bad" aria-hidden="true"></span><span>Bridge↔Shiva disconnected</span><span class="tip" data-tip="Real-time bridge transport status between PMTA accounting bridge and Shiva receiver. Current endpoint is not available yet.">ⓘ</span></div>
+        <div class="triageBadge" data-k="badgeIntegrity" style="display:none"><span class="badgeLabel">INTEGRITY</span><span class="tip" data-tip="Data integrity counters are clean.">ⓘ</span></div>
+      </div>
+      <div class="mini">Created: <span class="muted">2026-03-22T10:19:10Z</span></div>
+      <div class="mini" data-k="alerts">Quick issues: ❌ abandoned chunks</div>
+    </div>
+
+    <div class="nav jobActionNav" style="margin-top:0">
+      <a class="btn secondary" href="/job/83b5cd63007e">Open</a>
+      <button class="btn secondary" type="button" data-action="pause" disabled>⏸ Pause</button>
+      <button class="btn secondary" type="button" data-action="resume" disabled>▶ Resume</button>
+      <button class="btn danger" type="button" data-action="stop" disabled>⛔ Stop</button>
+      <button class="btn danger" type="button" data-action="delete">🗑 Delete</button>
+    </div>
+  </div>
+
+  <div class="kpiWrap">
+    <div class="kpiRow">
+      <div class="kpiCell kpi-sent"><div class="k">Sent</div><div class="v"><span data-k="sent">0</span></div></div>
+      <div class="kpiCell"><div class="k">Pending</div><div class="v"><span data-k="pending">0</span><span class="kpiWarn" data-k="pendingWarn" style="display:none" title="Pending was clamped to 0 because Sent is lower than PMTA outcomes.">⚠</span></div></div>
+      <div class="kpiCell kpi-del"><div class="k">Del</div><div class="v"><span data-k="delivered">0</span></div></div>
+      <div class="kpiCell kpi-bnc"><div class="k">Bnc</div><div class="v"><span data-k="bounced">0</span></div></div>
+      <div class="kpiCell kpi-def"><div class="k">Def</div><div class="v"><span data-k="deferred">0</span></div></div>
+      <div class="kpiCell kpi-cmp"><div class="k">Cmp</div><div class="v"><span data-k="complained">0</span></div></div>
+    </div>
+    <div class="ratesRow">
+      <div class="rateCell"><div class="k">Bounce %</div><div class="v" data-k="rateBounce">—</div></div>
+      <div class="rateCell"><div class="k">Complaint %</div><div class="v" data-k="rateComplaint">—</div></div>
+      <div class="rateCell"><div class="k">Deferred %</div><div class="v" data-k="rateDeferred">—</div></div>
+    </div>
+
+    <div class="panel" id="job-pmta-live" style="margin-top:10px;">
+      <h4>PMTA Live Panel</h4>
+      <div class="pmtaLive" data-k="pmtaLine">
+        <div class="pmtaGrid">
+          <div class="pmtaBox"><div class="pmtaTitle"><span>Spool</span><span class="tag good">rcpt</span></div><div class="pmtaHint">Total recipients/messages currently held by PMTA spool.</div><div class="pmtaRow"><span class="pmtaKey">RCPT</span><span class="pmtaVal good pmtaBig">—</span></div><div class="pmtaRow"><span class="pmtaKey">MSG</span><span class="pmtaVal good">—</span></div></div>
+          <div class="pmtaBox"><div class="pmtaTitle"><span>Queue</span><span class="tag good">rcpt</span></div><div class="pmtaHint">Recipients/messages still queued to be delivered.</div><div class="pmtaRow"><span class="pmtaKey">RCPT</span><span class="pmtaVal good pmtaBig">—</span></div><div class="pmtaRow"><span class="pmtaKey">MSG</span><span class="pmtaVal good">—</span></div></div>
+          <div class="pmtaBox"><div class="pmtaTitle"><span>Connections</span></div><div class="pmtaHint">Live SMTP sessions used for inbound/outbound traffic.</div><div class="pmtaRow"><span class="pmtaKey">SMTP In</span><span class="pmtaVal good pmtaBig">—</span></div><div class="pmtaRow"><span class="pmtaKey">SMTP Out</span><span class="pmtaVal good pmtaBig">—</span></div><div class="pmtaRow"><span class="pmtaKey">Total</span><span class="pmtaVal good">—</span></div></div>
+          <div class="pmtaBox"><div class="pmtaTitle"><span>Last minute</span></div><div class="pmtaHint">Recent PMTA throughput over the last 60 seconds.</div><div class="pmtaRow"><span class="pmtaKey">In</span><span class="pmtaVal warn pmtaBig">—</span></div><div class="pmtaRow"><span class="pmtaKey">Out</span><span class="pmtaVal warn pmtaBig">—</span></div><div class="pmtaSub">traffic recipients / minute</div></div>
+          <div class="pmtaBox"><div class="pmtaTitle"><span>Last hour</span></div><div class="pmtaHint">Rolling traffic totals for the previous 60 minutes.</div><div class="pmtaRow"><span class="pmtaKey">In</span><span class="pmtaVal warn pmtaBig">—</span></div><div class="pmtaRow"><span class="pmtaKey">Out</span><span class="pmtaVal warn pmtaBig">—</span></div><div class="pmtaSub">traffic recipients / hour</div></div>
+          <div class="pmtaBox"><div class="pmtaTitle"><span>Top queues</span></div><div class="pmtaHint">Queues with the highest recipient backlog and latest queue errors.</div><div class="pmtaSub">0=0</div></div>
+          <div class="pmtaBox"><div class="pmtaTitle"><span>Time</span></div><div class="pmtaHint">Timestamp of the latest PMTA snapshot used for this panel.</div><div class="pmtaSub">2026-03-22T10:19:41Z</div></div>
+        </div>
+      </div>
+      <div class="mini" style="margin-top:6px" data-k="pmtaNote">Note: <b>sent</b> = accepted by PMTA (client-side). Delivery may still be queued/deferred.</div>
+      <div class="chunkMeta" style="margin-top:6px" data-k="pmtaDiag"><span class="chunkMetaPill">Diag: —</span></div>
+      <div class="mini" style="margin-top:8px"><b>Error summary</b></div>
+      <div class="mini errorSummaryBox" data-k="pmtaErrorSummary" style="display: none;"></div>
+    </div>
+
+    <details class="qualityMini">
+      <summary>Quality</summary>
+      <div class="qualityLine">Final-fail: <span data-k="failed">0</span> · Skipped: <span data-k="skipped">0</span> · Invalid: <span data-k="invalid">0</span> · Total: <span data-k="total">1</span></div>
+    </details>
+  </div>
+
+  <div class="bars">
+    <div class="panel">
+      <h4>Progress</h4>
+      <div class="mini" data-k="progressText">Send progress: 0% (0/1)</div>
+      <div class="bar"><div data-k="barSend" style="width: 0%;"></div></div>
+      <div class="mini" style="margin-top:8px" data-k="chunksText">Chunks: 1/1 done · backoff_events=0 · abandoned=1</div>
+      <div class="mini" data-k="attemptsText" style="display:none">—</div>
+      <div class="bar"><div data-k="barChunks" style="width: 100%;"></div></div>
+      <div class="mini" style="margin-top:8px" data-k="domainsText">Domains: 0% (0/1)</div>
+      <div class="bar"><div data-k="barDomains" style="width: 0%;"></div></div>
+    </div>
+  </div>
+
+  <div class="quickIssues" data-k="quickIssues">Quick issues: ❌ abandoned chunks</div>
+
+  <details class="more" open>
+    <summary>More details</summary>
+    <div class="moreBlock twoCol">
+      <div class="panel">
+        <h4>Current chunk</h4>
+        <div class="mini">Current send settings + top active domains in this running chunk.</div>
+        <div class="mini" data-k="chunkLine"><div class="mini">—</div></div>
+        <div class="mini" data-k="chunkDomains"><div class="mini chunkNote chunkNoteDomains">🔥 Top active domains: —</div></div>
+      </div>
+      <div class="panel">
+        <h4>Backoff</h4>
+        <div class="mini">Latest retry event when PMTA/provider pressure slows delivery.</div>
+        <div class="mini" data-k="backoffLine">—</div>
+      </div>
+    </div>
+
+    <div class="panel moreBlock" id="job-outcomes">
+      <h4>Outcomes (PMTA accounting)</h4>
+      <div class="outcomesWrap" data-k="outcomes">
+        <div class="outcomesGrid">
+          <div class="outChip del"><span class="k">Delivered</span><span class="v">0</span></div>
+          <div class="outChip bnc"><span class="k">Bounced</span><span class="v">0</span></div>
+          <div class="outChip def"><span class="k">Deferred</span><span class="v">0</span></div>
+          <div class="outChip cmp"><span class="k">Complained</span><span class="v">0</span></div>
+        </div>
+        <div class="outMeta">Pending (sent - final outcomes): <b>0</b> · PMTA queue now: <b>0</b></div>
+        <div class="outMeta">Last accounting update: —</div>
+      </div>
+      <div class="outTrend" data-k="outcomeTrend">Trend · —</div>
+    </div>
+
+    <div class="moreGrid moreBlock">
+      <div class="panel" id="job-providers">
+        <h4 data-k="domainsPanelTitle">Top providers</h4>
+        <div class="mini" data-k="topDomains">Gmail: <b>0</b> · Yahoo: <b>0</b> · Outlook: <b>0</b> · iCloud: <b>0</b> · Other: <b>1</b></div>
+        <div class="mini" style="margin-top: 10px; display: none;"><b>Domain progress (bars)</b></div>
+        <div data-k="topDomainsBars"><div style="margin-top:10px"><div class="mini"><b>Gmail</b> · 0</div><div class="smallBar"><div style="width:0%"></div></div></div><div style="margin-top:10px"><div class="mini"><b>Yahoo</b> · 0</div><div class="smallBar"><div style="width:0%"></div></div></div><div style="margin-top:10px"><div class="mini"><b>Outlook</b> · 0</div><div class="smallBar"><div style="width:0%"></div></div></div><div style="margin-top:10px"><div class="mini"><b>iCloud</b> · 0</div><div class="smallBar"><div style="width:0%"></div></div></div><div style="margin-top:10px"><div class="mini"><b>Other</b> · 1</div><div class="smallBar"><div style="width:100%"></div></div></div></div>
+      </div>
+
+      <div class="panel">
+        <h4 class="sopHeader">📌 System / Provider / Integrity</h4>
+
+        <div class="sopBlock">
+          <div class="sopLabel system">🖥️ System / Internal</div>
+          <div class="sopLine" data-k="systemSummary">🔗 Bridge failures: <b>0</b> · ⏱️ Last bridge success: <b>0m ago</b> · ⚙️ Runtime internal errors: <b>0</b> · 💾 DB write failures: <b>0</b></div>
+          <details class="errorFold">
+            <summary>View details</summary>
+            <div class="mini" style="margin-top:8px" data-k="systemDetails">—</div>
+          </details>
+        </div>
+
+        <div class="sopBlock">
+          <div class="sopLabel provider">📬 Provider / Deliverability</div>
+          <div class="sopLine" data-k="providerSummary">✅ Delivered: <b>0</b> (—) · ⏳ Deferred: <b>0</b> (—) · ❌ Bounced: <b>0</b> (—) · 📢 Complained: <b>0</b> (—)</div>
+          <div class="sopLine" style="margin-top:6px" data-k="providerBreakdown">🌐 Provider/domain breakdown: —</div>
+          <div class="sopLine" style="margin-top:6px" data-k="providerReasons">🧠 Top reason buckets: —</div>
+          <details class="errorFold">
+            <summary>View details</summary>
+            <div class="mini" style="margin-top:8px" data-k="providerDetails">—</div>
+          </details>
+        </div>
+
+        <div class="sopBlock">
+          <div class="sopLabel integrity">🗂️ Data Integrity / Mapping</div>
+          <div class="sopLine" data-k="integritySummary">♻️ duplicates_dropped: <b>0</b> · 🔎 job_not_found: <b>0</b> · 🧾 missing_fields: <b>0</b> · 💽 db_write_failures: <b>0</b></div>
+          <details class="errorFold">
+            <summary>View details</summary>
+            <div class="mini" style="margin-top:8px" data-k="integrityDetails">—</div>
+          </details>
+        </div>
+
+        <div class="legacyDiagnosticsBox">
+          <div class="legacyDiagnosticsTitle">📄 Legacy quality + errors (unchanged data)</div>
+          <div class="legacySectionLabel">📊 Quality counters</div>
+          <div class="mini legacyDataLine" data-k="counters">safe_total=0 · safe_invalid=0 · invalid_filtered=0 · skipped=0 · backoff_events=0 · abandoned_chunks=1 · paused=no · stop_requested=no</div>
+          <div class="legacySectionLabel">🚨 Error type</div>
+          <div class="mini legacyDataLine" data-k="errorTypes">—</div>
+          <div class="legacySectionLabel">⚠️ Error summary</div>
+          <div class="mini legacyDataLine" data-k="lastErrors">—</div>
+          <div class="mini legacyDataLine" data-k="lastErrors2">—</div>
+          <div class="mini legacyDataLine" data-k="internalErrors">—</div>
+        </div>
+        <div class="bridgeSnapshotBox">
+          <div class="legacySectionLabel" style="margin-top:0">🌉 Data source: Bridge snapshot</div>
+          <div class="mini legacyDataLine" style="margin-top:8px" data-k="bridgeReceiver">Data source: <b>Bridge snapshot</b><br>Last poll success: <b>2026-03-22T11:55:02Z (2m ago)</b><br>Last accounting update: <b>—</b></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" id="job-chunk-preflight" style="margin-top:10px">
+      <h4>Chunk preflight</h4>
+      <div class="mini" style="margin-top:6px"><b>Active / Live chunk</b></div>
+      <div style="overflow:auto; margin-top:8px">
+        <table>
+          <thead>
+            <tr>
+              <th>Chunk</th>
+              <th>Status</th>
+              <th>Size</th>
+              <th>Sender mail</th>
+              <th>Receiver domain</th>
+              <th>Spam</th>
+              <th>Blacklist</th>
+            </tr>
+          </thead>
+          <tbody data-k="chunkLive"><tr><td colspan="7" class="mini">No active chunk right now.</td></tr></tbody>
+        </table>
+      </div>
+
+      <div class="mini" style="margin-top:10px"><b>History chunk (last 12)</b></div>
+      <div style="overflow:auto; margin-top:8px">
+        <table>
+          <thead>
+            <tr>
+              <th>Chunk</th>
+              <th>Status</th>
+              <th>Size</th>
+              <th>Sender mail</th>
+              <th>Receiver domain</th>
+              <th>Spam</th>
+              <th>Blacklist</th>
+              <th>Attempt</th>
+              <th>Next retry</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody data-k="chunkHist"><tr><td>2</td><td>abandoned</td><td>1</td><td title="welcome@101crossroadsstudio.com">welcome@101crossroadsstudio.co…</td><td>srv1.mail-tester.com</td><td>-1.90</td><td title="domain:101crossroadsstudio.com=&gt;dbl.spamhaus.org">domain:101crossroadsstudio.com…</td><td><b>0</b></td><td><span title="">—</span></td><td title="preflight_blocked: blacklist">preflight_blocked: blacklist</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </details>
+</div>
+"""
+
 
 def build_live_snapshot() -> dict:
     snapshot = copy.deepcopy(DASHBOARD_DATA)
@@ -1564,9 +1803,56 @@ PAGE = r"""
     .inline-status{ margin-top: 10px; padding: 10px 12px; border-radius: 14px; border: 1px solid rgba(255,255,255,.14); background: rgba(0,0,0,.12); color: var(--muted); font-size: 12px; line-height: 1.6; display:none; }
     .inline-status.show{ display:block; }
     .inline-status b{ color: rgba(255,255,255,.88); }
-    @media (max-width: 1200px){ .grid.kpis{grid-template-columns:repeat(2,minmax(0,1fr))} .grid.two,.grid.send-layout,.split,.telemetryRow{grid-template-columns:1fr} }
+    .sectionNav{display:flex; gap:10px; flex-wrap:wrap; margin:14px 0 18px}
+    .sectionNav a{display:inline-flex; align-items:center; gap:8px; padding:10px 12px; border-radius:999px; border:1px solid rgba(255,255,255,.14); background:rgba(255,255,255,.05)}
+    .job{padding:18px; border-radius:22px; border:1px solid var(--border); background:linear-gradient(180deg, rgba(9,16,28,.92), rgba(11,24,38,.84)); box-shadow:var(--shadow)}
+    .jobTop{display:flex; justify-content:space-between; gap:16px; flex-wrap:wrap}
+    .titleRow,.triageRow,.kpiRow,.ratesRow,.outcomesGrid,.pmtaGrid,.moreGrid{display:grid; gap:10px}
+    .titleRow{grid-template-columns:repeat(auto-fit,minmax(120px,max-content)); align-items:center}
+    .triageRow{grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); margin-top:12px}
+    .triageBadge,.chunkMetaPill,.outChip,.pmtaBox,.rateCell,.kpiCell,.sopBlock,.legacyDiagnosticsBox,.bridgeSnapshotBox{border:1px solid rgba(255,255,255,.12); background:rgba(255,255,255,.05); border-radius:16px}
+    .triageBadge{display:flex; align-items:center; gap:8px; padding:10px 12px; color:var(--muted)}
+    .triageBadge.good{border-color:rgba(53,228,154,.3); color:var(--good)}
+    .triageBadge.bad{border-color:rgba(255,94,115,.3); color:var(--bad)}
+    .statusDot{width:10px; height:10px; border-radius:999px; display:inline-block; background:currentColor}
+    .badgeLabel{font-weight:700}
+    .tip{cursor:help; opacity:.8}
+    .jobActionNav{align-self:flex-start}
+    .kpiWrap,.bars,.quickIssues,.moreBlock{margin-top:14px}
+    .kpiRow{grid-template-columns:repeat(auto-fit,minmax(120px,1fr))}
+    .ratesRow{grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); margin-top:10px}
+    .kpiCell,.rateCell,.outChip{padding:12px}
+    .kpiCell .k,.rateCell .k,.outChip .k,.pmtaKey,.pmtaHint,.pmtaSub,.sopLine,.legacyDataLine{color:var(--muted); font-size:12px}
+    .kpiCell .v,.rateCell .v,.outChip .v{font-size:24px; font-weight:900; margin-top:6px}
+    .kpi-del .v,.outChip.del .v,.pmtaVal.good{color:var(--good)}
+    .kpi-bnc .v,.outChip.bnc .v,.bridgeConnBadge.bad{color:var(--bad)}
+    .kpi-def .v,.outChip.def .v,.pmtaVal.warn{color:var(--warn)}
+    .kpi-cmp .v,.outChip.cmp .v{color:#ff97cf}
+    .kpi-sent .v{color:var(--accent)}
+    .kpiWarn{margin-left:6px; color:var(--warn)}
+    .panel{padding:16px; border-radius:18px; border:1px solid rgba(255,255,255,.12); background:rgba(255,255,255,.04)}
+    .pmtaGrid{grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); margin-top:12px}
+    .pmtaBox{padding:12px}
+    .pmtaTitle{display:flex; justify-content:space-between; gap:8px; align-items:center; font-weight:800}
+    .pmtaRow{display:flex; justify-content:space-between; gap:8px; margin-top:10px}
+    .pmtaBig{font-size:22px; font-weight:900}
+    .qualityMini{margin-top:12px}
+    .qualityLine,.outMeta,.outTrend{margin-top:10px; color:var(--muted); font-size:12px}
+    .quickIssues{padding:12px 14px; border:1px solid rgba(255,94,115,.25); background:rgba(255,94,115,.08); border-radius:14px; color:#ffd8df}
+    .more summary,.errorFold summary,.qualityMini summary{cursor:pointer; font-weight:800}
+    .twoCol{display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px}
+    .outcomesGrid{grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); margin-top:12px}
+    .moreGrid{grid-template-columns:minmax(260px,.9fr) minmax(320px,1.1fr)}
+    .sopHeader{margin-bottom:12px}
+    .sopBlock,.legacyDiagnosticsBox,.bridgeSnapshotBox{padding:12px; margin-top:12px}
+    .sopLabel,.legacyDiagnosticsTitle,.legacySectionLabel{font-weight:800; margin-bottom:8px}
+    .sopLabel.system{color:var(--accent)}
+    .sopLabel.provider{color:var(--warn)}
+    .sopLabel.integrity{color:var(--good)}
+    .errorSummaryBox{padding:10px 12px; border-radius:14px; border:1px dashed rgba(255,255,255,.14)}
+    @media (max-width: 1200px){ .grid.kpis{grid-template-columns:repeat(2,minmax(0,1fr))} .grid.two,.grid.send-layout,.split,.telemetryRow,.twoCol,.moreGrid{grid-template-columns:1fr} }
     @media (max-width: 920px){ .shell{grid-template-columns:1fr} .sidebar{position:relative; height:auto; border-right:0; border-bottom:1px solid rgba(255,255,255,.08)} .grid.three{grid-template-columns:1fr} }
-    @media (max-width: 520px){ .row{grid-template-columns: 1fr;} .topActions{ align-items:stretch; width:100%; } .topLinks{ justify-content:flex-start; } .content{padding:18px 14px 24px} }
+    @media (max-width: 520px){ .row{grid-template-columns: 1fr;} .topActions{ align-items:stretch; width:100%; } .topLinks{ justify-content:flex-start; } .content{padding:18px 14px 24px} .sectionNav a{width:100%; justify-content:center} }
   </style>
 </head>
 <body>
@@ -1759,6 +2045,32 @@ def dashboard():
               </div>
             </div>
           </div>
+
+          <div class="grid two" style="margin-top:14px">
+            <div class="card">
+              <h2>Operations snapshot</h2>
+              <div class="grid two" style="margin-top:12px">
+                {% for item in data.ops_snapshot %}
+                <div class="alert {{ item.tone }}" style="margin:0">
+                  <div style="font-weight:800">{{ item.label }}</div>
+                  <div style="font-size:22px; font-weight:900; margin-top:8px">{{ item.value }}</div>
+                  <div class="mini">{{ item.hint }}</div>
+                </div>
+                {% endfor %}
+              </div>
+            </div>
+            <div class="card">
+              <h2>Dashboard fake notes</h2>
+              <div class="statsList" style="margin-top:12px">
+                {% for note in data.dashboard_notes %}
+                <div class="alert {{ note.tone }}" style="margin:0">
+                  <div style="font-weight:800">{{ note.title }}</div>
+                  <div class="mini" style="margin-top:6px">{{ note.body }}</div>
+                </div>
+                {% endfor %}
+              </div>
+            </div>
+          </div>
         </div>
         """,
         data=DASHBOARD_DATA,
@@ -1820,49 +2132,24 @@ def jobs_page():
         <div class="top">
           <div>
             <h1 class="title">Jobs board</h1>
-            <div class="subtitle">Simulated jobs list with risk labels, provider grouping, progress bars, and outcomes overview.</div>
+            <div class="subtitle">Navigation button now opens the full static job layout exactly inside the Jobs surface, with a local section navigation bar on top.</div>
           </div>
           <div class="actions">
-            <button>🔄 Refresh</button>
+            <a class="btn" href="#job-overview">Open job layout</a>
             <button class="secondary">🎛️ Filters</button>
           </div>
         </div>
-        <div class="grid">
-          {% for job in jobs %}
-          <div class="card">
-            <div style="display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap">
-              <div>
-                <h3>Job <code>{{ job.id }}</code></h3>
-                <div class="mini">Campaign: {{ job.campaign_id }} · Created: {{ job.created_at }} · Updated: {{ job.updated_at }}</div>
-              </div>
-              <div style="display:flex; gap:8px; flex-wrap:wrap">
-                <span class="tag {{ 'good' if job.status == 'running' else ('warn' if job.status in ['backoff','paused'] else 'accent') }}">{{ job.status }}</span>
-                <span class="tag accent">{{ job.bridge_mode }}</span>
-                <span class="tag {{ 'bad' if job.risk != 'none' else 'good' }}">{{ job.risk }}</span>
-                <span class="tag">{{ job.provider }}</span>
-              </div>
-            </div>
-            <div class="grid three" style="margin-top:12px">
-              <div><div class="mini">Delivered</div><div style="font-size:24px; font-weight:900; color:var(--good)">{{ '{:,}'.format(job.delivered) }}</div></div>
-              <div><div class="mini">Deferred</div><div style="font-size:24px; font-weight:900; color:var(--warn)">{{ '{:,}'.format(job.deferred) }}</div></div>
-              <div><div class="mini">Queued</div><div style="font-size:24px; font-weight:900; color:var(--accent)">{{ '{:,}'.format(job.queued) }}</div></div>
-            </div>
-            <div class="progressLine">
-              <div style="display:flex; justify-content:space-between; gap:8px; margin-bottom:6px"><span>Progress</span><b>{{ job.progress }}%</b></div>
-              <div class="bar"><div style="width:{{ job.progress }}%"></div></div>
-            </div>
-            <div class="mini" style="margin-top:10px">Top domains: {{ job.top_domains|join(', ') }}</div>
-            <div class="actions" style="margin-top:12px">
-              <a class="btn" href="{{ url_for('job_page', job_id=job.id) }}">View details</a>
-              <button class="secondary">Pause</button>
-              <button class="secondary">Resume</button>
-              <button class="secondary">Stop</button>
-            </div>
-          </div>
+
+        <div class="sectionNav">
+          {% for item in nav_items %}
+          <a href="{{ item.href }}">{{ item.label }}</a>
           {% endfor %}
         </div>
+
+        {{ job_markup|safe }}
         """,
-        jobs=JOBS,
+        nav_items=JOBS_NAV_ITEMS,
+        job_markup=JOBS_SHOWCASE_HTML,
     )
     return render("jobs", "Shivamini Jobs", body)
 
