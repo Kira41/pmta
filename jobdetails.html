@@ -1,0 +1,550 @@
+<html lang="en"><head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Job 83b5cd63007e</title>
+  <style>
+    :root{
+      --bg:#0b1020; --card: rgba(255,255,255,.06); --border: rgba(255,255,255,.14);
+      --text:#fff; --muted: rgba(255,255,255,.65);
+      --good:#35e49a; --bad:#ff5e73; --warn:#ffc14d; --accent:#7aa7ff;
+    }
+    body{font-family:system-ui; margin:0; background:var(--bg); color:var(--text);}
+    .wrap{max-width: 1100px; margin: 0 auto; padding: 18px 14px;}
+    a{color:var(--accent); text-decoration:none}
+    .card{background:var(--card); border:1px solid var(--border); border-radius:14px; padding:14px; margin-bottom:12px;}
+    .muted{color:var(--muted)}
+    .row{display:flex; gap:12px; flex-wrap:wrap; align-items:center}
+    code{background:rgba(255,255,255,.08); padding:2px 6px; border-radius:8px;}
+    .bar{height: 12px; background: rgba(255,255,255,.10); border:1px solid rgba(255,255,255,.14); border-radius:999px; overflow:hidden;}
+    .bar > div{height:100%; width:0%; background: rgba(122,167,255,.65);}
+    table{width:100%; border-collapse:collapse; font-size: 13px;}
+    th,td{padding:8px; border-bottom:1px solid rgba(255,255,255,.10); text-align:left; vertical-align:top}
+    .ok{color:var(--good); font-weight:800}
+    .no{color:var(--bad); font-weight:800}
+    .pill{padding:6px 10px; border-radius:999px; border:1px solid rgba(255,255,255,.14); background:rgba(255,255,255,.06);}
+
+    .nav{display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:8px}
+    .nav form{display:inline; margin:0;}
+    .navBtn{
+      display:inline-flex; align-items:center; gap:8px;
+      padding:8px 10px;
+      border:1px solid rgba(255,255,255,.14);
+      background: rgba(255,255,255,.06);
+      border-radius: 12px;
+      color: rgba(255,255,255,.92);
+      cursor:pointer;
+      font: inherit;
+      text-decoration:none;
+    }
+    .navBtn:hover{filter:brightness(1.06)}
+    .navBtn.primary{ background: rgba(122,167,255,.14); font-weight:800; }
+
+    .nav a, .nav button{
+      display:inline-flex; align-items:center; gap:8px;
+      padding:8px 10px;
+      border:1px solid rgba(255,255,255,.14);
+      background: rgba(255,255,255,.06);
+      border-radius: 12px;
+      cursor:pointer;
+      font: inherit;
+      color: rgba(255,255,255,.92);
+    }
+    .nav a:hover{filter:brightness(1.06)}
+
+    .smallBar{height:8px; border-radius:999px; background:rgba(255,255,255,.10); border:1px solid rgba(255,255,255,.12); overflow:hidden}
+    .smallBar > div{height:100%; width:0%; background: rgba(53,228,154,.55);}
+
+    .titleTip{display:inline-flex; align-items:center; gap:6px}
+    .tip{display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; border-radius:999px;
+      border:1px solid rgba(255,255,255,.18); background: rgba(0,0,0,.18); color: rgba(255,255,255,.86);
+      font-size: 12px; cursor: help; position: relative; user-select:none}
+    .tip:hover::after{
+      content: attr(data-tip);
+      position: absolute;
+      left: 0;
+      top: 24px;
+      min-width: 240px;
+      max-width: 420px;
+      background: rgba(0,0,0,.72);
+      border: 1px solid rgba(255,255,255,.18);
+      box-shadow: 0 18px 55px rgba(0,0,0,.35);
+      color: rgba(255,255,255,.92);
+      padding: 10px 12px;
+      border-radius: 14px;
+      z-index: 999;
+      white-space: normal;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="row" style="justify-content:space-between; margin-bottom:12px;">
+      <div>
+        <h2 style="margin:0">Job <code>83b5cd63007e</code></h2>
+        <div class="nav">
+          
+            <form method="get" action="/campaign/abac50d078ae">
+              <button class="navBtn primary" type="submit">← Back to Campaign</button>
+            </form>
+            <a class="navBtn" href="/jobs?c=abac50d078ae">📄 Jobs</a>
+            <a class="navBtn" href="/campaigns">📌 Campaigns</a>
+          
+        </div>
+      </div>
+      <div class="pill" id="statusPill">Status: error</div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <div><b>Total:</b> <span id="total">1</span></div>
+        <div><b>Sent:</b> <span id="sent" class="ok">0</span></div>
+        <div><b>Failed:</b> <span id="failed" class="no">0</span></div>
+        <div><b>Skipped:</b> <span id="skipped">0</span></div>
+        <div><b>Invalid:</b> <span id="invalid">0</span></div>
+      </div>
+      <div style="margin-top:10px" class="bar"><div id="barFill" style="width: 0%;"></div></div>
+      <div class="muted" style="margin-top:10px" id="lastError">Last error: Acceptance self-check (v2/end) failed: acceptance[end] recipients coverage mismatch assigned=0 expected=1</div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin:0 0 10px">Domain State (live)</h3>
+      <div class="muted" style="margin-bottom:8px">Per recipient domain: sent/failed out of planned total.</div>
+      <div class="bar"><div id="domBarFill" style="width: 0%;"></div></div>
+      <div class="muted" style="margin-top:10px" id="domBarText">Domains progress: 0% (0/1)</div>
+      <div style="overflow:auto; margin-top:10px">
+        <table>
+          <thead>
+            <tr>
+              <th>Domain</th>
+              <th>Planned</th>
+              <th>Sent</th>
+              <th>Failed</th>
+              <th style="min-width:180px">Progress</th>
+            </tr>
+          </thead>
+          <tbody id="domState"><tr><td>srv1.mail-tester.com</td><td>1</td><td class="ok">0</td><td class="no">0</td><td><div class="smallBar"><div style="width:0%"></div></div><div class="muted" style="font-size:12px; margin-top:4px">0/1 (0%)</div></td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin:0 0 10px">Chunks &amp; Backoff</h3>
+      <div class="muted" id="chunkMeta">chunks_done=1 · chunks_total≈1 · backoff_events=0 · active_chunks=0 · active_backoff=0 · current_chunk(supplemental)=-1</div>
+      <div style="overflow:auto; margin-top:10px">
+        <table>
+          <thead>
+            <tr>
+              <th>Chunk</th>
+              <th>Status</th>
+              <th>Size</th>
+              <th>Sender</th>
+              <th>Spam</th>
+              <th>Blacklist</th>
+              <th>Attempt</th>
+              <th>Next retry</th>
+            </tr>
+          </thead>
+          <tbody id="chunkTbl"><tr><td>2</td><td>abandoned</td><td>1</td><td>welcome@101crossroadsstudio.com</td><td>-1.90</td><td title="domain:101crossroadsstudio.com=&gt;dbl.spamhaus.org">domain:101crossroadsstudio.com=&gt;dbl.spam…</td><td>0</td><td></td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin:0 0 10px" class="titleTip">Recent Results <span class="tip" data-tip="Browse job results in pages. Use Prev/Next to navigate the latest processed recipients.">ⓘ</span></h3>
+      <div class="row" style="margin-bottom:8px; align-items:center; gap:8px; flex-wrap:wrap">
+        <button class="navBtn" id="downloadDeliveredBtn" type="button" title="Download recipients that reached delivered status">📥 Delivered CSV</button>
+        <button class="navBtn" id="downloadPendingBtn" type="button" title="Download recipients still pending and not assigned to any chunk yet">⏳ Queue CSV</button>
+        <button class="navBtn" id="downloadFailedBtn" type="button" title="Download recipients that ended in bounce/deferred/complained outcomes">🚫 Failed CSV</button>
+      </div>
+      <div class="row" style="margin-bottom:8px; align-items:center; gap:8px">
+        <button class="navBtn" id="resultsPrevBtn" type="button" disabled="">← Prev</button>
+        <button class="navBtn" id="resultsNextBtn" type="button" disabled="">Next →</button>
+        <span class="muted" id="resultsPageMeta">Page 1 / 1 · 100 emails per page</span>
+      </div>
+      <div style="overflow:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Email</th>
+              <th>OK</th>
+              <th>Detail</th>
+            </tr>
+          </thead>
+          <tbody id="results"><tr><td colspan="4" class="muted">No results yet...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card" id="schedulerTelemetryCard" style="display:none;">
+      <details open="">
+        <summary style="cursor:pointer; font-weight:700; margin-bottom:8px">Scheduler + Lanes Telemetry</summary>
+        <div class="muted" id="telemetryHeader">—</div>
+        <div class="muted" id="telemetryExecutionModel" style="margin-top:6px">—</div>
+        <div class="muted" id="telemetryParallelSummary" style="margin-top:6px">—</div>
+        <div style="margin-top:8px" id="telemetryProviderGroups" class="muted"></div>
+
+        <div style="margin-top:10px">
+          <h4 style="margin:0 0 8px">Parallel Sender Lanes</h4>
+          <div class="muted" id="parallelLanesStats">—</div>
+          <div style="overflow:auto; max-height:320px; margin-top:8px">
+            <table>
+              <thead>
+                <tr>
+                  <th>Lane</th>
+                  <th>Sender</th>
+                  <th>Provider</th>
+                  <th>Chunk</th>
+                  <th>Status</th>
+                  <th>Lane state</th>
+                  <th>Processed</th>
+                  <th>Success</th>
+                  <th>Temp fail</th>
+                  <th>Hard fail</th>
+                  <th>Workers</th>
+                  <th>Started / Updated / Finished</th>
+                </tr>
+              </thead>
+              <tbody id="parallelLanesTable"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div style="overflow:auto; max-height:260px; margin-top:12px">
+          <table>
+            <thead>
+              <tr>
+                <th>Lane + Provider</th>
+                <th>State</th>
+                <th>Def/HF/TO</th>
+                <th>Next allowed</th>
+                <th>Inflight</th>
+                <th>Last reason/error</th>
+                <th>Suggested caps</th>
+              </tr>
+            </thead>
+            <tbody id="telemetryLanes"></tbody>
+          </table>
+        </div>
+        <div style="margin-top:10px" class="muted" id="telemetryEvents">—</div>
+      </details>
+    </div>
+
+    <div class="card">
+      <h3 style="margin:0 0 10px">Logs (last 80)</h3>
+      <div id="logs" class="muted" style="white-space:pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px">[2026-03-22T10:19:36Z] INFO: Recipient filter applied: checks=syntax+mx_or_a kept=1 dropped=0 smtp_probe=1/25; safe_kept=0 safe_dropped=0
+[2026-03-22T10:19:36Z] INFO: PMTA monitor: ok=True busy=False reason=ok status_url=root@209.46.123.49:22 spool_rcpt=None spool_msg=None queued_rcpt=None queued_msg=None
+[2026-03-22T10:19:36Z] INFO: Accepted 1 valid recipients, 0 invalid recipients filtered, deduplicated=0.
+[2026-03-22T10:19:36Z] INFO: Safe maillist OFF: safe_invalid=0.
+[2026-03-22T10:19:36Z] INFO: Spam score BEFORE send: score=-1.9 limit=4.0
+[2026-03-22T10:19:36Z] INFO: Spam detail (truncated): backend=spamcheck-module
+ pts rule                   description                                       
+---- ---------------------- --------------------------------------------------
+-1.9 BAYES_00               BODY: Bayes spam probability is 0 to 1% [score:   
+                            0.0013]                                           
+-0.0 NO_RELAYS              Informational: message was not relayed via SMTP   
+-0.0 NO_RECEIVED            Informational: message has no Received headers    
+[2026-03-22T10:19:36Z] INFO: Domain States scope: sender domains used for sending (from-address domains), not recipient domains.
+[2026-03-22T10:19:36Z] INFO: Sender-domain precheck: domains=1 listed=1 spf_pass=1 dmarc_pass=1 dkim_pass=1.
+[2026-03-22T10:19:36Z] INFO: Sender inputs: names=1 emails_valid=1 emails_invalid=0 subjects=1. Sending mode: provider-aware round-robin chunks (one recipient-domain chunk -&gt; one sender email/IP rotation).
+[2026-03-22T10:19:36Z] INFO: Chunk controls: chunk_size=50 workers=5 sleep_between_chunks=0.0s delay_between_messages=0.0s
+[2026-03-22T10:19:36Z] INFO: Recipient indexing initialized: total=1 status=not_yet.
+[2026-03-22T10:19:36Z] INFO: Starting job. total=1 host=209.46.123.49:2525 security=none chunk_size=50 workers=5 sleep_chunks=0.0s
+[2026-03-22T10:19:41Z] INFO: v2 bypass: fallback controller heuristics disabled
+[2026-03-22T10:19:41Z] INFO: Scheduler startup: scheduler_mode=v2 effective_parallel=0 max_parallel_lanes=5 sender_count=1
+[2026-03-22T10:19:41Z] INFO: Job start summary: mode=v2 sender_count=1 created_lanes=1 parallel_cap=5 recipients_total=1 provider_domains=['srv1.mail-tester.com']
+[2026-03-22T10:19:41Z] INFO: Scheduler mode=v2 (legacy=sequential pipeline, v2=parallel sender-driven pipeline)
+[2026-03-22T10:19:41Z] INFO: Recipient partition stats: valid=1 invalid=0 deduplicated=0 totals_match=True domain_spread_ok=True
+[2026-03-22T10:19:41Z] INFO: Per-sender totals: {'welcome@101crossroadsstudio.com': 1}
+[2026-03-22T10:19:41Z] INFO: Per-sender per-domain counts: {'welcome@101crossroadsstudio.com': {'srv1.mail-tester.com': 1}}
+[2026-03-22T10:19:41Z] INFO: Prepared dynamic chunks (initial chunk_size=50).
+[2026-03-22T10:19:41Z] INFO: Acceptance self-check (v2/start) passed.
+[2026-03-22T10:19:41Z] INFO: v2 sender-driven parallel execution: lanes=1 workers=1 configured_limit=5
+[2026-03-22T10:19:41Z] INFO: lane transition lane=0|srv1.mail-tester.com status=queued state=created sender=welcome@101crossroadsstudio.com provider=srv1.mail-tester.com chunks_total=1
+[2026-03-22T10:19:41Z] INFO: lane assigned for sender welcome@101crossroadsstudio.com: providers=['srv1.mail-tester.com'] chunks_pending=1
+[2026-03-22T10:19:41Z] INFO: lane start sender=welcome@101crossroadsstudio.com sender_idx=0
+[2026-03-22T10:19:41Z] INFO: lane transition lane=0|srv1.mail-tester.com status=running state=processing chunk=1 chunk_id=0|srv1.mail-tester.com#chunk-1 workers=5
+[2026-03-22T10:19:55Z] WARN: Chunk 2 [srv1.mail-tester.com]: abandoned at preflight (preflight_blocked: blacklist)
+[2026-03-22T10:19:55Z] INFO: lane transition lane=0|srv1.mail-tester.com status=done state=completed processed=1
+[2026-03-22T10:19:55Z] INFO: lane finish sender=welcome@101crossroadsstudio.com sender_idx=0 chunks_done=1 temp_fail_chunks=0 hard_fail_chunks=0
+[2026-03-22T10:19:55Z] INFO: Job end summary: lanes_completed=1 lanes_failed=0 total_sent=0 total_temp_fails=0 total_hard_fails=0 total_duration_s=19.23
+[2026-03-22T10:19:55Z] ERROR: Acceptance self-check (v2/end) failed: acceptance[end] recipients coverage mismatch assigned=0 expected=1
+[2026-03-22T10:19:55Z] INFO: Job finished.</div>
+    </div>
+  </div>
+
+<script>
+  const jobId = "83b5cd63007e";
+  const RESULTS_PAGE_SIZE = 100;
+  let resultsPage = 1;
+  let resultsTotalPages = 1;
+  function esc(s){ return (s ?? "").toString().replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;"); }
+
+  function pct(n,d){
+    const nn = Number(n||0), dd = Number(d||0);
+    return dd ? Math.min(100, Math.round((nn/dd)*100)) : 0;
+  }
+
+  function fmtRate(v){ return (Number(v||0) * 100).toFixed(1) + '%'; }
+
+  function renderSchedulerTelemetry(t){
+    const card = document.getElementById('schedulerTelemetryCard');
+    if(!card) return;
+    if(!t){ card.style.display = 'none'; return; }
+    card.style.display = '';
+
+    const rollout = t.rollout || {};
+    const scheduler = t.scheduler || {};
+    const fallback = t.fallback || {};
+    const parallel = t.parallel_lanes || {};
+    const summary = scheduler.summary || {};
+    const hdr = `mode=${esc(scheduler.mode || 'legacy')} · rollout=${esc(rollout.effective_mode || 'off')} · concurrency=${scheduler.concurrency_enabled ? 'on' : 'off'} (${Number(scheduler.max_parallel_lanes||1)}) · fallback=${fallback.active ? 'ACTIVE' : 'inactive'}`;
+    const h = document.getElementById('telemetryHeader');
+    if(h) h.textContent = hdr;
+
+    const modelNode = document.getElementById('telemetryExecutionModel');
+    const isParallel = String(parallel.mode || scheduler.mode || 'legacy').toLowerCase() === 'v2';
+    if(modelNode){
+      modelNode.textContent = isParallel
+        ? 'Execution model: v2 parallel sender lanes (multiple lanes/chunks can run together).'
+        : 'Execution model: legacy sequential job (single active pipeline lane).';
+    }
+
+    const sumNode = document.getElementById('telemetryParallelSummary');
+    if(sumNode){
+      sumNode.textContent = `Summary: scheduler_mode=${esc(summary.scheduler_mode || scheduler.mode || 'legacy')} · sender_count=${Number(summary.sender_count || parallel.sender_count || 0)} · active_parallel_lanes=${Number(summary.active_parallel_lanes || parallel.active_parallel_lanes || 0)} · configured_max_lanes=${Number(summary.configured_max_lanes || parallel.configured_max_lanes || 1)}`;
+    }
+
+    const groups = ((t.provider_canonicalization || {}).groups || {});
+    const gtxt = Object.entries(groups).map(([k,v]) => `${k}:${v}`).join(' · ');
+    const gp = document.getElementById('telemetryProviderGroups');
+    if(gp) gp.textContent = gtxt ? (`Provider groups: ${gtxt}`) : 'Provider groups: —';
+
+    const laneCounts = parallel.lane_counts || {};
+    const pStats = document.getElementById('parallelLanesStats');
+    if(pStats){
+      pStats.textContent = `lanes_total=${Number(laneCounts.total||0)} · running=${Number(laneCounts.running||0)} · completed=${Number(laneCounts.completed||0)} · failed=${Number(laneCounts.failed||0)} · sleeping=${Number(laneCounts.sleeping||0)} · queued=${Number(laneCounts.queued||0)} · backoff=${Number(laneCounts.backoff||0)}`;
+    }
+
+    const plTable = document.getElementById('parallelLanesTable');
+    const plRows = (parallel.lanes || []);
+    if(plTable){
+      plTable.innerHTML = plRows.map((ln) => {
+        const chunkIndex = (ln.chunk_index === null || ln.chunk_index === undefined) ? '-' : Number(ln.chunk_index);
+        const chunkId = (ln.chunk_id || '').toString();
+        const totalChunks = Number(ln.chunks_total || 0);
+        const remChunks = Number(ln.chunks_remaining || 0);
+        const chunkTxt = `${chunkIndex} / ${esc(chunkId || '-')}${totalChunks ? ` · remaining=${remChunks}` : ''}`;
+        const workers = Number(ln.current_workers || 0);
+        return `<tr>`+
+          `<td>${esc(ln.lane_id || '')}</td>`+
+          `<td>${esc(ln.sender_email || ('sender#' + Number(ln.sender_idx||0)))}</td>`+
+          `<td>${esc(ln.provider_domain || '')}</td>`+
+          `<td>${chunkTxt}</td>`+
+          `<td>${esc(ln.status || 'queued')}</td>`+
+          `<td>${esc(ln.lane_state || '')}</td>`+
+          `<td>${Number(ln.processed_count || 0)}</td>`+
+          `<td class="ok">${Number(ln.success_count || 0)}</td>`+
+          `<td>${Number(ln.temp_fail_count || 0)}</td>`+
+          `<td class="no">${Number(ln.hard_fail_count || 0)}</td>`+
+          `<td>${workers}${ln.workers_detail ? ` · ${esc(JSON.stringify(ln.workers_detail))}` : ''}</td>`+
+          `<td>${esc(ln.started_at || '-')}<br>${esc(ln.last_update || '-')}<br>${esc(ln.finished_at || '-')}</td>`+
+        `</tr>`;
+      }).join('') || `<tr><td colspan="12" class="muted">No parallel lanes runtime snapshot yet.</td></tr>`;
+    }
+
+    const lanes = (t.lanes || []);
+    const tbody = document.getElementById('telemetryLanes');
+    if(tbody){
+      tbody.innerHTML = lanes.map((ln) => {
+        const next = Number(ln.seconds_remaining || 0) > 0 ? `${Number(ln.seconds_remaining).toFixed(0)}s` : 'now';
+        const err = (ln.last_denial_reason || ln.last_reason || (ln.last_error_samples||[])[0] || '').toString();
+        const laneCaps = ((ln.recommended_caps||{}).lane || {});
+        const learnCaps = ((ln.recommended_caps||{}).learning || {});
+        const compactCaps = `C:${laneCaps.chunk_size_cap ?? '-'} W:${laneCaps.workers_cap ?? '-'} D:${laneCaps.delay_floor ?? '-'} · L:C${learnCaps.chunk_size_cap ?? '-'} W${learnCaps.workers_cap ?? '-'}`;
+        return `<tr>`+
+          `<td>${esc(ln.sender_label || ('sender#' + Number(ln.sender_idx||0)))} · ${esc(ln.provider_domain || '')}</td>`+
+          `<td>${esc(ln.state || 'HEALTHY')}</td>`+
+          `<td>${fmtRate(ln.deferral_rate)} / ${fmtRate(ln.hardfail_rate)} / ${fmtRate(ln.timeout_rate)}</td>`+
+          `<td>${esc(next)}</td>`+
+          `<td>${ln.inflight ? 'yes' : 'no'}</td>`+
+          `<td title="${esc((ln.last_error_samples||[]).join(' | '))}">${esc(err.slice(0, 80))}</td>`+
+          `<td>${esc(compactCaps)}</td>`+
+        `</tr>`;
+      }).join('') || `<tr><td colspan="7" class="muted">No scheduler lanes telemetry.</td></tr>`;
+    }
+
+    const ev = document.getElementById('telemetryEvents');
+    if(ev){
+      const fReasons = (fallback.reasons || []).map(x => esc(String(x))).join(' | ') || 'none';
+      const completions = (t.executor || {}).recent_completions || [];
+      const lastExec = completions.slice(-5).map(x => `${x.lane}:${x.status}`).join(' · ') || 'none';
+      ev.textContent = `fallback_reasons=${fReasons} · executor_recent=${lastExec}`;
+    }
+  }
+
+  function triggerResultsExport(kind){
+    const safeKind = (kind || '').toString().trim().toLowerCase();
+    if(!safeKind) return;
+    const url = `/api/job/${encodeURIComponent(jobId)}/recent-results/export?kind=${encodeURIComponent(safeKind)}`;
+    window.location.href = url;
+  }
+
+  function renderResultsPager(){
+    const meta = document.getElementById('resultsPageMeta');
+    const prevBtn = document.getElementById('resultsPrevBtn');
+    const nextBtn = document.getElementById('resultsNextBtn');
+    const total = Number(resultsTotalPages || 1);
+    const page = Number(resultsPage || 1);
+    if(meta) meta.textContent = `Page ${page} / ${total} · ${RESULTS_PAGE_SIZE} emails per page`;
+    if(prevBtn) prevBtn.disabled = page <= 1;
+    if(nextBtn) nextBtn.disabled = page >= total;
+  }
+
+  async function tick(){
+    const qp = new URLSearchParams({
+      recent_page: String(resultsPage),
+      recent_page_size: String(RESULTS_PAGE_SIZE),
+    });
+    const r = await fetch(`/api/job/${jobId}?${qp.toString()}`);
+    if(!r.ok){ return; }
+    const j = await r.json();
+
+    document.getElementById("total").textContent = j.total;
+    document.getElementById("sent").textContent = j.sent;
+    document.getElementById("failed").textContent = j.failed;
+    document.getElementById("skipped").textContent = j.skipped;
+    document.getElementById("invalid").textContent = j.invalid;
+
+    document.getElementById("statusPill").textContent = `Status: ${j.status}`;
+    document.getElementById("lastError").textContent = j.last_error ? ("Last error: " + j.last_error) : "";
+
+    const denom = (j.total || 0);
+    const done = (j.sent + j.failed + j.skipped);
+    document.getElementById("barFill").style.width = pct(done, denom) + "%";
+
+    // Domain state
+    const plan = j.domain_plan || {};
+    const sentMap = j.domain_sent || {};
+    const failMap = j.domain_failed || {};
+
+    const rows = Object.entries(plan).map(([dom, planned]) => {
+      const p = Number(planned||0);
+      const s = Number(sentMap[dom]||0);
+      const f = Number(failMap[dom]||0);
+      const done2 = s + f;
+      return {dom, p, s, f, done2, pct: pct(done2, p)};
+    }).sort((a,b)=>b.p-a.p).slice(0, 300);
+
+    const domBody = document.getElementById('domState');
+    if(domBody){
+      domBody.innerHTML = rows.map(x => {
+        const bar = `<div class="smallBar"><div style="width:${x.pct}%"></div></div>`;
+        return `<tr>`+
+          `<td>${esc(x.dom)}</td>`+
+          `<td>${x.p}</td>`+
+          `<td class="ok">${x.s}</td>`+
+          `<td class="no">${x.f}</td>`+
+          `<td>${bar}<div class="muted" style="font-size:12px; margin-top:4px">${x.done2}/${x.p} (${x.pct}%)</div></td>`+
+        `</tr>`;
+      }).join('') || `<tr><td colspan="5" class="muted">No domains yet.</td></tr>`;
+    }
+
+    const totalPlanned = Object.values(plan).reduce((a,v)=>a+Number(v||0),0);
+    const totalDone = rows.reduce((a,x)=>a+Number(x.done2||0),0);
+    const dp = pct(totalDone, totalPlanned);
+    const domFill = document.getElementById('domBarFill');
+    const domTxt = document.getElementById('domBarText');
+    if(domFill) domFill.style.width = dp + '%';
+    if(domTxt) domTxt.textContent = `Domains progress: ${dp}% (${totalDone}/${totalPlanned})`;
+
+    // Chunk state
+    const chunkMeta = document.getElementById('chunkMeta');
+    if(chunkMeta){
+      const activeCount = Number(j.active_chunks_count || ((Array.isArray(j.active_chunks_info) ? j.active_chunks_info.length : 0)) || 0);
+      const activeBackoffCount = Number(j.active_backoff_chunks_count || 0);
+      chunkMeta.textContent = `chunks_done=${j.chunks_done || 0} · chunks_total≈${j.chunks_total || 0} · backoff_events=${j.chunks_backoff || 0} · active_chunks=${activeCount} · active_backoff=${activeBackoffCount} · current_chunk(supplemental)=${(j.current_chunk ?? -1)}`;
+    }
+
+    const chunkTbl = document.getElementById('chunkTbl');
+    const cs = (j.chunk_states || []).slice().reverse();
+    if(chunkTbl){
+      chunkTbl.innerHTML = cs.map(x => {
+        const next = x.next_retry_ts ? new Date(Number(x.next_retry_ts)*1000).toLocaleTimeString() : '';
+        const bl = (x.blacklist || '').toString();
+        const blShort = bl.length > 40 ? (bl.slice(0,40) + '…') : bl;
+        const spam = (x.spam_score === null || x.spam_score === undefined) ? '' : Number(x.spam_score).toFixed(2);
+        return `<tr>`+
+          `<td>${Number(x.chunk)+1}</td>`+
+          `<td>${esc(x.status || '')}</td>`+
+          `<td>${Number(x.size||0)}</td>`+
+          `<td>${esc(x.sender || '')}</td>`+
+          `<td>${esc(spam)}</td>`+
+          `<td title="${esc(bl)}">${esc(blShort)}</td>`+
+          `<td>${esc(String(x.attempt ?? ''))}</td>`+
+          `<td>${esc(next)}</td>`+
+        `</tr>`;
+      }).join('') || `<tr><td colspan="8" class="muted">No chunk states yet.</td></tr>`;
+    }
+
+    // Recent results (paginated at API level)
+    resultsPage = Number(j.recent_page || 1);
+    resultsTotalPages = Number(j.recent_total_pages || 1);
+    const rrows = (j.recent_results || []).map(x => {
+      const ok = x.ok ? '<span class="ok">YES</span>' : '<span class="no">NO</span>';
+      return `<tr><td>${esc(x.ts)}</td><td>${esc(x.email)}</td><td>${ok}</td><td>${esc(x.detail)}</td></tr>`;
+    }).join("");
+    document.getElementById("results").innerHTML = rrows || `<tr><td colspan="4" class="muted">No results yet...</td></tr>`;
+    renderResultsPager();
+
+    renderSchedulerTelemetry(j.scheduler_telemetry || null);
+
+    // Logs
+    const logs = (j.logs || []).slice(-80).map(l => `[${l.ts}] ${l.level}: ${l.message}`).join("\n");
+    document.getElementById("logs").textContent = logs;
+
+    if(j.status === "done" || j.status === "error"){
+      clearInterval(window._t);
+      window._t = setInterval(tick, 3500);
+    }
+  }
+
+  const downloadDeliveredBtn = document.getElementById('downloadDeliveredBtn');
+  if(downloadDeliveredBtn){
+    downloadDeliveredBtn.addEventListener('click', () => triggerResultsExport('delivered'));
+  }
+
+  const downloadPendingBtn = document.getElementById('downloadPendingBtn');
+  if(downloadPendingBtn){
+    downloadPendingBtn.addEventListener('click', () => triggerResultsExport('pending'));
+  }
+
+  const downloadFailedBtn = document.getElementById('downloadFailedBtn');
+  if(downloadFailedBtn){
+    downloadFailedBtn.addEventListener('click', () => triggerResultsExport('failed'));
+  }
+
+  const prevBtn = document.getElementById('resultsPrevBtn');
+  if(prevBtn){
+    prevBtn.addEventListener('click', async () => {
+      if(resultsPage <= 1) return;
+      resultsPage -= 1;
+      await tick();
+    });
+  }
+
+  const nextBtn = document.getElementById('resultsNextBtn');
+  if(nextBtn){
+    nextBtn.addEventListener('click', async () => {
+      if(resultsPage >= resultsTotalPages) return;
+      resultsPage += 1;
+      await tick();
+    });
+  }
+
+  renderResultsPager();
+  tick();
+  window._t = setInterval(tick, 1200);
+</script>
+
+</body></html>
